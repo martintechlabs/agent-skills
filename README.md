@@ -70,6 +70,16 @@ Whole-repository CRITICAL/HIGH-only risk pass with a prioritized walk order (aut
 - You want a small, prioritized fix list rather than a graded scorecard
 - You need executable remediation specs grouped by root cause, not by file
 
+### delivery-health
+
+Evaluates how a team *ships* rather than what they built — the delivery and process signals in git history and GitHub. Measures review rigor, PR pickup and cycle time, PR size, CI health, branch protection, bus factor, rework/hotfix rate, and release cadence, anchored to DORA's four keys and scaled to team size, with every metric backed by a citable command. Renders a scorecard, a graded report, or a prioritized fix list, and degrades gracefully to git-only signals when GitHub isn't available.
+
+**Use when:**
+
+- You're a fractional/interim CTO assessing how healthy a team's delivery process is
+- You want to know how well a team ships — review practices, velocity, CI reliability, release cadence — not whether the code is good
+- You want reproducible delivery metrics you can re-run quarter over quarter
+
 ## Repository layout
 
 ```
