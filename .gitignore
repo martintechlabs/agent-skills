@@ -1,0 +1,37 @@
+# Local Claude Code workspace — settings, transcripts, plan files, etc.
+.claude/
+CLAUDE.local.md
+
+# Other AI agent local config
+.cursor/
+.aider*
+.continue/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Node (in case any skill bundles scripts)
+node_modules/
+npm-debug.log*
+.pnpm-debug.log*
+
+# Python (in case any skill bundles scripts)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Logs and temp
+*.log
+tmp/
