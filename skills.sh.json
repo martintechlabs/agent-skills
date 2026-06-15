@@ -1,5 +1,11 @@
 {
   "$schema": "https://skills.sh/schemas/skills.sh.schema.json",
   "notGrouped": "bottom",
-  "groupings": []
+  "groupings": [
+    {
+      "title": "Codebase evaluation",
+      "description": "Evaluate unfamiliar codebases — fast triage, deep graded audits, and technical due diligence for investors and acquirers.",
+      "skills": ["codebase-triage", "codebase-audit", "tech-due-diligence"]
+    }
+  ]
 }
