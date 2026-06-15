@@ -3,7 +3,7 @@ name: codebase-audit
 description: Deep, evidence-based technical audit of a codebase that rates ten dimensions (domain/architecture, event-driven design, data modeling, security, dependency & runtime currency, performance, code cleanliness, testability, robustness, documentation), each with severity-tagged findings, concrete recommendations, a summary table, and a final overall score. Use this whenever the user wants a thorough graded engineering review or architecture assessment of a repository, detailed actionable findings with file-level evidence, or help deciding where to invest engineering effort. Language- and framework-agnostic. Use codebase-triage instead for a fast first-pass orientation, and tech-due-diligence when the goal is an investment or acquisition decision rather than improving the code.
 metadata:
   author: stephen-martin
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 This skill makes the agent act as a senior software architect, database designer,
@@ -42,6 +42,81 @@ not meaningfully applicable to the repository type, say so explicitly.
 
 --------------------------------------------------------
 
+## How to Work
+
+This is a deep audit, but "deep" means **every dimension is accounted for with
+evidence** — not that every line is read. On any real repository (hundreds to
+thousands of source files) reading everything is impossible, and attempting it
+produces shallow, front-loaded results where the last dimensions starve. Work to a
+method instead.
+
+### 1. Orient before reading code
+
+Read the orienting layer first: `README`, `AGENTS.md`/`CONTRIBUTING`, root manifests
+(`package.json`, `pyproject.toml`, `go.mod`, etc.), CI configs, IaC, and any
+`docs/`/ADRs. Establish the stack, the domain, how it builds and deploys, and the
+conventions the code is supposed to follow. Do not open application code yet.
+
+### 2. Inventory — don't read-everything
+
+Enumerate the repo by top-level directory and build a file/size map (`git ls-files`,
+line counts, language breakdown, counts of migrations/tests/routes/components).
+Aggregate signals from `grep`/counts are **legitimate evidence for breadth claims**
+(e.g. "78 files use the service-role client", "44 stray console logs") — tag them
+`Inferred` and cite the command. Reading is for depth; grep is for breadth. Use both
+deliberately.
+
+### 3. Read by risk, fully, where it counts
+
+Some paths must be read in full regardless of repo size — they carry the risk that
+justifies the audit:
+- Authentication / authorization / session and permission logic
+- Anything touching money, payments, or billing
+- Data-write paths, migrations, and access-control policies (RLS / ORM scopes / security rules)
+- Webhook and external-integration entry points
+
+Read those fully. For the rest, sample per directory — the representative file plus
+the largest/most-central ones — until the dimension's signal is stable. When you
+stop sampling an area, say why.
+
+### 4. Delegate for scale (large repos)
+
+The ten dimensions are largely independent passes over the same tree. For any repo
+too large to cover well in one pass (rule of thumb: more than ~150 source files, or
+when you catch yourself scoring later dimensions off stale earlier reads instead of
+fresh ones), **fan out to subagents and synthesize**:
+
+- **Security + Bug Risks/Robustness** — one agent over auth/payment/RLS/webhook/write paths.
+- **Database & Data Modeling** — one agent that reads *all* migrations/schema (this slice is usually small enough to cover fully, restoring true completeness for it).
+- **Dependency & Runtime Currency** — one isolated agent that does the web research (see that dimension).
+- **Testability**, **Documentation**, **Performance**, **Code Cleanliness** — independent agents over their slices (cleanliness can be sharded by top-level directory).
+- **DDD + EDA** — one agent over the domain/core layer.
+
+Each subagent reads its slice for real and returns its rating, severity-tagged
+findings, and evidence; a final synthesis pass composes the report, **dedupes
+findings that surface in more than one slice** (an unauthenticated route is both a
+Security and a Robustness finding — report it once, cross-referenced), and computes
+the scores. This keeps coverage near-complete per slice and prevents the quality
+decay of auditing all ten dimensions sequentially in one context. For a small repo,
+do it inline — delegation isn't worth the overhead.
+
+**If you cannot spawn subagents** in this environment, don't let the later
+dimensions decay: audit in risk-priority order (Security → Bug Risks/Robustness →
+Data → Dependency → Performance → Cleanliness → Testability → DDD/EDA → Docs) and,
+for each dimension, **re-grep and re-open the files that dimension needs rather than
+scoring it from memory of earlier reads**. Fresh evidence per dimension is what
+delegation buys you; reach for it the same way in one context.
+
+### 5. Be honest about coverage
+
+The output must state what was inspected. Reconcile breadth and depth explicitly:
+which areas were read in full, which were sampled (and at what rate), and which are
+known only from aggregate signals. Sampled or grepped findings are `Inferred`, never
+`Observed`. A faithful "here is what I actually looked at" beats a false claim of
+total coverage.
+
+--------------------------------------------------------
+
 ## Evaluation Criteria
 
 ### 1. Domain-Driven Design (DDD)
@@ -56,10 +131,13 @@ not meaningfully applicable to the repository type, say so explicitly.
 - Evaluate domain language clarity and cohesion.
 - If no explicit DDD patterns are used, explain how domain logic is
   organized instead.
-- If the repository type makes DDD analysis not meaningfully applicable
-  (for example, a thin frontend-only app, CLI utility, or small library
-  with no domain model), use `Rating (0-10): N/A` and provide a
-  one-sentence rationale.
+- Reserve `Rating (0-10): N/A` for repositories with no meaningful domain — a
+  thin frontend-only shell, CLI utility, or small library with no domain model.
+  Provide a one-sentence rationale.
+- A substantial app that HAS a real domain but does NOT use DDD tactical patterns
+  is not N/A. Rate how well its domain logic is organized: an anemic, scattered, or
+  leaky domain is a *low score*, not an exemption. N/A means "the lens doesn't
+  apply," never "they didn't do DDD."
 - Otherwise, **provide a rating from 0 to 10.**
 
 ### 2. Event-Driven Architecture (EDA)
@@ -130,6 +208,13 @@ not meaningfully applicable to the repository type, say so explicitly.
   that claim as `Not verifiable from repo`.
 - If the latest stable version or support status cannot be confirmed
   from authoritative sources, say that explicitly and do not guess.
+- If live web research cannot be performed in this run at all, do not silently
+  leave the table empty. Still report installed versions from repo evidence, mark
+  `Latest stable`/`Status` as `Not verifiable in this run`, rate the dimension on
+  what the repo alone shows (a runtime pinned to a known-old major is still a flag),
+  and list live version/EOL verification as a required follow-up. A delegated audit
+  should give this dimension to an isolated subagent precisely so the research does
+  get done.
 - **Provide a rating from 0 to 10.**
 
 ### 6. Performance & Scalability
@@ -192,10 +277,14 @@ not meaningfully applicable to the repository type, say so explicitly.
 
 ## Repository Coverage
 
-- Review the entire repository, not a representative subset.
-- Inspect all first-party source code, configuration, infrastructure, schema, migration, test, and documentation files that materially affect system behavior or maintainability.
+Coverage follows the method in **How to Work** — account for every dimension via
+inventory + risk-prioritized full reads + aggregate signals, read the
+security/money/data paths in full, sample and grep the rest, and state plainly what
+was read in full vs. sampled vs. known only from aggregates (`Observed` vs.
+`Inferred`). Two additions specific to this section:
+
 - Do not deeply review vendored dependencies, generated files, lockfiles, or build outputs unless they reveal a concrete risk, compatibility issue, or maintenance concern.
-- When presenting findings, make clear which parts of the repository were inspected, distinguish `Observed` from `Inferred`, and call out any areas that were excluded with the reason for exclusion.
+- Call out any areas you excluded, with the reason for exclusion.
 
 Show a **brief overview of key areas** by listing the actual repo-relative paths you found:
 - Root structure: list the main top-level directories and important root files
@@ -332,6 +421,15 @@ justify it.
 Compute the final score as the unweighted arithmetic mean of all
 applicable numeric category ratings. Exclude every category marked
 `N/A` from the denominator, and state the denominator you used.
+
+When the system handles money, authentication, or personal/regulated data, also
+report a **risk-weighted score** alongside the unweighted mean: weight Security, Bug
+Risks & Robustness, and Database & Data Modeling at 2× the other dimensions,
+recompute, and show both numbers with a one-line note on why they differ and the
+weights used. The unweighted mean stays for comparability across audits; the
+risk-weighted score is the one to act on. (An unweighted mean lets strong docs and
+tests dilute serious security concerns on a production app — show both so the reader
+isn't misled by a single rosy number.)
 
 Interpret ratings roughly as:
 
