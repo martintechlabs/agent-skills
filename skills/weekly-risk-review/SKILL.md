@@ -3,7 +3,7 @@ name: weekly-risk-review
 description: Whole-repository risk pass that reports only CRITICAL and HIGH severity issues across security, data integrity, performance, and architecture, then produces a small, prioritized remediation plan. Includes a prioritized walk order, a concrete anti-pattern catalog to scan against, cross-reference checks for unfulfilled comment-promises, and either a single weekly report or an audit doc plus remediation specs when the user wants executable follow-up. Use this whenever the user asks for a "weekly risk review", "what should we fix first", "what could go wrong here", a fractional-CTO-style risk pass, a focused review BEFORE shipping, or recurring whole-repo health checks where breadth and severity-filtering matter more than scoring every dimension. Use codebase-triage for fast first-pass orientation, codebase-audit for a thorough graded engineering review across ten dimensions, tech-due-diligence for an investment / acquisition decision, and bug-class-audit to quantify one specific recurring bug pattern.
 metadata:
   author: stephen-martin
-  version: "1.1.0"
+  version: "1.2.0"
 ---
 
 You are a principal engineer performing a weekly whole-repository risk review. Your task is to identify only the most important code, architecture, security, performance, and data integrity issues that deserve immediate engineering attention, then produce the smallest effective remediation plan to reduce risk quickly without unnecessary churn.
@@ -98,6 +98,8 @@ Prioritized walk (use this order, not alphabetical):
 
 Skip these on a weekly pass unless time permits: utility helpers, UI components, tests, generated code.
 
+**Exception — always read the client-side data-layer wiring** (Supabase/Clerk/Apollo/tRPC providers and client factories, e.g. where the browser client is given its auth token). Whether an RLS or authorization finding is actually *reachable* depends on how the browser client authenticates — this is the step that turns "the policy looks weak" into a confirmed, exploitable CRITICAL rather than a hedge.
+
 Pattern catalog — what to grep for at each surface:
 
 The categories above are abstract. These are the concrete anti-patterns that produce CRITICAL/HIGH findings in real codebases. Scan for them at the relevant surface.
@@ -123,6 +125,7 @@ The categories above are abstract. These are the concrete anti-patterns that pro
 - `CREATE POLICY … FOR UPDATE USING (…)` with no `WITH CHECK` — lets users mutate protected columns (especially `role`, `tenant_id`, `email`).
 - `CREATE POLICY … FOR ALL TO anon, authenticated USING (true) WITH CHECK (true)` — wide-open table.
 - Policies or comments referencing a trigger or function that doesn't exist (grep the symbol to confirm).
+- **Stale stopgap:** a permissive policy/config whose own comment says it's "temporary until X exists" — grep to check whether X now exists. A wide-open `FOR ALL … USING(true)` left in place *after* the service-role client (or guard) it was waiting for has shipped is live attack surface, not a harmless leftover. (Applies beyond RLS: any "TODO: lock this down once …" where the "once" has already happened.)
 - `BEFORE UPDATE` triggers that protect some fields but not `role`, `email`, `tenant_id`, `admin_approved`.
 - Service-role key bundled in browser code (`NEXT_PUBLIC_*` or equivalent containing the service-role token).
 - Storage bucket policies that allow any authenticated user to read/delete files in a multi-tenant bucket.
@@ -161,6 +164,7 @@ Cross-reference checks (before including a finding):
 
 For each candidate finding, do at least one of these confirmations:
 
+- **`grep -rL` for the guard to find handlers that LACK it** (e.g. `grep -rL 'auth()' src/app/api`, `grep -rL 'require_role' app/controllers`). Finding the routes that *don't* call the guard is usually higher-signal than reading the ones that do — this is often the single most productive command of the review.
 - `grep` for the referenced symbol / trigger / function to confirm absence. Promises in comments ("field-level protection handled by `trg_protect_request_fields`") are often unfulfilled, and the absence is often a CRITICAL finding.
 - Read the calling site, not just the definition, to confirm the path is exploitable end-to-end.
 - Trace the data flow from public HTTP boundary to the side effect.

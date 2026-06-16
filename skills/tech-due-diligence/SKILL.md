@@ -3,7 +3,7 @@ name: tech-due-diligence
 description: Technical due diligence on a codebase for investors, acquirers, or boards. Translates engineering findings into deal risk and rough remediation cost, covering scalability ceiling, security and data-privacy/compliance exposure, licensing/IP and open-source obligations, code maintainability, dependency/runtime end-of-life risk, key-person/bus-factor risk, and operational readiness — ending in a clear proceed / proceed-with-conditions / caution / walk-away recommendation written for a non-technical decision-maker. Use this whenever the question is whether to invest in, acquire, or merge with the company behind the code, when someone needs a risk write-up to support a transaction, or when they ask what it would cost to fix what's broken. Use codebase-triage for a quick orientation and codebase-audit for a graded engineering review when no transaction is involved.
 metadata:
   author: stephen-martin
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # Technical Due Diligence
@@ -26,6 +26,17 @@ cost of sugar-coating diligence is borne by someone writing a large check.
 
 - **Never fabricate facts or financials.** Remediation costs are *rough* estimates;
   label them as such. Don't invent revenue, user counts, or contractual terms.
+- **Express remediation as effort, not invented dollars.** Engineering effort in
+  person-months (or person-weeks) is a defensible judgment; converting it to dollars
+  needs a fully-loaded labor rate you usually don't have. State effort in
+  person-months and **defer dollarization to the buyer's own loaded cost**. If you
+  must show a dollar range, state the per-engineer-month rate you assumed and label it
+  an assumption — never present a dollar figure as grounded when the rate was invented.
+- **Don't ship security findings from pattern-matching alone.** Authorization and
+  validation are often enforced via varied legitimate patterns, so a grep/heuristic
+  scan produces false positives. Open each flagged file and confirm the gap
+  end-to-end before including it — a wrong "N unguarded endpoints" headline destroys
+  the report's credibility.
 - **Mark assumptions explicitly.** Diligence depends on the deal thesis (what's
   being bought, expected scale, regulatory context). If it's provided, use it. If
   not, state your assumptions (e.g., "assuming a SaaS acquisition expected to 5x
@@ -71,10 +82,15 @@ For each area, land on a **risk level** (Low / Medium / High / Critical), a roug
    databases represent forced near-term spend and security exposure. Identify the
    core runtime, primary framework, and the few most central dependencies; note
    versions and support status (verify online from primary sources where feasible).
+   Also note whether the runtime version is **pinned at all** (`.nvmrc` / `engines` /
+   `Dockerfile` / `.tool-versions`) — an unpinned runtime is itself a risk, not just
+   an old one.
 6. **Key-person & process risk (bus factor).** If git history is available, look at
    contributor concentration, recency, and cadence; plus CI/CD, docs, and
    onboarding material. Mark inferences clearly — you cannot confirm team structure
-   without interviews.
+   without interviews. Reconcile duplicate/merged author identities first (one person
+   under several emails, or several people sharing one) — raw `git shortlog` counts
+   are unreliable until normalized.
 7. **Operational readiness.** Observability, deploy/rollback, database migrations,
    and backup/DR — where visible. Gaps here raise the risk of a painful, expensive
    post-close stabilization period.
