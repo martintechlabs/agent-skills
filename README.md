@@ -80,6 +80,16 @@ Evaluates how a team *ships* rather than what they built — the delivery and pr
 - You want to know how well a team ships — review practices, velocity, CI reliability, release cadence — not whether the code is good
 - You want reproducible delivery metrics you can re-run quarter over quarter
 
+### evaluation-trend
+
+Compares two evaluations of the same codebase over time and reports the trajectory — improving, declining, or measurement-dominated. Diffs the output of any of the other evaluation skills (audit, triage, delivery-health, weekly-risk-review, bug-class-audit) via two saved reports, a git-window diff, or a re-run at an old commit. Its discipline is comparability-first: it separates real change from method/measurement change before trusting any delta, and classifies findings as resolved, newly surfaced, persisting, or regressed.
+
+**Use when:**
+
+- You want to know how a codebase or team has changed since last quarter, not just its current state
+- You're producing a retainer or board trajectory update and need direction plus drivers
+- You're re-auditing and want to separate genuine improvement/regression from changes in how you measured
+
 ## Repository layout
 
 ```
