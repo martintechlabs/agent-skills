@@ -3,7 +3,7 @@ name: codebase-triage
 description: Rapid, time-boxed first-pass health check of an unfamiliar codebase that produces a one-page scorecard — stack inventory, architecture sketch, a red/yellow/green health signal, the top risks, and recommended next steps. Use this whenever someone hands you a new or unfamiliar repository and wants a fast read on what it is, whether it's healthy, and what to worry about — onboarding to a client or legacy codebase, sizing up an open-source project, or a fractional/interim CTO getting oriented before deciding where to dig. Prefer this over a full audit when speed and breadth matter more than exhaustive depth. Use codebase-audit instead when the user wants a thorough graded engineering review, and tech-due-diligence when the question is whether to invest in or acquire the company behind the code.
 metadata:
   author: stephen-martin
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # Codebase Triage
@@ -53,6 +53,9 @@ Move through these quickly, in order:
    - Maintainability smells: god files, very large modules, high `TODO`/`FIXME`
      density, copy-pasted blocks, no error handling or logging.
    - License file present (or conspicuously absent)?
+   - Config consistency: do runtime/tool versions agree across `.tool-versions`,
+     `engines`, CI config, `Dockerfile`, and README? Disagreement is a cheap-to-spot,
+     high-value "works locally, breaks in CI/prod" risk.
 
 **Do not** do line-by-line review, build a full dependency graph, fix anything, or
 research every dependency's latest version. That's out of scope for a triage.
@@ -63,7 +66,11 @@ Tag substantive claims so the reader knows how much to trust each one:
 
 - `Observed` — directly visible in files, config, or command output.
 - `Inferred` — a reasoned conclusion from visible evidence.
-- `Unknown` — couldn't confirm within the triage; note it as a follow-up.
+- `Not checked` — verifiable from the repo, but deliberately deferred to stay inside
+  the time-box; record it in Method & limits as a follow-up. This is distinct from the
+  sibling skills' `Not verifiable from repo` (which means the repo physically can't
+  answer it — e.g. production traffic). A triage's gaps are usually the former: things
+  you *could* confirm with more time but chose not to.
 
 ## Output format
 
@@ -118,4 +125,6 @@ One- to two-sentence rationale.
 Keep dimension signals coarse (Green/Yellow/Red) — resist turning this into the
 ten-category graded audit. The value of a triage is a fast, honest, decisive read
 that tells the reader where to look next. Be specific, cite real paths, and never
-invent files or findings.
+invent files or findings. A genuinely healthy repo can legitimately produce an
+all-`Minor` risk list and a Green overall — don't inflate severities to fill the
+section; an honest "nothing major here" is a valid and valuable triage result.
