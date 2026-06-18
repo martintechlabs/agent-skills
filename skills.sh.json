@@ -3,9 +3,17 @@
   "notGrouped": "bottom",
   "groupings": [
     {
-      "title": "Codebase evaluation",
-      "description": "Evaluate unfamiliar codebases — fast triage, deep graded audits, and technical due diligence for investors and acquirers.",
-      "skills": ["codebase-triage", "codebase-audit", "tech-due-diligence"]
+      "title": "CTO toolkit",
+      "description": "Evaluate and steer an engineering org straight from the repo: orient on an unfamiliar codebase, audit it deeply, assess the team's delivery process, run recurring risk passes, quantify a recurring bug pattern, support an investment or acquisition decision, and track trajectory over time.",
+      "skills": [
+        "codebase-triage",
+        "codebase-audit",
+        "delivery-health",
+        "weekly-risk-review",
+        "bug-class-audit",
+        "tech-due-diligence",
+        "evaluation-trend"
+      ]
     }
   ]
 }
