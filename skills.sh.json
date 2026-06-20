@@ -14,6 +14,13 @@
         "tech-due-diligence",
         "evaluation-trend"
       ]
+    },
+    {
+      "title": "Productivity",
+      "description": "Everyday workflow helpers that make working with AI faster — starting with turning a fuzzy intent into a sharp, reusable prompt.",
+      "skills": [
+        "meta-prompt"
+      ]
     }
   ]
 }
