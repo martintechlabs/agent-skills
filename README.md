@@ -90,6 +90,16 @@ Compares two evaluations of the same codebase over time and reports the trajecto
 - You're producing a retainer or board trajectory update and need direction plus drivers
 - You're re-auditing and want to separate genuine improvement/regression from changes in how you measured
 
+### meta-prompt
+
+Turns a fuzzy intent into a sharp, ready-to-run prompt. Gathers three ingredients — the **goal** you want, the **context** around why it matters, and **examples** of good output — then synthesizes them into an engineered prompt (role, goal, context, examples slot, constraints), shows it in a copyable block, and offers to run it. Asks for any missing ingredient rather than fabricating it.
+
+**Use when:**
+
+- You don't know how to ask AI for something, or aren't sure how to phrase the request
+- You want a reusable prompt you can run again — drafting emails, sales copy, job descriptions, summaries, anything
+- The bottleneck is *how to ask*, not the task itself (if you've already given a clear, complete request, the agent should just do it)
+
 ## Repository layout
 
 ```
