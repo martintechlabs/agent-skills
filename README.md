@@ -100,6 +100,18 @@ Turns a fuzzy intent into a sharp, ready-to-run prompt. Gathers three ingredient
 - You want a reusable prompt you can run again — drafting emails, sales copy, job descriptions, summaries, anything
 - The bottleneck is *how to ask*, not the task itself (if you've already given a clear, complete request, the agent should just do it)
 
+### consult-codex
+
+A self-triggering skill for the coding agent itself: when Claude is genuinely stuck, weighing two or more technical approaches, facing a hard-to-reverse decision, or fighting a bug that's survived a couple of debugging passes, it shells out to `codex exec` for a second opinion from Codex (the OpenAI coding agent). Runs Codex read-only by default, frames a proper briefing (goal, the competing avenues, what's been tried, constraints), then weighs the answer critically rather than blindly following it — and reports back what it consulted and where it landed.
+
+**Use when:**
+
+- You're Claude, mid-task, and a second model's view would actually change what you do next — not on every hard line
+- You've made a real attempt and are still stuck, or honestly can't choose between approaches
+- A high-stakes or hard-to-reverse decision would be de-risked by another set of eyes
+
+(For a second-opinion *code review* specifically, a dedicated Codex review skill is the better fit.)
+
 ## Repository layout
 
 ```
