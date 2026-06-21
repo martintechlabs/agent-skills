@@ -21,6 +21,13 @@
       "skills": [
         "meta-prompt"
       ]
+    },
+    {
+      "title": "Coding",
+      "description": "Skills the coding agent reaches for itself while working — starting with getting a second opinion from another agent when it's stuck or weighing competing technical approaches.",
+      "skills": [
+        "consult-codex"
+      ]
     }
   ]
 }
