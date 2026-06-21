@@ -110,7 +110,19 @@ A self-triggering skill for the coding agent itself: when Claude is genuinely st
 - You've made a real attempt and are still stuck, or honestly can't choose between approaches
 - A high-stakes or hard-to-reverse decision would be de-risked by another set of eyes
 
-(For a second-opinion *code review* specifically, a dedicated Codex review skill is the better fit.)
+(For a second-opinion *code review* specifically, use `codex-review` below.)
+
+### codex-review
+
+Gets a second-opinion code review from Codex (the OpenAI coding agent) by shelling out to `codex exec review`. Works both ways: Claude reaches for it on its own after writing a substantial chunk of code or before opening a PR, and it responds when you explicitly ask for a Codex review. Defaults to reviewing the whole branch diff against its base branch, and can also review just the uncommitted working changes or a single commit. Triages the findings on their merits — fixes the real ones, pushes back on the wrong ones, treats nits as your call — then reports what it reviewed and what it concluded.
+
+**Use when:**
+
+- Claude has just written a meaningful chunk of code and a second pair of eyes is worth it before it ships or before a PR
+- You explicitly want Codex to review a branch, PR, diff, or commit
+- You want the findings triaged and acted on, not a raw review transcript
+
+(For getting *unstuck* or choosing between approaches before code is written, use `consult-codex` instead.)
 
 ## Repository layout
 
