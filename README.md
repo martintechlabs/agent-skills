@@ -12,10 +12,16 @@ Install every skill in this repo into your local agent:
 npx skills add martintechlabs/agent-skills
 ```
 
-Install a single skill:
+Install specific skills by name (comma-separate to install several):
 
 ```bash
-npx skills add martintechlabs/agent-skills/<skill-name>
+npx skills add martintechlabs/agent-skills --skill <skill-name>
+```
+
+Add `-g` to install globally (user-level, available across all projects) instead of into the current project, and `-y` to skip the prompts:
+
+```bash
+npx skills add martintechlabs/agent-skills -g --skill consult-codex,codex-review -y
 ```
 
 ## Available skills
@@ -160,10 +166,10 @@ Each skill is a directory under `skills/` containing a single `SKILL.md`: YAML f
 4. **(Optional) Add supporting files** the skill loads on demand under `skills/<skill-name>/references/` (see `bug-class-audit`).
 5. **List it** under **Available skills** above, mirroring the existing format (one-paragraph summary + a "Use when" list).
 6. **(Optional) Group it** by adding the skill name to a grouping in `skills.sh.json`.
-7. **Test it** by installing locally and confirming it triggers:
+7. **Test it** by installing locally and confirming it triggers (use `--skill` to select by name; skills live under `skills/`, so a `…/agent-skills/<skill-name>` path will not resolve):
 
    ```bash
-   npx skills add martintechlabs/agent-skills/<skill-name>
+   npx skills add martintechlabs/agent-skills --skill <skill-name>
    ```
 
 The `description` is the most important field for triggering: lead with what the skill does, then list the concrete situations and phrasings that should activate it. When skills overlap, say when to reach for this one versus the others.
