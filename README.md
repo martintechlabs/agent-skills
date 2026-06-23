@@ -130,6 +130,16 @@ Gets a second-opinion code review from Codex (the OpenAI coding agent) by shelli
 
 (For getting *unstuck* or choosing between approaches before code is written, use `consult-codex` instead.)
 
+### ship-ready-pr-loop
+
+Drives a change from review findings to a ship-ready PR. Runs `/code-review max`, fixes only the valid Critical and Major issues (root-cause, minimal changes, tests where appropriate), reruns validation, and repeats up to 5 passes. Then it creates a PR documenting what was fixed and any false positives, and runs `/greploop` repeatedly — up to 5 passes — until Greptile gives a 5/5 with no unresolved comments. Stays narrow: no broad rewrites, no low-priority churn, no weakening validation, and it never claims 5/5 unless the latest run confirms it.
+
+**Use when:**
+
+- You want a PR hardened until it's genuinely ready to ship, not just opened
+- You want Critical/Major review findings fixed and the PR pushed to a Greploop 5/5
+- You want a clear final report of passes run, fixes made, and any remaining blockers
+
 ## Repository layout
 
 ```
