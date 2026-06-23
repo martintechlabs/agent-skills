@@ -27,7 +27,8 @@
       "description": "Skills the coding agent reaches for while working — getting a second opinion from another agent when it's stuck or weighing competing technical approaches, and getting a second-opinion code review of work it's written.",
       "skills": [
         "consult-codex",
-        "codex-review"
+        "codex-review",
+        "ship-ready-pr-loop"
       ]
     }
   ]
