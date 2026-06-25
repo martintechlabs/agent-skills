@@ -1,6 +1,6 @@
 # agent-skills
 
-A collection of [Agent Skills](https://agentskills.io/) by [Martin Tech Labs](https://github.com/martintechlabs), published for use with Claude Code and other skill-aware AI agents.
+A collection of [Agent Skills](https://agentskills.io/) by [Martin Tech Labs](https://www.martintechlabs.com/), published for use with Claude Code and other skill-aware AI agents.
 
 [![skills.sh](https://skills.sh/b/martintechlabs/agent-skills)](https://skills.sh/martintechlabs/agent-skills)
 
@@ -26,130 +26,40 @@ npx skills add martintechlabs/agent-skills -g --skill consult-codex,codex-review
 
 ## Available skills
 
-### codebase-triage
+Skills are grouped into the same categories as the [`skills/`](skills/) directories.
 
-Rapid, time-boxed first-pass health check of an unfamiliar codebase. Produces a one-page scorecard: stack inventory, architecture sketch, a red/yellow/green health signal, top risks, and recommended next steps.
+### CTO toolkit
 
-**Use when:**
+Evaluate and steer an engineering org straight from the repo.
 
-- You've just been handed an unfamiliar repo and want a fast read on what it is and whether it's healthy
-- You're onboarding to a client or legacy codebase and need orientation before going deep
-- You want a quick health check before committing to a full audit
+| Skill | What it does |
+|-------|--------------|
+| [`codebase-triage`](skills/cto-toolkit/codebase-triage/SKILL.md) | Rapid, time-boxed health check of an unfamiliar codebase: stack inventory, architecture sketch, red/yellow/green signal, top risks, and next steps. |
+| [`codebase-audit`](skills/cto-toolkit/codebase-audit/SKILL.md) | Deep, graded technical audit across ten dimensions, with severity-tagged, file-level findings, prioritized recommendations, and an overall score. |
+| [`tech-due-diligence`](skills/cto-toolkit/tech-due-diligence/SKILL.md) | Investor/acquirer technical due diligence: turns findings into deal risk and rough remediation cost, ending in a proceed/caution/walk recommendation. |
+| [`bug-class-audit`](skills/cto-toolkit/bug-class-audit/SKILL.md) | Quantifies how systemic one bug class is by classifying recent fix PRs into a defensible headline percentage with a breakdown and examples. |
+| [`weekly-risk-review`](skills/cto-toolkit/weekly-risk-review/SKILL.md) | Recurring CRITICAL/HIGH-only risk pass with a prioritized walk order; outputs a weekly report or executable remediation specs grouped by root cause. |
+| [`delivery-health`](skills/cto-toolkit/delivery-health/SKILL.md) | Evaluates how a team *ships* — review rigor, cycle time, CI health, cadence — against DORA's four keys, not whether the code is good. |
+| [`evaluation-trend`](skills/cto-toolkit/evaluation-trend/SKILL.md) | Compares two evaluations of the same codebase over time and reports the trajectory, separating real change from measurement change. |
 
-### codebase-audit
+### Productivity
 
-Deep, evidence-based technical audit of a codebase. Rates ten dimensions (architecture/DDD, event-driven design, data modeling, security, dependency currency, performance, cleanliness, testing, robustness, docs) with severity-tagged findings, prioritized recommendations, and an overall score.
+Everyday workflow helpers that make working with AI faster.
 
-**Use when:**
+| Skill | What it does |
+|-------|--------------|
+| [`meta-prompt`](skills/productivity/meta-prompt/SKILL.md) | Turns a fuzzy intent into a sharp, reusable prompt by gathering the goal, the context, and examples of good output, then engineering the prompt for you. |
+| [`critical-partner`](skills/productivity/critical-partner/SKILL.md) | Switches the agent into a constructive-disagreement thinking partner that pressure-tests your ideas and names weaknesses first instead of affirming you. |
 
-- You want a thorough, graded engineering review of a codebase
-- You need detailed, actionable findings with file-level evidence
-- You're deciding where to invest engineering effort to improve a system
+### Coding
 
-### tech-due-diligence
+Skills the coding agent reaches for while working.
 
-Technical due diligence for investors, acquirers, or boards. Translates technical findings into deal risk and rough remediation cost — covering scalability, security/compliance, licensing/IP, maintainability, dependency/EOL risk, and key-person risk — ending in a clear recommendation.
-
-**Use when:**
-
-- You're evaluating a company's technology before investing in or acquiring it
-- You need a non-technical-friendly risk write-up with a proceed/caution/walk recommendation
-- You want to know roughly what it would cost to fix what's broken
-
-### bug-class-audit
-
-Quantify how systemic ONE specific bug class is in a codebase by classifying every recent fix-prefixed merged PR against explicit inclusion/exclusion criteria. Produces a headline percentage, a breakdown table, representative examples, patterns, and caveats — a number you can put in front of stakeholders instead of a vibe.
-
-**Use when:**
-
-- You suspect a specific pattern keeps recurring and want a defensible number
-- You need to justify a refactor or initiative with evidence from PR history
-- You want to replace "we keep shipping the same bug" with "19% of last 100 fix PRs are this class"
-
-### weekly-risk-review
-
-Whole-repository CRITICAL/HIGH-only risk pass with a prioritized walk order (auth → routes → webhooks → RLS → cron → integrations), a concrete anti-pattern catalog to scan against, and cross-reference checks for unfulfilled comment-promises. Outputs either a single weekly report or — when the user wants executable follow-up — an audit doc plus N remediation specs grouped by root cause.
-
-**Use when:**
-
-- You run a recurring weekly or pre-ship CTO-level risk check
-- You want a small, prioritized fix list rather than a graded scorecard
-- You need executable remediation specs grouped by root cause, not by file
-
-### delivery-health
-
-Evaluates how a team *ships* rather than what they built — the delivery and process signals in git history and GitHub. Measures review rigor, PR pickup and cycle time, PR size, CI health, branch protection, bus factor, rework/hotfix rate, and release cadence, anchored to DORA's four keys and scaled to team size, with every metric backed by a citable command. Renders a scorecard, a graded report, or a prioritized fix list, and degrades gracefully to git-only signals when GitHub isn't available.
-
-**Use when:**
-
-- You're a fractional/interim CTO assessing how healthy a team's delivery process is
-- You want to know how well a team ships — review practices, velocity, CI reliability, release cadence — not whether the code is good
-- You want reproducible delivery metrics you can re-run quarter over quarter
-
-### evaluation-trend
-
-Compares two evaluations of the same codebase over time and reports the trajectory — improving, declining, or measurement-dominated. Diffs the output of any of the other evaluation skills (audit, triage, delivery-health, weekly-risk-review, bug-class-audit) via two saved reports, a git-window diff, or a re-run at an old commit. Its discipline is comparability-first: it separates real change from method/measurement change before trusting any delta, and classifies findings as resolved, newly surfaced, persisting, or regressed.
-
-**Use when:**
-
-- You want to know how a codebase or team has changed since last quarter, not just its current state
-- You're producing a retainer or board trajectory update and need direction plus drivers
-- You're re-auditing and want to separate genuine improvement/regression from changes in how you measured
-
-### meta-prompt
-
-Turns a fuzzy intent into a sharp, ready-to-run prompt. Gathers three ingredients — the **goal** you want, the **context** around why it matters, and **examples** of good output — then synthesizes them into an engineered prompt (role, goal, context, examples slot, constraints), shows it in a copyable block, and offers to run it. Asks for any missing ingredient rather than fabricating it.
-
-**Use when:**
-
-- You don't know how to ask AI for something, or aren't sure how to phrase the request
-- You want a reusable prompt you can run again — drafting emails, sales copy, job descriptions, summaries, anything
-- The bottleneck is *how to ask*, not the task itself (if you've already given a clear, complete request, the agent should just do it)
-
-### critical-partner
-
-Switches the agent into a critical-thinking partner whose default mode is constructive disagreement instead of agreement. Surfaces the untested assumption first, argues the strongest opposing case before conceding anything, names the weakest part of your work ahead of the strengths, calls out when you're emotionally invested, and retreats only on new evidence or reasoning — not because you pushed back. Won't manufacture flaws when the position is sound, and ends each exchange with one question to sit with rather than a reassuring summary. Stays out of the way for plain factual or execution requests where there's no belief to test.
-
-**Use when:**
-
-- You want to be challenged rather than affirmed — pressure-testing a decision, plan, idea, or interpretation
-- You catch yourself wanting AI to agree with you, and you'd rather it poke holes, steelman the other side, or play devil's advocate
-- You're sharing work for review and want the weaknesses named first, not the strengths
-- Sycophancy would be the failure mode — easy agreement, praise, or hedging would rob you of the friction you came for
-
-### consult-codex
-
-A self-triggering skill for the coding agent itself: when Claude is genuinely stuck, weighing two or more technical approaches, facing a hard-to-reverse decision, or fighting a bug that's survived a couple of debugging passes, it shells out to `codex exec` for a second opinion from Codex (the OpenAI coding agent). Runs Codex read-only by default, frames a proper briefing (goal, the competing avenues, what's been tried, constraints), then weighs the answer critically rather than blindly following it — and reports back what it consulted and where it landed.
-
-**Use when:**
-
-- You're Claude, mid-task, and a second model's view would actually change what you do next — not on every hard line
-- You've made a real attempt and are still stuck, or honestly can't choose between approaches
-- A high-stakes or hard-to-reverse decision would be de-risked by another set of eyes
-
-(For a second-opinion *code review* specifically, use `codex-review` below.)
-
-### codex-review
-
-Gets a second-opinion code review from Codex (the OpenAI coding agent) by shelling out to `codex exec review`. Works both ways: Claude reaches for it on its own after writing a substantial chunk of code or before opening a PR, and it responds when you explicitly ask for a Codex review. Defaults to reviewing the whole branch diff against its base branch, and can also review just the uncommitted working changes or a single commit. Triages the findings on their merits — fixes the real ones, pushes back on the wrong ones, treats nits as your call — then reports what it reviewed and what it concluded.
-
-**Use when:**
-
-- Claude has just written a meaningful chunk of code and a second pair of eyes is worth it before it ships or before a PR
-- You explicitly want Codex to review a branch, PR, diff, or commit
-- You want the findings triaged and acted on, not a raw review transcript
-
-(For getting *unstuck* or choosing between approaches before code is written, use `consult-codex` instead.)
-
-### ship-ready-pr-loop
-
-Drives a change from review findings to a ship-ready PR. Runs `/code-review max`, fixes only the valid Critical and Major issues (root-cause, minimal changes, tests where appropriate), reruns validation, and repeats up to 5 passes. Then it creates a PR documenting what was fixed and any false positives, and runs `/greploop` repeatedly — up to 5 passes — until Greptile gives a 5/5 with no unresolved comments. Stays narrow: no broad rewrites, no low-priority churn, no weakening validation, and it never claims 5/5 unless the latest run confirms it.
-
-**Use when:**
-
-- You want a PR hardened until it's genuinely ready to ship, not just opened
-- You want Critical/Major review findings fixed and the PR pushed to a Greploop 5/5
-- You want a clear final report of passes run, fixes made, and any remaining blockers
+| Skill | What it does |
+|-------|--------------|
+| [`consult-codex`](skills/coding/consult-codex/SKILL.md) | Gets a second opinion from Codex (the OpenAI coding agent) when the agent is genuinely stuck or weighing competing technical approaches. |
+| [`codex-review`](skills/coding/codex-review/SKILL.md) | Gets a second-opinion code review from Codex on a branch, PR, diff, or commit, then triages the findings on their merits. |
+| [`ship-ready-pr-loop`](skills/coding/ship-ready-pr-loop/SKILL.md) | Drives a change from review findings to a ship-ready PR: fixes Critical/Major issues, then loops Greptile until it reaches 5/5. |
 
 ## Repository layout
 
