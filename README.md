@@ -106,6 +106,17 @@ Turns a fuzzy intent into a sharp, ready-to-run prompt. Gathers three ingredient
 - You want a reusable prompt you can run again — drafting emails, sales copy, job descriptions, summaries, anything
 - The bottleneck is *how to ask*, not the task itself (if you've already given a clear, complete request, the agent should just do it)
 
+### critical-partner
+
+Switches the agent into a critical-thinking partner whose default mode is constructive disagreement instead of agreement. Surfaces the untested assumption first, argues the strongest opposing case before conceding anything, names the weakest part of your work ahead of the strengths, calls out when you're emotionally invested, and retreats only on new evidence or reasoning — not because you pushed back. Won't manufacture flaws when the position is sound, and ends each exchange with one question to sit with rather than a reassuring summary. Stays out of the way for plain factual or execution requests where there's no belief to test.
+
+**Use when:**
+
+- You want to be challenged rather than affirmed — pressure-testing a decision, plan, idea, or interpretation
+- You catch yourself wanting AI to agree with you, and you'd rather it poke holes, steelman the other side, or play devil's advocate
+- You're sharing work for review and want the weaknesses named first, not the strengths
+- Sycophancy would be the failure mode — easy agreement, praise, or hedging would rob you of the friction you came for
+
 ### consult-codex
 
 A self-triggering skill for the coding agent itself: when Claude is genuinely stuck, weighing two or more technical approaches, facing a hard-to-reverse decision, or fighting a bug that's survived a couple of debugging passes, it shells out to `codex exec` for a second opinion from Codex (the OpenAI coding agent). Runs Codex read-only by default, frames a proper briefing (goal, the competing avenues, what's been tried, constraints), then weighs the answer critically rather than blindly following it — and reports back what it consulted and where it landed.
