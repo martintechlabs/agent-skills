@@ -159,18 +159,21 @@ agent-skills/
 ├── LICENSE            # MIT license
 ├── skills.sh.json     # skills.sh manifest (groupings, ordering)
 └── skills/
-    └── <skill-name>/
-        ├── SKILL.md       # Skill definition (frontmatter + instructions)
-        └── references/    # Optional supporting files the skill loads on demand
+    └── <category>/        # Category directory, mirrors a skills.sh.json grouping
+        └── <skill-name>/
+            ├── SKILL.md       # Skill definition (frontmatter + instructions)
+            └── references/    # Optional supporting files the skill loads on demand
 ```
 
-Each skill lives in its own directory under `skills/` and is defined by a single `SKILL.md` file with YAML frontmatter (`name`, `description`, optional `metadata`) followed by the instructions the agent should follow when the skill triggers.
+Skills are organized into **category directories** under `skills/` — currently `cto-toolkit/`, `productivity/`, and `coding/`. Each skill lives in its own `<skill-name>/` directory inside a category and is defined by a single `SKILL.md` file with YAML frontmatter (`name`, `description`, optional `metadata`) followed by the instructions the agent should follow when the skill triggers.
+
+The category directories **mirror the groupings in `skills.sh.json`** — that file remains the source of truth for how skills are grouped and ordered on the skills.sh page; the folders just make the same taxonomy visible when browsing the repo. Keep the two in sync: a skill's directory should sit under the category whose grouping lists it. Note that nothing tooling-side enforces this — the skills.sh CLI and the `--skill` flag resolve skills by their frontmatter `name`, not their path, so the category folder is purely organizational.
 
 ## Adding a new skill
 
-Each skill is a directory under `skills/` containing a single `SKILL.md`: YAML frontmatter followed by the Markdown instructions the agent follows when the skill triggers.
+Each skill is a directory under a category in `skills/` containing a single `SKILL.md`: YAML frontmatter followed by the Markdown instructions the agent follows when the skill triggers.
 
-1. **Create the file** `skills/<skill-name>/SKILL.md`. Use a short, hyphenated `<skill-name>` (e.g. `codebase-audit`); it must match the `name` in the frontmatter.
+1. **Pick a category** under `skills/` (`cto-toolkit/`, `productivity/`, or `coding/`) — or add a new one if none fit, and create a matching grouping in `skills.sh.json` (step 6). **Create the file** `skills/<category>/<skill-name>/SKILL.md`. Use a short, hyphenated `<skill-name>` (e.g. `codebase-audit`); it must match the `name` in the frontmatter.
 2. **Write the frontmatter.** `name` and `description` are required; `metadata` is optional but recommended:
 
    ```yaml
@@ -184,10 +187,10 @@ Each skill is a directory under `skills/` containing a single `SKILL.md`: YAML f
    ```
 
 3. **Write the instructions** below the frontmatter: be concrete about procedure, output format, and anti-patterns (follow the house style of the existing skills).
-4. **(Optional) Add supporting files** the skill loads on demand under `skills/<skill-name>/references/` (see `bug-class-audit`).
+4. **(Optional) Add supporting files** the skill loads on demand under `skills/<category>/<skill-name>/references/` (see `bug-class-audit`).
 5. **List it** under **Available skills** above, mirroring the existing format (one-paragraph summary + a "Use when" list).
-6. **(Optional) Group it** by adding the skill name to a grouping in `skills.sh.json`.
-7. **Test it** by installing locally and confirming it triggers (use `--skill` to select by name; skills live under `skills/`, so a `…/agent-skills/<skill-name>` path will not resolve):
+6. **Group it** by adding the skill name to the matching grouping in `skills.sh.json` — the same category whose directory you placed it under. Folders and groupings should agree.
+7. **Test it** by installing locally and confirming it triggers (use `--skill` to select by the frontmatter `name`, not a path — the CLI resolves skills by name regardless of which category directory they live in):
 
    ```bash
    npx skills add martintechlabs/agent-skills --skill <skill-name>
