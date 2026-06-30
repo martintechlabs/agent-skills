@@ -2,13 +2,14 @@
 name: conductor-neon-db
 description: >-
   Set up fully isolated per-workspace databases for Conductor: each workspace gets its own
-  instant schema-only Neon branch off production (full schema, zero production data), with
-  Prisma migration history baselined and test fixtures seeded, plus the .conductor/settings.toml
-  that wires setup/run/archive. Manual-only — run in a Neon + Prisma project to add the setup.
+  instant schema-only Neon branch off production (full schema, zero production data), with the
+  ORM's migration history baselined (Prisma or Drizzle) and test fixtures seeded, plus the
+  .conductor/settings.toml that wires setup/run/archive. Manual-only — run in a Neon + Prisma
+  or Neon + Drizzle project to add the setup.
 disable-model-invocation: true
 ---
 
-# Per-workspace isolated databases for Conductor (Neon + Prisma)
+# Per-workspace isolated databases for Conductor (Neon + Prisma or Drizzle)
 
 ## What this sets up
 
@@ -18,7 +19,7 @@ parallel agents never read or write the same rows. On workspace setup, `scripts/
 1. Creates an **instant schema-only Neon branch** off the production branch — the full schema
    and extensions (e.g. PostGIS reference data), but **zero production rows**. Neon copies no
    data, so this is fast and cheap, and no production data ever lands in a dev workspace.
-2. **Baselines** Prisma's migration history (see "Why" below).
+2. **Baselines** the ORM's migration history — Prisma or Drizzle (see "Why" below).
 3. **Seeds** test fixtures.
 4. Writes the branch's connection string to `.env` as `DATABASE_URL`.
 
@@ -27,48 +28,72 @@ On archive, the branch is deleted. The whole thing is driven by `.conductor/sett
 ## When this applies
 
 - The project's database is on **Neon** (branching is a Neon feature).
-- Migrations are managed by **Prisma**.
+- Migrations are managed by **Prisma** or **Drizzle** (set the `ORM` knob in the script).
 - `neonctl` and `tsx` are available as project-local dev dependencies, plus a Node package
-  manager (pnpm/npm/yarn).
+  manager (pnpm/npm/yarn). For **Drizzle** you also need the project's existing Postgres driver
+  (`@neondatabase/serverless` / `postgres` / `pg`) wired into the script's `execSql()` knob —
+  Drizzle has no `prisma db execute` equivalent for running the baseline INSERT.
 
-If the stack is different (not Neon, or not Prisma), the exact mechanics here don't transfer —
-adapt the script's knobs, or tell the user this skill assumes Neon + Prisma and stop.
+If the stack is different (not Neon, or not Prisma/Drizzle), the exact mechanics here don't
+transfer — adapt the script's knobs, or tell the user this skill assumes Neon + Prisma/Drizzle
+and stop.
 
 ## Why schema-only + baseline (the one non-obvious part)
 
-A schema-only Neon branch gives you the schema and extensions but an **empty `_prisma_migrations`
-table** (the migration history is table *data*, which schema-only doesn't copy). If you leave it
-empty, `prisma migrate dev/deploy` think nothing is applied, try to recreate every table, and
-fail because the tables already exist. So provisioning **baselines** the history: it computes
-Prisma's own checksum (sha256 of each `migration.sql`) and inserts a row per migration, marking
-them all applied. After that, `prisma migrate status` reports "up to date" and `migrate dev`
-works normally. (PostGIS's `spatial_ref_sys` is repopulated for free by the extension — no
-special handling needed.)
+A schema-only Neon branch gives you the schema and extensions but an **empty migrations table**
+(the migration history is table *data*, which schema-only doesn't copy). If you leave it empty,
+the migrator thinks nothing is applied, tries to recreate every table, and fails because the
+tables already exist. So provisioning **baselines** the history — reconstructing it from the
+repo's own migration files, marking every migration applied. It **never reads from production**;
+the migration files are the source of truth. The two ORMs differ only in the table and the row:
+
+- **Prisma** — the `_prisma_migrations` table. Each row's `checksum` is Prisma's own sha256 hex
+  of the `migration.sql`. After baselining, `prisma migrate status` reports "up to date" and
+  `migrate dev` works normally.
+- **Drizzle** — the `drizzle.__drizzle_migrations` table. Each row is `hash` (sha256 hex of the
+  migration's `.sql` file) plus `created_at` (the `when` timestamp from `meta/_journal.json`) —
+  exactly what drizzle-kit would have written. drizzle-kit decides what to run by the **latest
+  `created_at`**, so the timestamps must come from the journal, not `now()`. After baselining,
+  `drizzle-kit migrate` finds nothing to apply.
+
+(PostGIS's `spatial_ref_sys` is repopulated for free by the extension — no special handling, ORM
+either way.)
 
 This baseline assumes the **parent branch already contains the code's committed migrations** —
 true for the normal Conductor flow (workspaces branch from the default branch; production is
-deployed from it). If the parent ever lags, `prisma migrate reset` in the workspace rebuilds.
+deployed from it). If the parent ever lags, rebuild in the workspace (`prisma migrate reset`, or
+drop the branch and re-provision for Drizzle).
 
 ## Setup
 
 ### 1. Preflight
 
-Confirm the project is Neon + Prisma and find the package manager (lockfile: `pnpm-lock.yaml`
-→ pnpm, `package-lock.json` → npm, `yarn.lock` → yarn). Ensure `neonctl` and `tsx` are dev
-dependencies (`<pm> add -D neonctl tsx` if missing). Identify the Neon project's **production
-branch name** (`neonctl branches list --project-id <id>` — it's the one marked default/primary).
+Confirm the project is Neon + Prisma **or** Neon + Drizzle, and find the package manager
+(lockfile: `pnpm-lock.yaml` → pnpm, `package-lock.json` → npm, `yarn.lock` → yarn). Ensure
+`neonctl` and `tsx` are dev dependencies (`<pm> add -D neonctl tsx` if missing). For Drizzle,
+note which Postgres driver the project already uses (`@neondatabase/serverless` / `postgres` /
+`pg`) — you'll wire it into `execSql()` in step 2; don't add a new one. Identify the Neon
+project's **production branch name** (`neonctl branches list --project-id <id>` — it's the one
+marked default/primary).
 
 ### 2. Add the provisioning script
 
 Copy `scripts/conductor-db.ts` (bundled with this skill) into the project's `scripts/`. Then
 adjust the **PORTING KNOBS** block at the top:
+- `ORM` — set to `'prisma'` or `'drizzle'`. This switches the baseline + reuse logic throughout.
 - `PM_EXEC` — your package manager's exec form (`['pnpm','exec']` / `['npx']` / `['yarn']`).
 - `SEED_SCRIPT` and the `seedWorkspace()` body — adapt to the project's seed (see step 6).
-- The other paths (`MIGRATIONS_DIR`, `PRISMA_SCHEMA`, `ENV_FILE`) only change if non-standard.
+- **Prisma:** `PRISMA_MIGRATIONS_DIR`, `PRISMA_SCHEMA` only change if non-standard.
+- **Drizzle:** `DRIZZLE_MIGRATIONS_DIR` (the folder with `meta/_journal.json` + `<tag>.sql`),
+  and `DRIZZLE_MIGRATIONS_SCHEMA`/`DRIZZLE_MIGRATIONS_TABLE` only if you set a custom
+  `migrationsSchema`/`migrationsTable` in `drizzle.config`. **Wire `execSql()`** to the
+  project's Postgres driver (an example for each driver is in the block) and remove its throw —
+  this is what runs the baseline INSERT. Left unconfigured it raises a clear error.
+- `ENV_FILE` only changes if non-standard.
 
-Optionally copy the bundled `tests/conductor-db.test.ts` into the project's test directory —
-it locks the two safety-critical bits (the `conductor/*`-only deletion guard and the checksum
-format). Keeping these tested is the main reason this is TypeScript and not a shell script.
+Optionally copy the bundled `tests/conductor-db.test.ts` into the project's test directory — it
+locks the safety-critical bits (the `conductor/*`-only deletion guard and both ORMs' baseline
+row format). Keeping these tested is the main reason this is TypeScript and not a shell script.
 
 ### 3. Track the shared settings file in git
 
@@ -103,8 +128,10 @@ run = "pnpm dev --port $CONDUCTOR_PORT"
 run_mode = "concurrent"
 ```
 
-Adapt the `setup`/`run` commands to the project's package manager and dev server. `run_mode`
-can be `concurrent` because each workspace has its own DB and its own `$CONDUCTOR_PORT`.
+Adapt the `setup`/`run` commands to the project's package manager and dev server. **For Drizzle**,
+drop the `prisma generate` step (Drizzle has no client-generate step — `drizzle-kit generate`
+produces migration *files* at dev time and doesn't belong in workspace setup). `run_mode` can be
+`concurrent` because each workspace has its own DB and its own `$CONDUCTOR_PORT`.
 
 ### 5. Tell the user the Conductor environment variables to set
 
@@ -130,8 +157,9 @@ seeds have (or should have) a guard that refuses non-local databases to prevent 
 production seeding — authorize it for **this branch only** (never production). The bundled
 script shows the pattern for a seed that allows a remote DB when `E2E_EXPECTED_DATABASE_URL ===
 DATABASE_URL`. If the project's seed is a plain `prisma db seed` with no guard, simplify the body
-to `runWithRetry('prisma', ['db', 'seed'], { ...process.env, DATABASE_URL: uri }, 2)`. If there's
-no seed, delete `seedWorkspace()` and its call.
+to `runWithRetry('prisma', ['db', 'seed'], { ...process.env, DATABASE_URL: uri }, 2)`; a Drizzle
+project typically seeds via a tsx script — `runWithRetry('tsx', [SEED_SCRIPT], { ...process.env,
+DATABASE_URL: uri }, 2)`. If there's no seed, delete `seedWorkspace()` and its call.
 
 ### 7. Verify
 
@@ -151,7 +179,8 @@ The script can't harm production, by construction:
 - **Self-destruct on failure**: if baseline or seed fails on a new branch, the branch is deleted
   so a half-set-up branch is never reused.
 - **Reuse preserves data**: re-provisioning an existing workspace branch keeps its data (only
-  runs `migrate deploy`); it never re-seeds or re-baselines.
+  runs the ORM's migrate-deploy — `prisma migrate deploy` / `drizzle-kit migrate`); it never
+  re-seeds or re-baselines.
 - Plus the Neon-side **branch protection** on production (step 7).
 
 ## Gotchas
@@ -160,6 +189,10 @@ The script can't harm production, by construction:
 - **Seeding is opt-in**: if the seed credential isn't set, provisioning logs a warning and the
   workspace comes up empty rather than failing setup. Set it to seed.
 - **Baseline assumption**: parent (production) must contain the code's committed migrations; if
-  it lags, `prisma migrate reset` in the workspace rebuilds cleanly.
+  it lags, rebuild in the workspace (`prisma migrate reset`, or drop the branch and re-provision
+  for Drizzle).
+- **Drizzle needs `execSql` wired** (step 2): unlike Prisma's `db execute`, Drizzle has no SQL-
+  runner CLI, so the baseline INSERT runs through the project's own Postgres driver. Left
+  unconfigured, provisioning fails fast with a clear remediation message.
 - **Branches branch from the default branch** in Conductor, which is why parent == code migrations
   in the normal case.

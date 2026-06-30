@@ -67,7 +67,7 @@ Skills for provisioning and wiring up development infrastructure.
 
 | Skill | What it does |
 |-------|--------------|
-| [`conductor-neon-db`](skills/devops/conductor-neon-db/SKILL.md) | Sets up fully isolated per-workspace databases for Conductor — each workspace gets its own instant schema-only Neon branch (full schema, zero production data) with Prisma migration history baselined and fixtures seeded, plus the `.conductor/settings.toml` that wires setup/run/archive. |
+| [`conductor-neon-db`](skills/devops/conductor-neon-db/SKILL.md) | Sets up fully isolated per-workspace databases for Conductor — each workspace gets its own instant schema-only Neon branch (full schema, zero production data) with the ORM's migration history baselined (Prisma or Drizzle) and fixtures seeded, plus the `.conductor/settings.toml` that wires setup/run/archive. |
 
 ## Repository layout
 

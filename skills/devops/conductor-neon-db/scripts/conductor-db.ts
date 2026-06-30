@@ -4,8 +4,9 @@
 // Each workspace gets its own SCHEMA-ONLY Neon branch off the production branch: the full
 // schema + extensions (e.g. PostGIS's spatial_ref_sys data) but ZERO production rows,
 // created instantly (Neon copies no data). Provisioning then:
-//   • baselines Prisma's migration history — a schema-only branch starts with an EMPTY
-//     _prisma_migrations, which would otherwise break `prisma migrate dev/deploy`; and
+//   • baselines the ORM's migration history — a schema-only branch starts with an EMPTY
+//     migrations table, which would otherwise make the migrator re-run every migration
+//     against tables that already exist and fail; and
 //   • seeds test fixtures (the last step of setup).
 // The branch is deleted when the workspace is archived.
 //
@@ -19,30 +20,78 @@
 //   NEON_PARENT_BRANCH – REQUIRED (no default); branch to clone, e.g. "production"
 //   (seed credentials) – whatever your seed needs — see seedWorkspace() below
 //
-// Assumes Neon (Postgres) + Prisma migrations, with `neonctl` and `tsx` available as
-// project-local binaries. Adjust the PORTING KNOBS just below for your project.
+// Assumes Neon (Postgres) with migrations managed by EITHER Prisma OR Drizzle (set ORM below),
+// with `neonctl` and `tsx` available as project-local binaries. The Drizzle path additionally
+// needs the project's own Postgres driver wired into execSql() (Drizzle has no `prisma db
+// execute` equivalent). Adjust the PORTING KNOBS just below for your project.
 //
 // Baselining assumes the parent branch already contains every migration committed on this
 // code branch — true for the normal Conductor flow (workspaces branch from the default
-// branch; production is deployed from it). If the parent lags the code's migrations, run
-// `prisma migrate reset` in the workspace to rebuild from migrations.
+// branch; production is deployed from it). If the parent lags the code's migrations, run the
+// ORM's reset (`prisma migrate reset` / `drizzle-kit push` from scratch) in the workspace.
 //
 // SAFETY: every destructive op (branch delete) is guarded to only ever run against a
-// disposable `conductor/*` branch — never the parent/production branch.
+// disposable `conductor/*` branch — never the parent/production branch. The baseline is
+// RECONSTRUCTED from the repo's migration files — provisioning never reads from production.
 
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 
 // ── PORTING KNOBS ────────────────────────────────────────────────────────────
-// How to run a project-local CLI (neonctl/prisma/tsx). Match your package manager:
+// Which ORM manages migrations. Switches the baseline + reuse logic throughout.
+const ORM: 'prisma' | 'drizzle' = 'prisma'
+
+// How to run a project-local CLI (neonctl/prisma/drizzle-kit/tsx). Match your package manager:
 //   pnpm → ['pnpm', 'exec']   npm → ['npx']   yarn → ['yarn']
 const PM_EXEC = ['pnpm', 'exec']
-const ENV_FILE = '.env' // file the app/Prisma/tsx auto-load DATABASE_URL from
+const ENV_FILE = '.env' // file the app/ORM/tsx auto-load DATABASE_URL from
 const BRANCH_PREFIX = 'conductor/' // workspace-branch namespace (matches Neon's preview/)
-const MIGRATIONS_DIR = 'prisma/migrations'
+const SEED_SCRIPT = 'prisma/seed.ts' // project's seed entrypoint (see seedWorkspace)
+
+// ── Prisma knobs (used when ORM === 'prisma') ────────────────────────────────
+const PRISMA_MIGRATIONS_DIR = 'prisma/migrations'
 const PRISMA_SCHEMA = 'prisma/schema.prisma'
-const SEED_SCRIPT = 'prisma/seed.ts'
+
+// ── Drizzle knobs (used when ORM === 'drizzle') ──────────────────────────────
+// Folder drizzle-kit writes migrations to (contains meta/_journal.json and <tag>.sql files).
+const DRIZZLE_MIGRATIONS_DIR = 'drizzle'
+// Where drizzle records applied migrations. Defaults match drizzle-kit; override only if you
+// set a custom migrationsSchema/migrationsTable in drizzle.config.
+const DRIZZLE_MIGRATIONS_SCHEMA = 'drizzle'
+const DRIZZLE_MIGRATIONS_TABLE = '__drizzle_migrations'
+
+/**
+ * Execute SQL against a Neon branch — used by the Drizzle baseline, which (unlike Prisma's
+ * `db execute`) has no built-in CLI to run arbitrary SQL. Wire this to the Postgres driver the
+ * project ALREADY depends on; do not add a new one. Pick the matching example, move its import
+ * to the top of the file, drop the body's throw:
+ *
+ *   // @neondatabase/serverless (HTTP, nothing to close — ideal for a one-shot script):
+ *   //   import { neon } from '@neondatabase/serverless'
+ *   //   async function execSql(uri, sql) { await neon(uri)(sql) }
+ *
+ *   // postgres (postgres-js):
+ *   //   import postgres from 'postgres'
+ *   //   async function execSql(uri, sql) {
+ *   //     const c = postgres(uri); try { await c.unsafe(sql) } finally { await c.end() }
+ *   //   }
+ *
+ *   // pg (node-postgres):
+ *   //   import { Client } from 'pg'
+ *   //   async function execSql(uri, sql) {
+ *   //     const c = new Client({ connectionString: uri }); await c.connect()
+ *   //     try { await c.query(sql) } finally { await c.end() }
+ *   //   }
+ *
+ * Left unconfigured it raises a clear error rather than inventing a driver dependency.
+ */
+async function execSql(_uri: string, _sql: string): Promise<void> {
+  throw new Error(
+    'ORM is "drizzle" but execSql() is not configured. Wire it to the project\'s Postgres driver ' +
+      '(@neondatabase/serverless / postgres / pg) — see the example in the PORTING KNOBS block.',
+  )
+}
 // ─────────────────────────────────────────────────────────────────────────────
 
 function requireEnv(name: string): string {
@@ -142,10 +191,10 @@ function writeDatabaseUrl(uri: string): void {
 }
 
 /**
- * Build the INSERT that baselines _prisma_migrations to "all migrations applied", using
- * Prisma's own checksum (sha256 hex of each migration.sql). Returns null if there are none.
+ * Build the INSERT that baselines Prisma's _prisma_migrations to "all migrations applied",
+ * using Prisma's own checksum (sha256 hex of each migration.sql). Returns null if none.
  */
-export function buildBaselineSql(migrations: Array<{ name: string; sql: string }>): string | null {
+export function buildPrismaBaselineSql(migrations: Array<{ name: string; sql: string }>): string | null {
   if (migrations.length === 0) return null
   const values = migrations
     .map(({ name, sql }) => {
@@ -160,29 +209,91 @@ export function buildBaselineSql(migrations: Array<{ name: string; sql: string }
   )
 }
 
-/** Read committed migrations (name + SQL) from disk, in apply order. */
-function readMigrations(): Array<{ name: string; sql: string }> {
-  return readdirSync(MIGRATIONS_DIR, { withFileTypes: true })
+/**
+ * Build the INSERT that baselines Drizzle's migrations table to "all migrations applied". Each
+ * row is (hash = sha256 hex of the migration .sql file's contents, created_at = the journal's
+ * `when` ms timestamp) — exactly what drizzle-kit would have written. drizzle-kit decides what
+ * to run by the latest created_at, so the timestamps must come from the journal, not now().
+ * Prepends CREATE SCHEMA/TABLE IF NOT EXISTS so it works even on the rare branch whose
+ * schema-only copy somehow lacks the (empty) migrations table. Returns null if none.
+ */
+export function buildDrizzleBaselineSql(migrations: Array<{ sql: string; when: number }>): string | null {
+  if (migrations.length === 0) return null
+  const values = migrations
+    .map(({ sql, when }) => {
+      const hash = createHash('sha256').update(sql).digest('hex')
+      return `('${hash}', ${when})`
+    })
+    .join(',\n')
+  const qualified = `"${DRIZZLE_MIGRATIONS_SCHEMA}"."${DRIZZLE_MIGRATIONS_TABLE}"`
+  return (
+    `CREATE SCHEMA IF NOT EXISTS "${DRIZZLE_MIGRATIONS_SCHEMA}";\n` +
+    `CREATE TABLE IF NOT EXISTS ${qualified} (id SERIAL PRIMARY KEY, hash text NOT NULL, created_at bigint);\n` +
+    `INSERT INTO ${qualified} (hash, created_at) VALUES\n${values};`
+  )
+}
+
+/** Read committed Prisma migrations (name + SQL) from disk, in apply order. */
+function readPrismaMigrations(): Array<{ name: string; sql: string }> {
+  return readdirSync(PRISMA_MIGRATIONS_DIR, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
     .sort()
     .flatMap((name) => {
       try {
-        return [{ name, sql: readFileSync(`${MIGRATIONS_DIR}/${name}/migration.sql`, 'utf8') }]
+        return [{ name, sql: readFileSync(`${PRISMA_MIGRATIONS_DIR}/${name}/migration.sql`, 'utf8') }]
       } catch {
         return [] // directory without a migration.sql — skip
       }
     })
 }
 
-/** A schema-only branch starts with an empty _prisma_migrations; baseline it so migrate works. */
-function baselineMigrations(uri: string): void {
-  const sql = buildBaselineSql(readMigrations())
-  if (!sql) {
-    console.log('[prisma] no migrations to baseline.')
+/**
+ * Read committed Drizzle migrations from disk, in apply order. The journal (meta/_journal.json)
+ * is the source of truth for order and each migration's `when` timestamp; the SQL lives in the
+ * sibling `<tag>.sql` file.
+ */
+function readDrizzleMigrations(): Array<{ sql: string; when: number }> {
+  const journalPath = `${DRIZZLE_MIGRATIONS_DIR}/meta/_journal.json`
+  let journal: { entries?: Array<{ tag: string; when: number }> }
+  try {
+    journal = JSON.parse(readFileSync(journalPath, 'utf8'))
+  } catch (error) {
+    throw new Error(`Could not read Drizzle journal at ${journalPath}: ${error instanceof Error ? error.message : error}`)
+  }
+  return (journal.entries ?? []).map(({ tag, when }) => ({
+    sql: readFileSync(`${DRIZZLE_MIGRATIONS_DIR}/${tag}.sql`, 'utf8'),
+    when,
+  }))
+}
+
+/** A schema-only branch starts with an empty migrations table; baseline it so the migrator works. */
+async function baselineMigrations(uri: string): Promise<void> {
+  if (ORM === 'prisma') {
+    const sql = buildPrismaBaselineSql(readPrismaMigrations())
+    if (!sql) {
+      console.log('[prisma] no migrations to baseline.')
+      return
+    }
+    runWithRetry('prisma', ['db', 'execute', '--schema', PRISMA_SCHEMA, '--stdin'], { ...process.env, DATABASE_URL: uri }, 3, sql)
     return
   }
-  runWithRetry('prisma', ['db', 'execute', '--schema', PRISMA_SCHEMA, '--stdin'], { ...process.env, DATABASE_URL: uri }, 3, sql)
+  // drizzle: no `db execute` CLI — run the baseline via the project's own Postgres driver.
+  const sql = buildDrizzleBaselineSql(readDrizzleMigrations())
+  if (!sql) {
+    console.log('[drizzle] no migrations to baseline.')
+    return
+  }
+  await execSql(uri, sql)
+}
+
+/** Apply any migrations pulled into this workspace since its branch was created. */
+function deployMigrations(uri: string): void {
+  if (ORM === 'prisma') {
+    runWithRetry('prisma', ['migrate', 'deploy'], { ...process.env, DATABASE_URL: uri })
+  } else {
+    runWithRetry('drizzle-kit', ['migrate'], { ...process.env, DATABASE_URL: uri })
+  }
 }
 
 /**
@@ -191,7 +302,8 @@ function baselineMigrations(uri: string): void {
  * ── ADAPT THIS to your project's seed ──────────────────────────────────────────
  *  • No seed?  Delete this function and its call in provision().
  *  • Plain seed, no safety guard?  Replace the body with:
- *      runWithRetry('prisma', ['db', 'seed'], { ...process.env, DATABASE_URL: uri }, 2)
+ *      Prisma:  runWithRetry('prisma', ['db', 'seed'], { ...process.env, DATABASE_URL: uri }, 2)
+ *      Drizzle: runWithRetry('tsx', [SEED_SCRIPT], { ...process.env, DATABASE_URL: uri }, 2)
  *  • Seed that REFUSES non-local DBs (recommended — stops accidental prod seeding)?
  *      Authorize it for THIS branch only. The example below matches a seed that allows a
  *      remote DB when E2E_EXPECTED_DATABASE_URL === DATABASE_URL, gated on a password.
@@ -208,7 +320,7 @@ function seedWorkspace(uri: string): void {
   runWithRetry('tsx', [SEED_SCRIPT], { ...process.env, DATABASE_URL: uri, E2E_EXPECTED_DATABASE_URL: uri }, 2)
 }
 
-function provision(): void {
+async function provision(): Promise<void> {
   const projectId = requireEnv('NEON_PROJECT_ID')
   requireEnv('NEON_API_KEY') // consumed by neonctl from the environment
   const parent = requireEnv('NEON_PARENT_BRANCH')
@@ -236,8 +348,8 @@ function provision(): void {
     // Treat the two as atomic: if either fails, delete the branch so the next provision
     // starts clean rather than reusing a half-set-up branch.
     try {
-      console.log('[prisma] baselining migration history (schema-only branches start empty)…')
-      baselineMigrations(uri)
+      console.log(`[${ORM}] baselining migration history (schema-only branches start empty)…`)
+      await baselineMigrations(uri)
       seedWorkspace(uri)
     } catch (error) {
       console.error('[conductor-db] new-branch setup failed — deleting it so the next attempt starts clean.')
@@ -250,8 +362,8 @@ function provision(): void {
     }
   } else {
     // Reuse: apply any migrations pulled into this workspace since the branch was created.
-    console.log('[prisma] applying any migrations beyond the baseline…')
-    runWithRetry('prisma', ['migrate', 'deploy'], { ...process.env, DATABASE_URL: uri })
+    console.log(`[${ORM}] applying any migrations beyond the baseline…`)
+    deployMigrations(uri)
   }
 
   console.log('✅ [conductor-db] workspace database ready.')
@@ -281,10 +393,10 @@ function teardown(): void {
   }
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const mode = process.argv[2]
   try {
-    if (mode === 'provision') provision()
+    if (mode === 'provision') await provision()
     else if (mode === 'teardown') teardown()
     else {
       console.error('Usage: tsx scripts/conductor-db.ts <provision|teardown>')
@@ -299,5 +411,5 @@ function main(): void {
 // Run only when executed directly (e.g. `tsx scripts/conductor-db.ts provision`),
 // so unit tests can import the pure helpers above without triggering the CLI.
 if (process.argv[1] && /conductor-db\.[cm]?[jt]s$/.test(process.argv[1])) {
-  main()
+  void main()
 }
