@@ -61,6 +61,14 @@ Skills the coding agent reaches for while working.
 | [`codex-review`](skills/coding/codex-review/SKILL.md) | Gets a second-opinion code review from Codex on a branch, PR, diff, or commit, then triages the findings on their merits. |
 | [`ship-ready-pr-loop`](skills/coding/ship-ready-pr-loop/SKILL.md) | Drives a change from review findings to a ship-ready PR: fixes Critical/Major issues, then loops Greptile until it reaches 5/5. |
 
+### DevOps
+
+Skills for provisioning and wiring up development infrastructure.
+
+| Skill | What it does |
+|-------|--------------|
+| [`conductor-neon-db`](skills/devops/conductor-neon-db/SKILL.md) | Sets up fully isolated per-workspace databases for Conductor — each workspace gets its own instant schema-only Neon branch (full schema, zero production data) with the ORM's migration history baselined (Prisma or Drizzle) and fixtures seeded, plus the `.conductor/settings.toml` that wires setup/run/archive. |
+
 ## Repository layout
 
 ```
@@ -75,7 +83,7 @@ agent-skills/
             └── references/    # Optional supporting files the skill loads on demand
 ```
 
-Skills are organized into **category directories** under `skills/` — currently `cto-toolkit/`, `productivity/`, and `coding/`. Each skill lives in its own `<skill-name>/` directory inside a category and is defined by a single `SKILL.md` file with YAML frontmatter (`name`, `description`, optional `metadata`) followed by the instructions the agent should follow when the skill triggers.
+Skills are organized into **category directories** under `skills/` — currently `cto-toolkit/`, `productivity/`, `coding/`, and `devops/`. Each skill lives in its own `<skill-name>/` directory inside a category and is defined by a single `SKILL.md` file with YAML frontmatter (`name`, `description`, optional `metadata`) followed by the instructions the agent should follow when the skill triggers.
 
 The category directories **mirror the groupings in `skills.sh.json`** — that file remains the source of truth for how skills are grouped and ordered on the skills.sh page; the folders just make the same taxonomy visible when browsing the repo. Keep the two in sync: a skill's directory should sit under the category whose grouping lists it. Note that nothing tooling-side enforces this — the skills.sh CLI and the `--skill` flag resolve skills by their frontmatter `name`, not their path, so the category folder is purely organizational.
 
@@ -83,7 +91,7 @@ The category directories **mirror the groupings in `skills.sh.json`** — that f
 
 Each skill is a directory under a category in `skills/` containing a single `SKILL.md`: YAML frontmatter followed by the Markdown instructions the agent follows when the skill triggers.
 
-1. **Pick a category** under `skills/` (`cto-toolkit/`, `productivity/`, or `coding/`) — or add a new one if none fit, and create a matching grouping in `skills.sh.json` (step 6). **Create the file** `skills/<category>/<skill-name>/SKILL.md`. Use a short, hyphenated `<skill-name>` (e.g. `codebase-audit`); it must match the `name` in the frontmatter.
+1. **Pick a category** under `skills/` (`cto-toolkit/`, `productivity/`, `coding/`, or `devops/`) — or add a new one if none fit, and create a matching grouping in `skills.sh.json` (step 6). **Create the file** `skills/<category>/<skill-name>/SKILL.md`. Use a short, hyphenated `<skill-name>` (e.g. `codebase-audit`); it must match the `name` in the frontmatter.
 2. **Write the frontmatter.** `name` and `description` are required; `metadata` is optional but recommended:
 
    ```yaml
