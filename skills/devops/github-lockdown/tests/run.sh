@@ -136,5 +136,35 @@ test_flags_flip_fields() {
 
 test_flags_flip_fields
 
+test_plan_create() {
+  local d; d="$(mktemp -d)"
+  run_lockdown "$d/bin" FAKE_GH_VIEWER_PERMISSION=ADMIN FAKE_GH_RULESETS_JSON='[]' \
+    -- --dry-run --repo octo/repo
+  assert_contains "$ERR" "PLAN CREATE ruleset name=github-lockdown via POST repos/octo/repo/rulesets" "plans a CREATE when none exists"
+  assert_contains "$ERR" "PLAN SET repos/octo/repo delete_branch_on_merge=true" "plans auto-delete"
+  rm -rf "$d"
+}
+
+test_plan_update() {
+  local d; d="$(mktemp -d)"
+  run_lockdown "$d/bin" FAKE_GH_VIEWER_PERMISSION=ADMIN \
+    FAKE_GH_RULESETS_JSON='[{"id":42,"name":"github-lockdown"},{"id":7,"name":"other"}]' \
+    -- --dry-run --repo octo/repo
+  assert_contains "$ERR" "PLAN UPDATE ruleset id=42 via PUT repos/octo/repo/rulesets/42" "plans an UPDATE by id when it exists"
+  rm -rf "$d"
+}
+
+test_plan_no_auto_delete() {
+  local d; d="$(mktemp -d)"
+  run_lockdown "$d/bin" FAKE_GH_VIEWER_PERMISSION=ADMIN FAKE_GH_RULESETS_JSON='[]' \
+    -- --dry-run --repo octo/repo --no-auto-delete
+  case "$ERR" in *"delete_branch_on_merge"*) bad "no-auto-delete suppresses the plan" "found delete_branch_on_merge line";; *) ok "no-auto-delete suppresses the plan";; esac
+  rm -rf "$d"
+}
+
+test_plan_create
+test_plan_update
+test_plan_no_auto_delete
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

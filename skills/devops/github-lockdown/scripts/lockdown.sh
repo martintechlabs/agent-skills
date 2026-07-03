@@ -40,8 +40,12 @@ main() {
   preflight
   if [ "$PREFLIGHT_ONLY" = true ]; then exit 0; fi
 
-  local body; body="$(build_ruleset_json)"
+  local body id
+  body="$(build_ruleset_json)"
+  id="$(find_ruleset_id)"
   if [ "$DRY_RUN" = true ]; then printf '%s\n' "$body"; fi
+  apply_ruleset "$body" "$id"
+  apply_auto_delete
 }
 
 parse_args() {
@@ -145,6 +149,37 @@ build_ruleset_json() {
       conditions: { ref_name: { include: $refs, exclude: [] } },
       rules: $rules
     }'
+}
+
+find_ruleset_id() {
+  gh api "repos/$REPO/rulesets" --paginate 2>/dev/null \
+    | jq -r --arg n "$NAME" 'if type=="array" then . else [.] end | map(select(.name==$n)) | (.[0].id // empty)'
+}
+
+apply_ruleset() {
+  local body="$1" id="$2"
+  if [ "$DRY_RUN" = true ]; then
+    if [ -n "$id" ]; then
+      echo "PLAN UPDATE ruleset id=$id via PUT repos/$REPO/rulesets/$id" >&2
+    else
+      echo "PLAN CREATE ruleset name=$NAME via POST repos/$REPO/rulesets" >&2
+    fi
+    return 0
+  fi
+  if [ -n "$id" ]; then
+    printf '%s' "$body" | gh api -X PUT "repos/$REPO/rulesets/$id" --input - >/dev/null
+  else
+    printf '%s' "$body" | gh api -X POST "repos/$REPO/rulesets" --input - >/dev/null
+  fi
+}
+
+apply_auto_delete() {
+  [ "$AUTO_DELETE" = true ] || return 0
+  if [ "$DRY_RUN" = true ]; then
+    echo "PLAN SET repos/$REPO delete_branch_on_merge=true" >&2
+    return 0
+  fi
+  gh api -X PATCH "repos/$REPO" -F delete_branch_on_merge=true >/dev/null
 }
 
 print_config() {
