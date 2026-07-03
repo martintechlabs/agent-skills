@@ -74,5 +74,23 @@ test_parse_args() {
 
 test_parse_args
 
+test_preflight_admin_ok() {
+  local d; d="$(mktemp -d)"
+  run_lockdown "$d/bin" FAKE_GH_VIEWER_PERMISSION=ADMIN -- --preflight-only --repo octo/repo
+  assert_eq "$RC" "0" "preflight passes for ADMIN"
+  rm -rf "$d"
+}
+
+test_preflight_non_admin_fails() {
+  local d; d="$(mktemp -d)"
+  run_lockdown "$d/bin" FAKE_GH_VIEWER_PERMISSION=WRITE -- --preflight-only --repo octo/repo
+  assert_eq "$RC" "1" "preflight fails for non-admin"
+  assert_contains "$ERR" "admin" "non-admin error mentions admin"
+  rm -rf "$d"
+}
+
+test_preflight_admin_ok
+test_preflight_non_admin_fails
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

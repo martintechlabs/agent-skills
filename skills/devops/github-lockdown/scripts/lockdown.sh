@@ -8,6 +8,7 @@ REPO=""; BRANCH=""; APPROVALS=0; ADMIN_BYPASS=false
 THREAD_RES=false; LINEAR=false; SIGNED=false; CODE_OWNER=false; DISMISS_STALE=false
 STATUS_CHECKS=""; AUTO_DELETE=true; NAME="github-lockdown"; DRY_RUN=false
 PRINT_CONFIG=false
+PREFLIGHT_ONLY=false
 
 usage() {
   cat <<'EOF'
@@ -36,6 +37,8 @@ EOF
 main() {
   parse_args "$@"
   if [ "$PRINT_CONFIG" = true ]; then print_config; exit 0; fi
+  preflight
+  if [ "$PREFLIGHT_ONLY" = true ]; then exit 0; fi
 }
 
 parse_args() {
@@ -55,10 +58,31 @@ parse_args() {
       --ruleset-name) NAME="$2"; shift 2 ;;
       --dry-run) DRY_RUN=true; shift ;;
       --print-config) PRINT_CONFIG=true; shift ;;
+      --preflight-only) PREFLIGHT_ONLY=true; shift ;;
       --help) usage; exit 0 ;;
       *) echo "Unknown flag: $1" >&2; usage >&2; exit 2 ;;
     esac
   done
+}
+
+preflight() {
+  command -v jq >/dev/null 2>&1 || { echo "jq is required. Install jq and retry." >&2; exit 1; }
+  gh auth status >/dev/null 2>&1 || { echo "Not authenticated. Run: gh auth login" >&2; exit 1; }
+  resolve_repo
+  local perm
+  perm="$(gh repo view "$REPO" --json viewerPermission -q .viewerPermission 2>/dev/null || true)"
+  if [ "$perm" != "ADMIN" ]; then
+    echo "You need admin permission on $REPO to change rulesets (have: ${perm:-unknown})." >&2
+    echo "Ask an org/repo admin to run this, or grant yourself the admin role." >&2
+    exit 1
+  fi
+}
+
+resolve_repo() {
+  if [ -z "$REPO" ]; then
+    REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+  fi
+  [ -n "$REPO" ] || { echo "Could not determine repo. Pass --repo <owner/repo>." >&2; exit 1; }
 }
 
 print_config() {
