@@ -39,6 +39,9 @@ main() {
   if [ "$PRINT_CONFIG" = true ]; then print_config; exit 0; fi
   preflight
   if [ "$PREFLIGHT_ONLY" = true ]; then exit 0; fi
+
+  local body; body="$(build_ruleset_json)"
+  if [ "$DRY_RUN" = true ]; then printf '%s\n' "$body"; fi
 }
 
 parse_args() {
@@ -83,6 +86,65 @@ resolve_repo() {
     REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
   fi
   [ -n "$REPO" ] || { echo "Could not determine repo. Pass --repo <owner/repo>." >&2; exit 1; }
+}
+
+ref_includes() {
+  if [ -n "$BRANCH" ]; then
+    jq -n --arg b "refs/heads/$BRANCH" '[$b]'
+  else
+    jq -n '["~DEFAULT_BRANCH"]'
+  fi
+}
+
+build_ruleset_json() {
+  local rules
+  rules="$(jq -n \
+    --argjson approvals "$APPROVALS" \
+    --argjson dismiss "$DISMISS_STALE" \
+    --argjson codeowner "$CODE_OWNER" \
+    --argjson threadres "$THREAD_RES" \
+    '[
+      {type:"pull_request", parameters:{
+        required_approving_review_count:$approvals,
+        dismiss_stale_reviews_on_push:$dismiss,
+        require_code_owner_review:$codeowner,
+        require_last_push_approval:false,
+        required_review_thread_resolution:$threadres
+      }},
+      {type:"non_fast_forward"},
+      {type:"deletion"}
+    ]')"
+
+  [ "$LINEAR" = true ] && rules="$(jq '. + [{type:"required_linear_history"}]' <<<"$rules")"
+  [ "$SIGNED" = true ] && rules="$(jq '. + [{type:"required_signatures"}]' <<<"$rules")"
+
+  if [ -n "$STATUS_CHECKS" ]; then
+    local checks
+    checks="$(printf '%s' "$STATUS_CHECKS" | jq -R 'split(",") | map({context: (. | gsub("^\\s+|\\s+$";""))})')"
+    rules="$(jq --argjson c "$checks" \
+      '. + [{type:"required_status_checks", parameters:{
+          required_status_checks:$c,
+          strict_required_status_checks_policy:false,
+          do_not_enforce_on_create:false }}]' <<<"$rules")"
+  fi
+
+  local bypass="[]"
+  # RepositoryRole id 5 == the built-in "admin" repo role.
+  [ "$ADMIN_BYPASS" = true ] && bypass='[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}]'
+
+  jq -n \
+    --arg name "$NAME" \
+    --argjson refs "$(ref_includes)" \
+    --argjson rules "$rules" \
+    --argjson bypass "$bypass" \
+    '{
+      name: $name,
+      target: "branch",
+      enforcement: "active",
+      bypass_actors: $bypass,
+      conditions: { ref_name: { include: $refs, exclude: [] } },
+      rules: $rules
+    }'
 }
 
 print_config() {

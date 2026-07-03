@@ -92,5 +92,29 @@ test_preflight_non_admin_fails() {
 test_preflight_admin_ok
 test_preflight_non_admin_fails
 
+# jqok <json> <jq-filter-returning-true> <label>
+jqok() {
+  local got; got="$(printf '%s' "$1" | jq -r "$2" 2>/dev/null)"
+  assert_eq "$got" "true" "$3"
+}
+
+test_default_ruleset_body() {
+  local d; d="$(mktemp -d)"
+  run_lockdown "$d/bin" FAKE_GH_VIEWER_PERMISSION=ADMIN FAKE_GH_RULESETS_JSON='[]' \
+    -- --dry-run --repo octo/repo
+  assert_eq "$RC" "0" "default dry-run exits 0"
+  jqok "$OUT" '.name == "github-lockdown"'                                   "name is github-lockdown"
+  jqok "$OUT" '.enforcement == "active"'                                     "enforcement active"
+  jqok "$OUT" '.target == "branch"'                                          "target branch"
+  jqok "$OUT" '(.bypass_actors | length) == 0'                              "no bypass actors"
+  jqok "$OUT" '.conditions.ref_name.include == ["~DEFAULT_BRANCH"]'          "targets default branch"
+  jqok "$OUT" 'any(.rules[]; .type == "non_fast_forward")'                   "blocks force-push"
+  jqok "$OUT" 'any(.rules[]; .type == "deletion")'                          "blocks deletion"
+  jqok "$OUT" '(.rules[] | select(.type=="pull_request") | .parameters.required_approving_review_count) == 0' "0 approvers"
+  rm -rf "$d"
+}
+
+test_default_ruleset_body
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
