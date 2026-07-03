@@ -116,5 +116,25 @@ test_default_ruleset_body() {
 
 test_default_ruleset_body
 
+test_flags_flip_fields() {
+  local d; d="$(mktemp -d)"
+  run_lockdown "$d/bin" FAKE_GH_VIEWER_PERMISSION=ADMIN -- --dry-run --repo octo/repo \
+    --approvals 2 --admin-bypass --linear-history --signed-commits \
+    --require-code-owner-review --dismiss-stale-approvals \
+    --require-conversation-resolution --status-checks "ci, build" --branch release
+  jqok "$OUT" '(.rules[] | select(.type=="pull_request") | .parameters.required_approving_review_count) == 2' "approvals=2"
+  jqok "$OUT" '(.rules[] | select(.type=="pull_request") | .parameters.require_code_owner_review) == true'     "code owner review on"
+  jqok "$OUT" '(.rules[] | select(.type=="pull_request") | .parameters.dismiss_stale_reviews_on_push) == true' "dismiss stale on"
+  jqok "$OUT" '(.rules[] | select(.type=="pull_request") | .parameters.required_review_thread_resolution) == true' "conversation resolution on"
+  jqok "$OUT" 'any(.rules[]; .type=="required_linear_history")'   "linear history rule present"
+  jqok "$OUT" 'any(.rules[]; .type=="required_signatures")'       "signatures rule present"
+  jqok "$OUT" '(.rules[] | select(.type=="required_status_checks") | .parameters.required_status_checks) == [{context:"ci"},{context:"build"}]' "status checks trimmed + parsed"
+  jqok "$OUT" '.bypass_actors == [{actor_id:5, actor_type:"RepositoryRole", bypass_mode:"always"}]' "admin bypass actor"
+  jqok "$OUT" '.conditions.ref_name.include == ["refs/heads/release"]' "explicit branch target"
+  rm -rf "$d"
+}
+
+test_flags_flip_fields
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
