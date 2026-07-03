@@ -180,5 +180,59 @@ test_real_apply_records_calls() {
 
 test_real_apply_records_calls
 
+test_missing_flag_value() {
+  local d; d="$(mktemp -d)"
+  run_lockdown "$d/bin" -- --repo
+  assert_eq "$RC" "2" "missing --repo value exits 2"
+  assert_contains "$ERR" "Missing value for --repo" "clear error for missing --repo value"
+  rm -rf "$d"
+}
+
+test_bad_approvals() {
+  local d; d="$(mktemp -d)"
+  run_lockdown "$d/bin" -- --approvals abc --repo octo/repo
+  assert_eq "$RC" "2" "non-numeric --approvals exits 2"
+  assert_contains "$ERR" "non-negative integer" "clear error for bad --approvals"
+  rm -rf "$d"
+}
+
+test_rulesets_get_failure_reports() {
+  local d; d="$(mktemp -d)"
+  # A fake gh that fails the rulesets GET. Override PATH's gh via a wrapper dir.
+  local bin="$d/bin"; mkdir -p "$bin"
+  cat >"$bin/gh" <<'GH'
+#!/usr/bin/env bash
+case "$1" in
+  auth) exit 0 ;;
+  repo) case "$*" in *viewerPermission*) echo ADMIN;; *nameWithOwner*) echo octo/repo;; esac ;;
+  api) case "$*" in *rulesets*) echo "HTTP 500" >&2; exit 1;; *) echo '{}';; esac ;;
+  *) exit 0 ;;
+esac
+GH
+  chmod +x "$bin/gh"
+  local outf errf; outf="$(mktemp)"; errf="$(mktemp)"
+  PATH="$bin:$PATH" bash "$SCRIPT" --dry-run --repo octo/repo >"$outf" 2>"$errf"
+  local rc=$?
+  assert_eq "$rc" "1" "rulesets GET failure exits 1"
+  assert_contains "$(cat "$errf")" "Failed to list rulesets" "reports GET failure with remediation"
+  rm -f "$outf" "$errf"; rm -rf "$d"
+}
+
+test_missing_flag_value
+test_bad_approvals
+test_rulesets_get_failure_reports
+
+test_real_apply_update_puts() {
+  local d; d="$(mktemp -d)"; local log="$d/gh.log"
+  run_lockdown "$d/bin" FAKE_GH_VIEWER_PERMISSION=ADMIN \
+    FAKE_GH_RULESETS_JSON='[{"id":99,"name":"github-lockdown"}]' FAKE_GH_LOG="$log" \
+    -- --repo octo/repo --no-auto-delete
+  assert_eq "$RC" "0" "real update exits 0"
+  assert_contains "$(cat "$log")" "api -X PUT repos/octo/repo/rulesets/99 --input -" "updates existing ruleset via PUT by id"
+  rm -rf "$d"
+}
+
+test_real_apply_update_puts
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

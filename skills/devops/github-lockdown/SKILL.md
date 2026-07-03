@@ -16,8 +16,9 @@ metadata:
 
 Protect a repo's default branch with a GitHub **repository ruleset** and turn on
 auto-delete of merged branches. The bundled `scripts/lockdown.sh` does the work through
-the `gh` CLI; it is **idempotent** (upserts one ruleset named `github-lockdown`) and only
-ever *adds* protection — it never deletes branches, history, or rulesets it did not create.
+the `gh` CLI; it is **idempotent** (upserts one ruleset named `github-lockdown`). It never
+deletes branches or history, and never touches any ruleset other than its own
+`github-lockdown` ruleset, which it creates or updates in place.
 
 ## When this applies
 
@@ -79,6 +80,7 @@ The standard lockdown, applied with no flags:
 | `--dismiss-stale-approvals` | Dismiss stale approvals on push |
 | `--status-checks "ci,build"` | Require these status check contexts to pass |
 | `--no-auto-delete` | Leave `delete_branch_on_merge` unchanged |
+| `--ruleset-name <name>` | Name of the managed ruleset (default: github-lockdown) |
 | `--dry-run` | Print planned changes; apply nothing |
 
 See `references/rulesets.md` for the ruleset model, required permissions, and how to undo

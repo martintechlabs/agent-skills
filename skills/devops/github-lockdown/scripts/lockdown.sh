@@ -52,18 +52,21 @@ main() {
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --repo) REPO="$2"; shift 2 ;;
-      --branch) BRANCH="$2"; shift 2 ;;
-      --approvals) APPROVALS="$2"; shift 2 ;;
+      --repo) [ $# -ge 2 ] || { echo "Missing value for --repo" >&2; exit 2; }; REPO="$2"; shift 2 ;;
+      --branch) [ $# -ge 2 ] || { echo "Missing value for --branch" >&2; exit 2; }; BRANCH="$2"; shift 2 ;;
+      --approvals)
+        [ $# -ge 2 ] || { echo "Missing value for --approvals" >&2; exit 2; }
+        case "$2" in ''|*[!0-9]*) echo "--approvals must be a non-negative integer" >&2; exit 2 ;; esac
+        APPROVALS="$2"; shift 2 ;;
       --admin-bypass) ADMIN_BYPASS=true; shift ;;
       --require-conversation-resolution) THREAD_RES=true; shift ;;
       --linear-history) LINEAR=true; shift ;;
       --signed-commits) SIGNED=true; shift ;;
       --require-code-owner-review) CODE_OWNER=true; shift ;;
       --dismiss-stale-approvals) DISMISS_STALE=true; shift ;;
-      --status-checks) STATUS_CHECKS="$2"; shift 2 ;;
+      --status-checks) [ $# -ge 2 ] || { echo "Missing value for --status-checks" >&2; exit 2; }; STATUS_CHECKS="$2"; shift 2 ;;
       --no-auto-delete) AUTO_DELETE=false; shift ;;
-      --ruleset-name) NAME="$2"; shift 2 ;;
+      --ruleset-name) [ $# -ge 2 ] || { echo "Missing value for --ruleset-name" >&2; exit 2; }; NAME="$2"; shift 2 ;;
       --dry-run) DRY_RUN=true; shift ;;
       --print-config) PRINT_CONFIG=true; shift ;;
       --preflight-only) PREFLIGHT_ONLY=true; shift ;;
@@ -153,8 +156,14 @@ build_ruleset_json() {
 }
 
 find_ruleset_id() {
-  gh api "repos/$REPO/rulesets" --paginate 2>/dev/null \
-    | jq -r --arg n "$NAME" 'if type=="array" then . else [.] end | map(select(.name==$n)) | (.[0].id // empty)'
+  local out
+  if ! out="$(gh api "repos/$REPO/rulesets" --paginate 2>&1)"; then
+    echo "Failed to list rulesets for $REPO." >&2
+    echo "$out" >&2
+    echo "Check that the repo exists and your token can manage rulesets." >&2
+    exit 1
+  fi
+  printf '%s' "$out" | jq -r --arg n "$NAME" 'if type=="array" then . else [.] end | map(select(.name==$n)) | (.[0].id // empty)'
 }
 
 apply_ruleset() {
