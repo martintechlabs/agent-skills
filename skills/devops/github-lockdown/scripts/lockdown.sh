@@ -7,6 +7,7 @@ set -euo pipefail
 REPO=""; BRANCH=""; APPROVALS=0; ADMIN_BYPASS=false
 THREAD_RES=false; LINEAR=false; SIGNED=false; CODE_OWNER=false; DISMISS_STALE=false
 STATUS_CHECKS=""; AUTO_DELETE=true; NAME="github-lockdown"; DRY_RUN=false
+PRINT_CONFIG=false
 
 usage() {
   cat <<'EOF'
@@ -34,15 +35,48 @@ EOF
 
 main() {
   parse_args "$@"
+  if [ "$PRINT_CONFIG" = true ]; then print_config; exit 0; fi
 }
 
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
+      --repo) REPO="$2"; shift 2 ;;
+      --branch) BRANCH="$2"; shift 2 ;;
+      --approvals) APPROVALS="$2"; shift 2 ;;
+      --admin-bypass) ADMIN_BYPASS=true; shift ;;
+      --require-conversation-resolution) THREAD_RES=true; shift ;;
+      --linear-history) LINEAR=true; shift ;;
+      --signed-commits) SIGNED=true; shift ;;
+      --require-code-owner-review) CODE_OWNER=true; shift ;;
+      --dismiss-stale-approvals) DISMISS_STALE=true; shift ;;
+      --status-checks) STATUS_CHECKS="$2"; shift 2 ;;
+      --no-auto-delete) AUTO_DELETE=false; shift ;;
+      --ruleset-name) NAME="$2"; shift 2 ;;
+      --dry-run) DRY_RUN=true; shift ;;
+      --print-config) PRINT_CONFIG=true; shift ;;
       --help) usage; exit 0 ;;
-      *) shift ;;   # extended in later tasks
+      *) echo "Unknown flag: $1" >&2; usage >&2; exit 2 ;;
     esac
   done
+}
+
+print_config() {
+  cat <<EOF
+REPO=$REPO
+BRANCH=$BRANCH
+APPROVALS=$APPROVALS
+ADMIN_BYPASS=$ADMIN_BYPASS
+THREAD_RES=$THREAD_RES
+LINEAR=$LINEAR
+SIGNED=$SIGNED
+CODE_OWNER=$CODE_OWNER
+DISMISS_STALE=$DISMISS_STALE
+STATUS_CHECKS=$STATUS_CHECKS
+AUTO_DELETE=$AUTO_DELETE
+NAME=$NAME
+DRY_RUN=$DRY_RUN
+EOF
 }
 
 main "$@"

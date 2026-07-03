@@ -49,5 +49,30 @@ test_help() {
 
 test_help
 
+test_parse_args() {
+  local d; d="$(mktemp -d)"
+  run_lockdown "$d/bin" -- --print-config \
+    --repo acme/widgets --branch develop --approvals 2 --admin-bypass \
+    --linear-history --signed-commits --require-code-owner-review \
+    --dismiss-stale-approvals --require-conversation-resolution \
+    --status-checks "ci,build" --no-auto-delete --ruleset-name custom --dry-run
+  assert_contains "$OUT" "REPO=acme/widgets"      "parses --repo"
+  assert_contains "$OUT" "BRANCH=develop"         "parses --branch"
+  assert_contains "$OUT" "APPROVALS=2"            "parses --approvals"
+  assert_contains "$OUT" "ADMIN_BYPASS=true"      "parses --admin-bypass"
+  assert_contains "$OUT" "LINEAR=true"            "parses --linear-history"
+  assert_contains "$OUT" "SIGNED=true"            "parses --signed-commits"
+  assert_contains "$OUT" "CODE_OWNER=true"        "parses --require-code-owner-review"
+  assert_contains "$OUT" "DISMISS_STALE=true"     "parses --dismiss-stale-approvals"
+  assert_contains "$OUT" "THREAD_RES=true"        "parses --require-conversation-resolution"
+  assert_contains "$OUT" "STATUS_CHECKS=ci,build" "parses --status-checks"
+  assert_contains "$OUT" "AUTO_DELETE=false"      "parses --no-auto-delete"
+  assert_contains "$OUT" "NAME=custom"            "parses --ruleset-name"
+  assert_contains "$OUT" "DRY_RUN=true"           "parses --dry-run"
+  rm -rf "$d"
+}
+
+test_parse_args
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
