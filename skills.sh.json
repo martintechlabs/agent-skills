@@ -36,7 +36,8 @@
       "title": "DevOps",
       "description": "Skills for provisioning and wiring up development infrastructure — isolated per-workspace environments, database branching, and the project setup that makes parallel agents safe.",
       "skills": [
-        "conductor-neon-db"
+        "conductor-neon-db",
+        "github-lockdown"
       ]
     }
   ]

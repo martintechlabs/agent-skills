@@ -68,6 +68,7 @@ Skills for provisioning and wiring up development infrastructure.
 | Skill | What it does |
 |-------|--------------|
 | [`conductor-neon-db`](skills/devops/conductor-neon-db/SKILL.md) | Sets up fully isolated per-workspace databases for Conductor — each workspace gets its own instant schema-only Neon branch (full schema, zero production data) with the ORM's migration history baselined (Prisma or Drizzle) and fixtures seeded, plus the `.conductor/settings.toml` that wires setup/run/archive. |
+| [`github-lockdown`](skills/devops/github-lockdown/SKILL.md) | Locks down a GitHub repo — protects the default branch behind a required PR (0 approvers by default), blocks force-pushes and branch deletion, and auto-deletes merged branches — via GitHub repository rulesets and the `gh` CLI. Manual-only, idempotent, with a short interview and a `--dry-run` preview. |
 
 ## Repository layout
 
