@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Fake `gh` for tests. Records calls to $FAKE_GH_LOG and emits canned JSON.
+# Behavior is tuned per-test via env vars:
+#   FAKE_GH_VIEWER_PERMISSION  (default ADMIN)
+#   FAKE_GH_NAME_WITH_OWNER    (default octo/repo)
+#   FAKE_GH_RULESETS_JSON      (default [])   -> response for GET .../rulesets
+set -uo pipefail
+[ -n "${FAKE_GH_LOG:-}" ] && printf '%s\n' "$*" >>"$FAKE_GH_LOG"
+
+case "$1" in
+  auth)
+    # `gh auth status`
+    exit 0 ;;
+  repo)
+    # `gh repo view --json <field> -q <expr>`
+    shift 2  # drop: repo view
+    case "$*" in
+      *viewerPermission*) printf '%s\n' "${FAKE_GH_VIEWER_PERMISSION:-ADMIN}" ;;
+      *nameWithOwner*)    printf '%s\n' "${FAKE_GH_NAME_WITH_OWNER:-octo/repo}" ;;
+      *)                  printf '\n' ;;
+    esac ;;
+  api)
+    # `gh api <path> [ -X METHOD ] [ --input FILE | -f k=v ]`
+    case "$*" in
+      *rulesets*) printf '%s\n' "${FAKE_GH_RULESETS_JSON:-[]}" ;;
+      *)          printf '{}\n' ;;
+    esac ;;
+  *)
+    exit 0 ;;
+esac
