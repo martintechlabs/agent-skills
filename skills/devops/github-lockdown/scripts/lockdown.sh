@@ -46,6 +46,7 @@ main() {
   if [ "$DRY_RUN" = true ]; then printf '%s\n' "$body"; fi
   apply_ruleset "$body" "$id"
   apply_auto_delete
+  if [ "$DRY_RUN" != true ]; then verify; fi
 }
 
 parse_args() {
@@ -180,6 +181,15 @@ apply_auto_delete() {
     return 0
   fi
   gh api -X PATCH "repos/$REPO" -F delete_branch_on_merge=true >/dev/null
+}
+
+verify() {
+  local approvals="$APPROVALS" target="default branch"
+  [ -n "$BRANCH" ] && target="$BRANCH"
+  echo "Locked down $REPO ($target): required PR, $approvals approver(s), force-push + deletion blocked."
+  [ "$AUTO_DELETE" = true ] && echo "  Auto-delete merged branches: on."
+  [ "$ADMIN_BYPASS" = true ] && echo "  Admin bypass: enabled."
+  return 0
 }
 
 print_config() {

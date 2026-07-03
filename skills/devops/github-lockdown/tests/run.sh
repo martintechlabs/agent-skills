@@ -166,5 +166,19 @@ test_plan_create
 test_plan_update
 test_plan_no_auto_delete
 
+test_real_apply_records_calls() {
+  local d; d="$(mktemp -d)"; local log="$d/gh.log"
+  run_lockdown "$d/bin" FAKE_GH_VIEWER_PERMISSION=ADMIN FAKE_GH_RULESETS_JSON='[]' FAKE_GH_LOG="$log" \
+    -- --repo octo/repo
+  assert_eq "$RC" "0" "real apply exits 0"
+  local logtext; logtext="$(cat "$log")"
+  assert_contains "$logtext" "api -X POST repos/octo/repo/rulesets" "issues POST to create ruleset"
+  assert_contains "$logtext" "api -X PATCH repos/octo/repo" "issues PATCH for auto-delete"
+  assert_contains "$OUT" "Locked down" "prints a verification summary"
+  rm -rf "$d"
+}
+
+test_real_apply_records_calls
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
