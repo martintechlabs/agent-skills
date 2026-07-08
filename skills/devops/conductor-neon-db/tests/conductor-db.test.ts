@@ -9,6 +9,7 @@ import {
   assertDisposableChildBranch,
   buildDrizzleBaselineSql,
   buildPrismaBaselineSql,
+  FatalError,
   legacyWorkspaceBranchName,
   readBranchState,
   setupIsPending,
@@ -212,6 +213,24 @@ describe('conductor-db helpers', () => {
       ).rejects.toThrow('still booting')
       expect(waits).toEqual([2000, 4000])
     })
+
+    it('never retries a FatalError — misconfiguration surfaces immediately, with no backoff', async () => {
+      const waits: number[] = []
+      let calls = 0
+      await expect(
+        withRetry(
+          'op',
+          () => {
+            calls += 1
+            throw new FatalError('execSql() is not configured')
+          },
+          6,
+          (ms) => waits.push(ms),
+        ),
+      ).rejects.toThrow('execSql() is not configured')
+      expect(calls).toBe(1)
+      expect(waits).toEqual([])
+    })
   })
 
   describe('buildPrismaBaselineSql', () => {
@@ -274,10 +293,13 @@ describe('conductor-db helpers', () => {
       expect(sql).toContain('e.hash = m.hash')
     })
 
-    it('rejects a non-numeric journal `when` instead of splicing it into SQL', () => {
+    it('rejects a journal `when` that is not a plain non-negative integer instead of splicing it into SQL', () => {
       const corrupted = [{ sql: 'x', when: "0),('x',0); DROP SCHEMA public CASCADE; --" as unknown as number }]
-      expect(() => buildDrizzleBaselineSql(corrupted)).toThrow(/non-numeric "when"/)
-      expect(() => buildDrizzleBaselineSql([{ sql: 'x', when: NaN }])).toThrow(/non-numeric "when"/)
+      expect(() => buildDrizzleBaselineSql(corrupted)).toThrow(/non-integer "when"/)
+      expect(() => buildDrizzleBaselineSql([{ sql: 'x', when: NaN }])).toThrow(/non-integer "when"/)
+      expect(() => buildDrizzleBaselineSql([{ sql: 'x', when: 1700000000000.5 }])).toThrow(/non-integer "when"/) // Postgres would silently round it
+      expect(() => buildDrizzleBaselineSql([{ sql: 'x', when: 1e21 }])).toThrow(/non-integer "when"/) // serializes as "1e+21", not a bigint literal
+      expect(() => buildDrizzleBaselineSql([{ sql: 'x', when: -1 }])).toThrow(/non-integer "when"/)
     })
   })
 })

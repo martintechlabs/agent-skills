@@ -266,7 +266,10 @@ The script can't harm production, by construction:
 - **Nothing auto-loads `.env.neondb`**: the script passes `DATABASE_URL` to every child process
   it spawns, and the `run` script loads the file via `dotenv -e .env.neondb -o --`. Anything else
   that needs the workspace DB (a manual `prisma studio`, an e2e runner, a one-off script) needs
-  the same `dotenv -e .env.neondb -o --` prefix — a bare `pnpm exec prisma studio` will not see it.
+  the same `dotenv -e .env.neondb -o --` prefix — a bare `pnpm exec prisma studio` will not see
+  it, and a bare destructive command (`prisma migrate reset`, `db push`) hits whatever the real
+  `.env` points at. Consider adding a package.json wrapper (e.g.
+  `"db": "dotenv -e .env.neondb -o --"`) so `pnpm db prisma studio` is the easy path.
 - **Cold computes are expected**: a branch whose compute has never been connected to (just
   created, or just renamed) can take a while to boot. Provisioning retries with exponential
   backoff (2s, 4s, 8s, …) around branch create, the connection-string fetch, and — with the
@@ -286,7 +289,10 @@ The script can't harm production, by construction:
   The one unrecoverable case: a workspace *renamed* before ever running the new script — its
   branch is only findable manually (`neonctl branches list`); write the real name into
   `.conductor/db-branch` by hand. Slug collisions between similarly-named long workspaces were
-  possible in the old flat-truncation scheme; the hash suffix removes them going forward.
+  possible in the old flat-truncation scheme; the hash suffix removes them going forward — but
+  if two live pre-upgrade workspaces *already* share a flat-truncated name, they were already
+  sharing one branch under the old scheme: resolve that manually (re-provision one of them)
+  before relying on the legacy-name fallback, which cannot tell their branches apart.
 - **Baseline assumption**: parent (production) must contain the code's committed migrations; if
   it lags, rebuild in the workspace (`dotenv -e .env.neondb -o -- prisma migrate reset`, or drop
   the branch and re-provision for Drizzle). **Never run `migrate reset` bare** — without the
