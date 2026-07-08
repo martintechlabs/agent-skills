@@ -26,7 +26,7 @@ parallel agents never read or write the same rows. On workspace setup, `scripts/
    silently skip it).
 3. **Seeds** test fixtures.
 4. Writes the branch's connection string to `.env.neondb` as `DATABASE_URL` (its own file — the
-   project's real `.env` is never touched; the run script loads it via `dotenv -e .env.neondb`).
+   project's real `.env` is never touched; the run script loads it via `dotenv -e .env.neondb -o`).
 5. Records the branch name in `.conductor/db-branch` (gitignored) so archive deletes the **same**
    branch even if the workspace is renamed later — a rename changes `CONDUCTOR_WORKSPACE_NAME`,
    which would otherwise re-derive a different slug and silently miss the real branch.
@@ -80,7 +80,7 @@ either way.)
 This baseline assumes the **parent branch already contains the code's committed migrations** —
 true for the normal Conductor flow (workspaces branch from the default branch; production is
 deployed from it). If the parent ever lags, rebuild in the workspace
-(`dotenv -e .env.neondb -- prisma migrate reset` — the prefix matters, see Gotchas — or
+(`dotenv -e .env.neondb -o -- prisma migrate reset` — the prefix matters, see Gotchas — or
 drop the branch and re-provision for Drizzle).
 
 ## Setup
@@ -110,9 +110,14 @@ adjust the **PORTING KNOBS** block at the top:
   `migrationsSchema`/`migrationsTable` in `drizzle.config`. **Wire `execSql()`** to the
   project's Postgres driver (an example for each driver is in the block) and remove its throw —
   this is what runs the baseline INSERT. Left unconfigured it raises a clear error.
-- `ENV_FILE` (`.env.neondb`) and `BRANCH_STATE_FILE` (`.conductor/db-branch`) only change if
-  non-standard — if you do change `ENV_FILE`, change the `dotenv -e` reference in the `run`
-  script (step 4) to match.
+- `DB_ENV_VARS` — **every** env var that must point at the workspace branch. Defaults to just
+  `DATABASE_URL`; if `schema.prisma` uses `directUrl = env("DIRECT_URL")` or
+  `shadowDatabaseUrl = env(...)`, add those names, or the project's real `.env` (which the ORM
+  CLI still auto-loads) supplies them and migrations silently target the **shared** database.
+- `ENV_FILE` (`.env.neondb`) only changes if non-standard — if you do change it, change the
+  `dotenv -e` reference in the `run` script (step 4) to match. The state file lives at
+  `.conductor/db-branch` (tests may relocate it via `CONDUCTOR_DB_STATE_FILE`; never set that
+  in Conductor).
 
 Copy the bundled `tests/conductor-db.test.ts` into the project's test directory — it locks the
 safety-critical bits (the `conductor/*`-only deletion guard, the slug-collision hash, the
@@ -137,10 +142,12 @@ workspace's branch name into every other workspace's checkout, where teardown/sy
 it and could delete or rename a *different* workspace's live branch:
 
 ```gitignore
-.conductor/db-branch
+.conductor/db-branch*
 ```
 
-Also make sure `.env*` is gitignored (it covers the generated `.env.neondb`). Verify with
+(The `*` also covers the transient `.conductor/db-branch.tmp` the atomic write uses — a crash
+can leave it behind, and it holds the same branch name.) Also make sure `.env*` is gitignored
+(it covers the generated `.env.neondb`). Verify with
 `git check-ignore -v .conductor/settings.toml` (should print the `!` negation = NOT ignored)
 and `git check-ignore .conductor/db-branch` (must print the path = ignored).
 
@@ -162,7 +169,7 @@ and `git check-ignore .conductor/db-branch` (must print the path = ignored).
 [scripts]
 setup = "corepack enable pnpm && pnpm install --frozen-lockfile && pnpm exec prisma generate && pnpm exec tsx scripts/conductor-db.ts provision"
 archive = "pnpm exec tsx scripts/conductor-db.ts teardown"
-run = "pnpm exec tsx scripts/conductor-db.ts sync && pnpm exec dotenv -e .env.neondb -- pnpm dev --port $CONDUCTOR_PORT"
+run = "pnpm exec tsx scripts/conductor-db.ts sync && pnpm exec dotenv -e .env.neondb -o -- pnpm dev --port $CONDUCTOR_PORT"
 run_mode = "concurrent"
 ```
 
@@ -251,10 +258,15 @@ The script can't harm production, by construction:
 ## Gotchas
 
 - **`DATABASE_URL` must not be in Conductor's env tabs** (step 5) — it overrides the per-workspace branch.
+- **`directUrl` / `shadowDatabaseUrl` leak the shared DB** if not covered: the ORM CLI and dev
+  server still auto-load the project's real `.env`, so any DB URL var defined there that isn't
+  in `DB_ENV_VARS` (step 2) wins for that connection — e.g. Prisma would run migrations over a
+  shared `DIRECT_URL` while `DATABASE_URL` correctly points at the branch. List every DB URL
+  var the schema references in `DB_ENV_VARS`.
 - **Nothing auto-loads `.env.neondb`**: the script passes `DATABASE_URL` to every child process
-  it spawns, and the `run` script loads the file via `dotenv -e .env.neondb --`. Anything else
+  it spawns, and the `run` script loads the file via `dotenv -e .env.neondb -o --`. Anything else
   that needs the workspace DB (a manual `prisma studio`, an e2e runner, a one-off script) needs
-  the same `dotenv -e .env.neondb --` prefix — a bare `pnpm exec prisma studio` will not see it.
+  the same `dotenv -e .env.neondb -o --` prefix — a bare `pnpm exec prisma studio` will not see it.
 - **Cold computes are expected**: a branch whose compute has never been connected to (just
   created, or just renamed) can take a while to boot. Provisioning retries with exponential
   backoff (2s, 4s, 8s, …) around branch create, the connection-string fetch, and — with the
@@ -265,19 +277,20 @@ The script can't harm production, by construction:
 - **Renaming a workspace is safe but eventually consistent**: teardown targets the recorded
   branch, provision renames a still-existing recorded branch instead of creating a duplicate,
   and the Neon branch name itself catches up on the next dev-server start (`sync`).
-- **Upgrading from a pre-state-file version of this script**: `sync` self-heals — on its first
-  run it records the existing branch's name, after which renames are safe. Until that first
-  record is written, teardown falls back to re-deriving the name, which fails for workspaces
-  that were *renamed* before ever running the new script, and for workspace names whose slug
-  exceeds 48 characters (the old script truncated flat; the new one truncates with a hash
-  suffix, so the derived name won't match the old branch). For those, either archive with the
-  old script first or write the real branch name into `.conductor/db-branch` by hand. Slug
-  collisions between similarly-named workspaces were possible in the old flat-truncation
-  scheme regardless of this script version; the hash suffix removes them going forward.
+- **Upgrading from a pre-state-file version of this script**: existing workspaces have `.env`
+  (not `.env.neondb`) and no state record, so the first dev-server start fails `sync`'s gate —
+  by design. **Re-run workspace setup once per live workspace**: provision reuses the existing
+  branch (data preserved), writes `.env.neondb`, and records the state file; from then on
+  renames are safe. Long workspace names provisioned under the old flat 48-char truncation are
+  found automatically (provision, sync, and teardown all check the legacy name as a fallback).
+  The one unrecoverable case: a workspace *renamed* before ever running the new script — its
+  branch is only findable manually (`neonctl branches list`); write the real name into
+  `.conductor/db-branch` by hand. Slug collisions between similarly-named long workspaces were
+  possible in the old flat-truncation scheme; the hash suffix removes them going forward.
 - **Baseline assumption**: parent (production) must contain the code's committed migrations; if
-  it lags, rebuild in the workspace (`dotenv -e .env.neondb -- prisma migrate reset`, or drop
+  it lags, rebuild in the workspace (`dotenv -e .env.neondb -o -- prisma migrate reset`, or drop
   the branch and re-provision for Drizzle). **Never run `migrate reset` bare** — without the
-  `dotenv -e .env.neondb --` prefix it auto-loads the project's real `.env` and resets whatever
+  `dotenv -e .env.neondb -o --` prefix it auto-loads the project's real `.env` and resets whatever
   shared database that points at.
 - **Crash recovery may re-run the seed**: if a provision is killed mid-first-setup, the next
   provision re-runs baseline *and seed* against the same branch. The baseline SQL is idempotent;

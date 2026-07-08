@@ -51,7 +51,7 @@
 // code branch — true for the normal Conductor flow (workspaces branch from the default
 // branch; production is deployed from it). If the parent lags the code's migrations, run the
 // ORM's reset in the workspace — ALWAYS through the generated env file, e.g.
-// `dotenv -e .env.neondb -- prisma migrate reset` (a bare reset would auto-load the project's
+// `dotenv -e .env.neondb -o -- prisma migrate reset` (a bare reset would auto-load the project's
 // real .env and destroy whatever shared database it points at).
 //
 // SAFETY: every destructive op (branch delete/rename) is guarded to only ever run against a
@@ -71,11 +71,16 @@ const ORM: 'prisma' | 'drizzle' = 'prisma'
 //   pnpm → ['pnpm', 'exec']   npm → ['npx']   yarn → ['yarn']
 const PM_EXEC = ['pnpm', 'exec']
 // DATABASE_URL lands in its OWN file, not .env, so the project's real .env is never clobbered.
-// NOTHING auto-loads .env.neondb — the run script loads it explicitly (dotenv -e .env.neondb --)
-// and this script passes DATABASE_URL to every child process itself. Anything else that needs
-// the workspace DB (a manual `prisma studio`, an e2e runner) must load it the same way.
+// NOTHING auto-loads .env.neondb — the run script loads it explicitly with override
+// (dotenv -e .env.neondb -o --; without -o an ambient DATABASE_URL would silently win) and this
+// script passes the DB vars to every child process itself. Anything else that needs the
+// workspace DB (a manual `prisma studio`, an e2e runner) must load it the same way.
 const ENV_FILE = '.env.neondb'
-const BRANCH_STATE_FILE = '.conductor/db-branch' // records the branch provision() used; see readBranchState()
+// EVERY env var that must point at the per-workspace branch. The project's real .env still gets
+// auto-loaded by the ORM CLI/dev server, so any DB URL var it defines that is NOT listed here
+// leaks the shared database into this workspace. If schema.prisma uses
+// `directUrl = env("DIRECT_URL")` or `shadowDatabaseUrl = env(...)`, add those names.
+const DB_ENV_VARS = ['DATABASE_URL']
 const BRANCH_PREFIX = 'conductor/' // workspace-branch namespace (matches Neon's preview/)
 const MAX_SLUG = 48 // Neon-safe branch-name length budget (excluding the BRANCH_PREFIX)
 const SEED_SCRIPT = 'prisma/seed.ts' // project's seed entrypoint (see seedWorkspace)
@@ -125,6 +130,19 @@ async function execSql(_uri: string, _sql: string): Promise<void> {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Where provision() records the branch it used. Resolved at call time so tests can point it at
+ * a sandbox via CONDUCTOR_DB_STATE_FILE (test-only override — never set it in Conductor).
+ */
+function stateFilePath(): string {
+  return process.env.CONDUCTOR_DB_STATE_FILE ?? '.conductor/db-branch'
+}
+
+/** The child-process environment with every DB var pinned to the workspace branch. */
+function childDbEnv(uri: string): NodeJS.ProcessEnv {
+  return { ...process.env, ...Object.fromEntries(DB_ENV_VARS.map((name) => [name, uri])) }
+}
+
 function requireEnv(name: string): string {
   const value = process.env[name]
   if (!value) {
@@ -136,16 +154,31 @@ function requireEnv(name: string): string {
   return value
 }
 
-/** Stable, Neon-safe branch name derived from the workspace name. */
-export function workspaceBranchName(): string {
-  const raw = requireEnv('CONDUCTOR_WORKSPACE_NAME')
-  let slug = raw
+/** The raw slug for the current workspace, before any length handling. */
+function workspaceSlug(): string {
+  const raw = process.env.CONDUCTOR_WORKSPACE_NAME
+  if (!raw) {
+    // Deliberately NOT requireEnv: Conductor injects this variable itself. Telling the user to
+    // add it to the env tabs would pin every workspace to ONE shared slug (and one branch).
+    throw new Error(
+      'CONDUCTOR_WORKSPACE_NAME is not set — this script must run inside a Conductor workspace ' +
+        '(Conductor injects it automatically). Do NOT add it to the Conductor env tabs.',
+    )
+  }
+  const slug = raw
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
   if (!slug) {
     throw new Error(`Could not derive a branch name from CONDUCTOR_WORKSPACE_NAME="${raw}".`)
   }
+  return slug
+}
+
+/** Stable, Neon-safe branch name derived from the workspace name. */
+export function workspaceBranchName(): string {
+  const raw = process.env.CONDUCTOR_WORKSPACE_NAME ?? ''
+  let slug = workspaceSlug()
   if (slug.length > MAX_SLUG) {
     // Truncate, but keep distinct workspaces distinct: append a short hash of the FULL name so
     // two long names that share a prefix don't collide onto the same branch (which would break
@@ -155,6 +188,17 @@ export function workspaceBranchName(): string {
     slug = `${slug.slice(0, MAX_SLUG - suffix.length - 1).replace(/-+$/, '')}-${suffix}`
   }
   return `${BRANCH_PREFIX}${slug}`
+}
+
+/**
+ * The name an EARLIER version of this script (flat `.slice(0, 48)` truncation, no hash suffix)
+ * would have derived, or null when it matches the current derivation. Teardown and sync check
+ * it as a fallback so upgrading doesn't orphan long-named workspaces provisioned before the
+ * state file existed.
+ */
+export function legacyWorkspaceBranchName(): string | null {
+  const flat = `${BRANCH_PREFIX}${workspaceSlug().slice(0, MAX_SLUG)}`
+  return flat === workspaceBranchName() ? null : flat
 }
 
 /**
@@ -169,17 +213,18 @@ export function workspaceBranchName(): string {
  * re-seeds or re-baselines a live branch.
  */
 export function writeBranchState(branchName: string, phase: 'pending' | 'ready' = 'ready'): void {
-  mkdirSync(dirname(BRANCH_STATE_FILE), { recursive: true })
+  const file = stateFilePath()
+  mkdirSync(dirname(file), { recursive: true })
   // Write-then-rename so a crash mid-write can't leave a truncated/garbage state file.
-  const tmp = `${BRANCH_STATE_FILE}.tmp`
+  const tmp = `${file}.tmp`
   writeFileSync(tmp, `${branchName}\n${phase}\n`, { mode: 0o600 })
-  renameSync(tmp, BRANCH_STATE_FILE)
+  renameSync(tmp, file)
 }
 
 /** Single reader for the state file; the exported helpers below are thin views over it. */
 function readStateFile(): { branch: string; phase: 'pending' | 'ready' } | null {
   try {
-    const lines = readFileSync(BRANCH_STATE_FILE, 'utf8').split('\n')
+    const lines = readFileSync(stateFilePath(), 'utf8').split('\n')
     const branch = lines[0].trim()
     if (!branch) return null
     return { branch, phase: lines[1]?.trim() === 'pending' ? 'pending' : 'ready' }
@@ -240,7 +285,12 @@ function branchExists(projectId: string, branchName: string): boolean {
   const parsed = JSON.parse(neon(['branches', 'list', '--project-id', projectId, '--output', 'json'])) as
     | Array<{ name?: string }>
     | { branches?: Array<{ name?: string }> }
-  const branches = Array.isArray(parsed) ? parsed : (parsed.branches ?? [])
+  const branches = Array.isArray(parsed) ? parsed : parsed?.branches
+  if (!Array.isArray(branches)) {
+    // An unrecognized shape must THROW, not read as "absent" — misreading a live branch as
+    // absent would make teardown skip it (leak) or provision try to re-create it.
+    throw new Error('Unexpected `neonctl branches list --output json` output shape; cannot determine branch existence.')
+  }
   return branches.some((b) => b.name === branchName)
 }
 
@@ -293,11 +343,33 @@ export async function withRetry<T>(
  * Callers decide how loud a final failure is (provision throws, sync warns).
  */
 async function renameBranch(projectId: string, from: string, to: string): Promise<void> {
+  // A from-and-to-both-exist collision can never succeed — fail fast with the actual fix
+  // instead of burning retries on Neon's "branch already exists" error.
+  if (branchExists(projectId, from) && branchExists(projectId, to)) {
+    throw new Error(
+      `Cannot rename branch "${from}" → "${to}": both already exist in project ${projectId}. ` +
+        `"${to}" is likely a leftover from an earlier workspace — delete or rename it in the ` +
+        `Neon console (neonctl branches list --project-id ${projectId}), then retry.`,
+    )
+  }
   await withRetry('rename branch', () => {
     if (branchExists(projectId, from)) {
       neon(['branches', 'rename', from, to, '--project-id', projectId])
     } else if (!branchExists(projectId, to)) {
       throw new Error(`neither "${from}" nor "${to}" exists in project ${projectId}`)
+    }
+  }, 3)
+}
+
+/**
+ * Delete a workspace branch, retried (a just-created branch can transiently refuse deletion
+ * while its create/compute operations are still running) and idempotent under retry (an
+ * attempt that "failed" after actually deleting reads as done on the next attempt).
+ */
+async function deleteBranch(projectId: string, branchName: string, opts: { inherit?: boolean } = {}): Promise<void> {
+  await withRetry('delete branch', () => {
+    if (branchExists(projectId, branchName)) {
+      neon(['branches', 'delete', branchName, '--project-id', projectId], opts)
     }
   }, 3)
 }
@@ -341,7 +413,7 @@ function writeDatabaseUrl(uri: string): void {
   writeFileSync(
     ENV_FILE,
     `# Generated by scripts/conductor-db.ts for this Conductor workspace. Do not commit.\n` +
-      `DATABASE_URL='${uri}'\n`,
+      DB_ENV_VARS.map((name) => `${name}='${uri}'\n`).join(''),
     { mode: 0o600 },
   )
 }
@@ -389,6 +461,14 @@ export function buildDrizzleBaselineSql(migrations: Array<{ sql: string; when: n
   const rows = migrations
     .map(({ sql, when }) => {
       const hash = createHash('sha256').update(sql).digest('hex') // [0-9a-f]{64} — injection-safe
+      if (typeof when !== 'number' || !Number.isFinite(when)) {
+        // `when` comes from JSON.parse of the journal — the TS type is not a runtime guarantee,
+        // and this value is spliced into SQL: reject anything that isn't a plain number.
+        throw new Error(
+          `Drizzle journal entry has a non-numeric "when" (${JSON.stringify(when)}) — ` +
+            `fix ${DRIZZLE_MIGRATIONS_DIR}/meta/_journal.json before provisioning.`,
+        )
+      }
       return `('${hash}', ${when})`
     })
     .join(',\n')
@@ -409,6 +489,12 @@ export function buildDrizzleBaselineSql(migrations: Array<{ sql: string; when: n
  * so a mis-timestamped directory name is harmless here.
  */
 export function readPrismaMigrations(): Array<{ name: string; sql: string }> {
+  if (!existsSync(PRISMA_MIGRATIONS_DIR)) {
+    // A project with no migrations directory yet (fresh schema, `db push` workflow) simply has
+    // nothing to baseline — not an error.
+    console.warn(`[prisma] ${PRISMA_MIGRATIONS_DIR} does not exist — nothing to baseline.`)
+    return []
+  }
   return readdirSync(PRISMA_MIGRATIONS_DIR, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
@@ -455,7 +541,7 @@ async function baselineMigrations(uri: string): Promise<void> {
       console.log('[prisma] no migrations to baseline.')
       return
     }
-    runWithRetry('prisma', ['db', 'execute', '--schema', PRISMA_SCHEMA, '--stdin'], { ...process.env, DATABASE_URL: uri }, 6, sql)
+    runWithRetry('prisma', ['db', 'execute', '--schema', PRISMA_SCHEMA, '--stdin'], childDbEnv(uri), 6, sql)
     return
   }
   // drizzle: no `db execute` CLI — run the baseline via the project's own Postgres driver,
@@ -471,9 +557,9 @@ async function baselineMigrations(uri: string): Promise<void> {
 /** Apply any migrations pulled into this workspace since its branch was created. */
 function deployMigrations(uri: string): void {
   if (ORM === 'prisma') {
-    runWithRetry('prisma', ['migrate', 'deploy'], { ...process.env, DATABASE_URL: uri })
+    runWithRetry('prisma', ['migrate', 'deploy'], childDbEnv(uri))
   } else {
-    runWithRetry('drizzle-kit', ['migrate'], { ...process.env, DATABASE_URL: uri })
+    runWithRetry('drizzle-kit', ['migrate'], childDbEnv(uri))
   }
 }
 
@@ -483,8 +569,8 @@ function deployMigrations(uri: string): void {
  * ── ADAPT THIS to your project's seed ──────────────────────────────────────────
  *  • No seed?  Delete this function and its call in provision().
  *  • Plain seed, no safety guard?  Replace the body with:
- *      Prisma:  runWithRetry('prisma', ['db', 'seed'], { ...process.env, DATABASE_URL: uri }, 2)
- *      Drizzle: runWithRetry('tsx', [SEED_SCRIPT], { ...process.env, DATABASE_URL: uri }, 2)
+ *      Prisma:  runWithRetry('prisma', ['db', 'seed'], childDbEnv(uri), 2)
+ *      Drizzle: runWithRetry('tsx', [SEED_SCRIPT], childDbEnv(uri), 2)
  *  • Seed that REFUSES non-local DBs (recommended — stops accidental prod seeding)?
  *      Authorize it for THIS branch only. The example below matches a seed that allows a
  *      remote DB when E2E_EXPECTED_DATABASE_URL === DATABASE_URL, gated on a password.
@@ -498,7 +584,7 @@ function seedWorkspace(uri: string): void {
     return
   }
   console.log('[seed] seeding workspace fixtures…')
-  runWithRetry('tsx', [SEED_SCRIPT], { ...process.env, DATABASE_URL: uri, E2E_EXPECTED_DATABASE_URL: uri }, 2)
+  runWithRetry('tsx', [SEED_SCRIPT], { ...childDbEnv(uri), E2E_EXPECTED_DATABASE_URL: uri }, 2)
 }
 
 async function provision(): Promise<void> {
@@ -516,12 +602,32 @@ async function provision(): Promise<void> {
   // branch that still holds this workspace's data.
   const recorded = readBranchState()
   if (recorded && recorded !== branchName) {
-    assertDisposableChildBranch(recorded, parent)
-    if (await withRetry('check recorded branch', () => branchExists(projectId, recorded), 3)) {
+    let recordedUsable = true
+    try {
+      assertDisposableChildBranch(recorded, parent)
+    } catch (error) {
+      // A corrupted/hand-edited record must not brick provisioning with a confusing
+      // "refusing destructive op" — the guard makes it undeletable anyway; overwrite it below.
+      recordedUsable = false
+      console.warn(
+        `[conductor-db] ignoring unusable ${stateFilePath()} record "${recorded}" ` +
+          `(${error instanceof Error ? error.message : error}) — it will be overwritten.`,
+      )
+    }
+    if (recordedUsable && (await withRetry('check recorded branch', () => branchExists(projectId, recorded), 3))) {
       console.log(`[neon] workspace renamed — renaming branch ${recorded} → ${branchName}…`)
       await renameBranch(projectId, recorded, branchName)
     }
     // Recorded branch gone (e.g. deleted out-of-band): fall through and derive fresh below.
+  } else if (!recorded) {
+    // No record at all: a long-named workspace provisioned by the old flat-truncation script
+    // may live under the legacy name — carry it over instead of creating a duplicate.
+    const legacy = legacyWorkspaceBranchName()
+    if (legacy && (await withRetry('check legacy branch', () => branchExists(projectId, legacy), 3))) {
+      assertDisposableChildBranch(legacy, parent)
+      console.log(`[neon] found pre-upgrade branch ${legacy} — renaming to ${branchName}…`)
+      await renameBranch(projectId, legacy, branchName)
+    }
   }
 
   let created = false
@@ -580,16 +686,16 @@ async function provision(): Promise<void> {
       // Only ever delete a branch WE just created; never a reused branch (it holds real data).
       console.error('[conductor-db] new-branch setup failed — deleting it so the next attempt starts clean.')
       try {
-        neon(['branches', 'delete', branchName, '--project-id', projectId])
+        await deleteBranch(projectId, branchName)
         // Delete succeeded: drop the record and the env file pointing at the dead endpoint.
-        rmSync(BRANCH_STATE_FILE, { force: true })
+        rmSync(stateFilePath(), { force: true })
         rmSync(ENV_FILE, { force: true })
       } catch {
         // Delete failed: the branch still exists, so KEEP the state file (marked 'pending') —
         // it is the only record that lets a later provision recover or teardown delete it.
         console.error(
           `[conductor-db] WARNING: could not delete just-created branch ${branchName}; ` +
-            `keeping ${BRANCH_STATE_FILE} so the next provision/teardown can find it.`,
+            `keeping ${stateFilePath()} so the next provision/teardown can find it.`,
         )
       }
     }
@@ -619,18 +725,21 @@ async function teardown(): Promise<void> {
 
   // Prefer the name provision() actually used — CONDUCTOR_WORKSPACE_NAME may have changed since
   // (the workspace was renamed), which would otherwise re-derive a different slug and miss the
-  // real branch. The derived name is kept as a fallback for workspaces provisioned before the
-  // state file existed, and for a record left stale by a crash between rename and re-record.
+  // real branch. The derived names (current scheme AND the pre-hash-suffix legacy scheme) are
+  // kept as fallbacks for workspaces provisioned before the state file existed, and for a
+  // record left stale by a crash between rename and re-record.
   const recorded = readBranchState()
   let derived: string | null = null
+  let legacy: string | null = null
   try {
     derived = workspaceBranchName()
+    legacy = legacyWorkspaceBranchName()
   } catch {
     // CONDUCTOR_WORKSPACE_NAME unset/unusable — proceed with the recorded name alone.
   }
   // A corrupted record (or one naming the parent) must not abort teardown outright — skip it
   // with a warning and let the other candidate be tried; the guard still makes it undeletable.
-  const candidates = [...new Set([recorded, derived])]
+  const candidates = [...new Set([recorded, derived, legacy])]
     .filter((name): name is string => Boolean(name))
     .filter((name) => {
       try {
@@ -642,6 +751,13 @@ async function teardown(): Promise<void> {
       }
     })
   if (candidates.length === 0) {
+    // No record AND no generated env file means provisioning never got anywhere (e.g. the
+    // workspace name never yielded a usable slug) — there is no branch to leak; don't block
+    // archive. With either trace present, a branch may exist somewhere: fail loudly.
+    if (!recorded && !existsSync(ENV_FILE)) {
+      console.warn('[conductor-db] no branch was ever recorded or provisioned for this workspace — nothing to clean.')
+      return
+    }
     throw new Error(
       'Cannot determine this workspace\'s branch: no usable .conductor/db-branch record and no ' +
         'usable CONDUCTOR_WORKSPACE_NAME to derive it from. Delete the branch manually ' +
@@ -661,14 +777,14 @@ async function teardown(): Promise<void> {
   }
   if (!target) {
     console.log(`[conductor-db] no workspace branch found (checked: ${candidates.join(', ')}) — nothing to delete.`)
-    rmSync(BRANCH_STATE_FILE, { force: true })
+    rmSync(stateFilePath(), { force: true })
     rmSync(ENV_FILE, { force: true })
     return
   }
 
   console.log(`[neon] deleting branch ${target}…`)
-  neon(['branches', 'delete', target, '--project-id', projectId], { inherit: true })
-  rmSync(BRANCH_STATE_FILE, { force: true })
+  await deleteBranch(projectId, target, { inherit: true })
+  rmSync(stateFilePath(), { force: true })
   // Also drop the generated env file: leaving it would let sync()'s provisioning gate pass and
   // boot the dev server against the deleted branch's dead endpoint.
   rmSync(ENV_FILE, { force: true })
@@ -689,9 +805,11 @@ async function teardown(): Promise<void> {
 async function sync(): Promise<void> {
   if (!existsSync(ENV_FILE)) {
     throw new Error(
-      `${ENV_FILE} not found — this workspace's database was never provisioned (or provisioning failed). ` +
-        `Re-run workspace setup (scripts/conductor-db.ts provision) before starting the dev server; ` +
-        `starting without it would silently use a shared/ambient DATABASE_URL.`,
+      `${ENV_FILE} not found — this workspace's database was never provisioned, provisioning ` +
+        `failed, or the workspace predates this script version (which wrote .env instead). ` +
+        `In every case the fix is the same: re-run workspace setup (scripts/conductor-db.ts ` +
+        `provision — it reuses an existing branch and preserves its data) before starting the ` +
+        `dev server. Starting without ${ENV_FILE} would silently use a shared/ambient DATABASE_URL.`,
     )
   }
   if (setupIsPending()) {
@@ -711,11 +829,15 @@ async function sync(): Promise<void> {
     const current = workspaceBranchName()
     if (!recorded) {
       // Workspace provisioned before the state file existed: record the name now, while the
-      // derived slug still matches the live branch, so a later rename can't orphan it.
-      if (branchExists(projectId, current)) {
-        assertDisposableChildBranch(current, process.env.NEON_PARENT_BRANCH ?? '')
-        writeBranchState(current)
-        console.log(`[conductor-db] recorded existing branch ${current} → ${BRANCH_STATE_FILE}`)
+      // derived slug still matches the live branch, so a later rename can't orphan it. Long
+      // names may live under the OLD flat-truncation scheme — check that name too.
+      const live = [current, legacyWorkspaceBranchName()]
+        .filter((name): name is string => Boolean(name))
+        .find((name) => branchExists(projectId, name))
+      if (live) {
+        assertDisposableChildBranch(live, process.env.NEON_PARENT_BRANCH ?? '')
+        writeBranchState(live)
+        console.log(`[conductor-db] recorded existing branch ${live} → ${stateFilePath()}`)
       }
       return
     }
