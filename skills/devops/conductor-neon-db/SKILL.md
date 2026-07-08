@@ -19,9 +19,11 @@ parallel agents never read or write the same rows. On workspace setup, `scripts/
 1. Creates an **instant schema-only Neon branch** off the production branch — the full schema
    and extensions (e.g. PostGIS reference data), but **zero production rows**. Neon copies no
    data, so this is fast and cheap, and no production data ever lands in a dev workspace.
-2. **Baselines** the ORM's migration history — Prisma or Drizzle (see "Why" below). The
-   baseline is idempotent, so re-provisioning also recovers a branch whose first setup died
-   halfway.
+2. **Baselines** the ORM's migration history — Prisma or Drizzle (see "Why" below). First-time
+   setup is tracked with a `pending` marker in the state file, so a provision killed mid-setup
+   is recovered (idempotent re-baseline + seed) on the next run — while a fully set-up branch
+   is never re-baselined (stamping a migration the branch hasn't run would make migrate-deploy
+   silently skip it).
 3. **Seeds** test fixtures.
 4. Writes the branch's connection string to `.env.neondb` as `DATABASE_URL` (its own file — the
    project's real `.env` is never touched; the run script loads it via `dotenv -e .env.neondb`).
@@ -29,13 +31,16 @@ parallel agents never read or write the same rows. On workspace setup, `scripts/
    branch even if the workspace is renamed later — a rename changes `CONDUCTOR_WORKSPACE_NAME`,
    which would otherwise re-derive a different slug and silently miss the real branch.
 
-On every dev-server start, a best-effort `sync` renames the Neon branch to match a renamed
-workspace (Conductor has no rename event, so it piggybacks on `run` — a real Neon rename, not
-delete+recreate, so data and `DATABASE_URL` are untouched). On archive, the branch is deleted —
-**loudly**: a missing `NEON_API_KEY`/`NEON_PROJECT_ID` or a failed delete exits non-zero instead
-of warning-and-continuing, because silently swallowed teardown failures are exactly how Neon
-branches leak past Conductor's archive step. The whole thing is driven by
-`.conductor/settings.toml`.
+On every dev-server start, `sync` refuses to start an unprovisioned workspace (missing
+`.env.neondb` → hard non-zero exit, because `dotenv -e` silently proceeds without the file and
+the app would boot against a shared/ambient `DATABASE_URL`), then best-effort renames the Neon
+branch to match a renamed workspace (Conductor has no rename event, so it piggybacks on `run` —
+a real Neon rename, not delete+recreate, so data and `DATABASE_URL` are untouched). On archive,
+the branch is deleted — **loudly**: a missing `NEON_API_KEY`/`NEON_PROJECT_ID` or a failed
+delete exits non-zero instead of warning-and-continuing, because silently swallowed teardown
+failures are exactly how Neon branches leak past Conductor's archive step. (An already-absent
+branch is "nothing to clean", not an error — teardown stays idempotent.) The whole thing is
+driven by `.conductor/settings.toml`.
 
 ## When this applies
 
@@ -124,9 +129,18 @@ must not be. If `.gitignore` ignores all of `.conductor/`, replace that with:
 !.conductor/settings.toml
 ```
 
-(The `.conductor/*` rule is also what keeps the generated `.conductor/db-branch` untracked.)
+If the repo instead tracks `.conductor/` contents individually (no blanket ignore), you MUST
+still add an explicit ignore for the state file — a committed `.conductor/db-branch` puts one
+workspace's branch name into every other workspace's checkout, where teardown/sync would trust
+it and could delete or rename a *different* workspace's live branch:
+
+```gitignore
+.conductor/db-branch
+```
+
 Also make sure `.env*` is gitignored (it covers the generated `.env.neondb`). Verify with
-`git check-ignore -v .conductor/settings.toml` (should print the `!` negation = NOT ignored).
+`git check-ignore -v .conductor/settings.toml` (should print the `!` negation = NOT ignored)
+and `git check-ignore .conductor/db-branch` (must print the path = ignored).
 
 ### 4. Create `.conductor/settings.toml`
 
@@ -136,9 +150,10 @@ Also make sure `.env*` is gitignored (it covers the generated `.env.neondb`). Ve
 # Local and cloud workspaces behave identically: setup installs deps, generates the Prisma
 # client, then provisions an isolated SCHEMA-ONLY Neon branch (scripts/conductor-db.ts),
 # baselines its migration history, and seeds fixtures. archive deletes the branch.
-# run first syncs the Neon branch's name to match the workspace (Conductor has no rename
-# event, so this catches up on the next dev-server start after a rename — best-effort, never
-# blocks the dev server), then loads the generated .env.neondb and starts the dev server.
+# run refuses to start if .env.neondb is missing (unprovisioned workspace), then best-effort
+# syncs the Neon branch's name to match the workspace (Conductor has no rename event, so this
+# catches up on the next dev-server start after a rename), then loads the generated
+# .env.neondb and starts the dev server.
 # Secrets come from Conductor's Environment tabs — NEVER commit them here, and NEVER put
 # DATABASE_URL there (the setup script owns it).
 
@@ -152,9 +167,12 @@ run_mode = "concurrent"
 Adapt the `setup`/`run` commands to the project's package manager and dev server. **For Drizzle**,
 drop the `prisma generate` step (Drizzle has no client-generate step — `drizzle-kit generate`
 produces migration *files* at dev time and doesn't belong in workspace setup). `run_mode` can be
-`concurrent` because each workspace has its own DB and its own `$CONDUCTOR_PORT`. `sync` is
-chained with `&&` but is internally best-effort — it warns and exits 0 on any failure, so a
-Neon hiccup can never block the dev server over a cosmetic branch rename.
+`concurrent` because each workspace has its own DB and its own `$CONDUCTOR_PORT`. `sync`'s
+rename part is internally best-effort — it warns and exits 0 on any failure, so a Neon hiccup
+can never block the dev server over a cosmetic branch rename. Its one hard check is
+deliberate: if `.env.neondb` is missing (provisioning never succeeded), it exits non-zero so
+`dotenv -e` — which silently proceeds without the file — can't boot the app against a
+shared/ambient `DATABASE_URL`.
 
 ### 5. Tell the user the Conductor environment variables to set
 
@@ -203,19 +221,27 @@ The script can't harm production, by construction:
 - **No slug collisions** (unit-tested): over-long workspace names are truncated with a short
   hash of the full name appended, so two long names sharing a prefix can't land on the same
   branch — which would break isolation and let one workspace's teardown delete another's.
-- **Self-destruct on failure**: if *anything* after branch creation fails (connection-string
-  fetch, `.env.neondb` write, baseline, seed), the just-created branch and its state file are
-  deleted so a half-set-up branch is never reused — and never leaked. Only a branch this run
+- **Self-destruct on failure**: if *anything* after branch creation fails (recording state,
+  connection-string fetch, `.env.neondb` write, baseline, seed), the just-created branch is
+  deleted — along with its state file and the stale `.env.neondb` — so a half-set-up branch is
+  never reused, never leaked, and never leaves an env file pointing at a dead endpoint. If that
+  cleanup delete itself fails, the state file is deliberately *kept* (still marked `pending`)
+  so a later provision or teardown can still find the surviving branch. Only a branch this run
   created is ever deleted here; a reused branch (which holds real data) is left alone.
-- **Reuse preserves data**: re-provisioning an existing workspace branch keeps its data — it
-  re-runs only the *idempotent* baseline (`WHERE NOT EXISTS`, recovering a branch whose first
-  setup died mid-way) and the ORM's migrate-deploy (`prisma migrate deploy` /
-  `drizzle-kit migrate`); it never re-seeds.
-- **Rename-safe teardown** (unit-tested): provision records the exact branch name in
-  `.conductor/db-branch`; teardown prefers that record over re-deriving from
-  `CONDUCTOR_WORKSPACE_NAME`, so renaming a workspace can't orphan its Neon branch. Teardown is
-  also **loud**: missing Neon credentials or a failed delete exit non-zero instead of
-  warning-and-returning.
+- **Reuse preserves data — and schema correctness**: re-provisioning a fully set-up branch runs
+  *only* the ORM's migrate-deploy (`prisma migrate deploy` / `drizzle-kit migrate`), never the
+  baseline — baselining a reused branch would stamp migrations committed after branch creation
+  as applied without running them, silently drifting the schema. The *idempotent* baseline
+  (`WHERE NOT EXISTS`) re-runs only in the explicit crash-recovery case: the state file still
+  says `pending`, meaning first-time setup never completed.
+- **Rename-safe, idempotent teardown** (unit-tested state handling): provision records the
+  exact branch name in `.conductor/db-branch`; teardown prefers that record over re-deriving
+  from `CONDUCTOR_WORKSPACE_NAME` (and checks both when they differ), so renaming a workspace
+  can't orphan its Neon branch. Provision is rename-aware too: if the recorded branch still
+  exists under the old name, it's renamed rather than duplicated. Teardown is **loud** on real
+  failures (missing Neon credentials or a failed delete exit non-zero) but treats an
+  already-absent branch as "nothing to clean" — an absent branch cannot leak, and archive of a
+  never-provisioned workspace must not error.
 - **`sync` is fenced**: it guards *both* the recorded and the derived name before renaming, and
   is best-effort — any failure only leaves a cosmetically stale branch name in the Neon console.
 - Plus the Neon-side **branch protection** on production (step 7).
@@ -234,10 +260,18 @@ The script can't harm production, by construction:
   provisions are normal; only repeated exhaustion is an error.
 - **Seeding is opt-in**: if the seed credential isn't set, provisioning logs a warning and the
   workspace comes up empty rather than failing setup. Set it to seed.
-- **Renaming a workspace is safe but eventually consistent**: teardown always targets the
-  recorded branch, and the Neon branch name itself catches up on the next dev-server start
-  (`sync`). Workspaces provisioned before the state file existed fall back to re-deriving the
-  name — fine as long as they weren't renamed.
+- **Renaming a workspace is safe but eventually consistent**: teardown targets the recorded
+  branch, provision renames a still-existing recorded branch instead of creating a duplicate,
+  and the Neon branch name itself catches up on the next dev-server start (`sync`).
+- **Upgrading from a pre-state-file version of this script**: `sync` self-heals — on its first
+  run it records the existing branch's name, after which renames are safe. Until that first
+  record is written, teardown falls back to re-deriving the name, which fails for workspaces
+  that were *renamed* before ever running the new script, and for workspace names whose slug
+  exceeds 48 characters (the old script truncated flat; the new one truncates with a hash
+  suffix, so the derived name won't match the old branch). For those, either archive with the
+  old script first or write the real branch name into `.conductor/db-branch` by hand. Slug
+  collisions between similarly-named workspaces were possible in the old flat-truncation
+  scheme regardless of this script version; the hash suffix removes them going forward.
 - **Baseline assumption**: parent (production) must contain the code's committed migrations; if
   it lags, rebuild in the workspace (`prisma migrate reset`, or drop the branch and re-provision
   for Drizzle).

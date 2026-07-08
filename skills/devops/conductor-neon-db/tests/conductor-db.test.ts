@@ -2,21 +2,32 @@
 // When you copy this into a project, adjust the import path to your layout
 // (e.g. `../../scripts/conductor-db` from `__tests__/scripts/`). Runs under Jest or Vitest.
 import { createHash } from 'node:crypto'
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   assertDisposableChildBranch,
   buildDrizzleBaselineSql,
   buildPrismaBaselineSql,
   readBranchState,
+  setupIsPending,
   withRetry,
   workspaceBranchName,
   writeBranchState,
 } from '../scripts/conductor-db'
 
-const BRANCH_STATE_FILE = '.conductor/db-branch'
-
 describe('conductor-db helpers', () => {
   const ORIGINAL_ENV = process.env
+  const ORIGINAL_CWD = process.cwd()
+  let sandbox: string
+
+  // The state-file helpers read/write .conductor/db-branch relative to the CWD. Run the whole
+  // suite from a throwaway directory so the tests can never touch (or destroy, if interrupted)
+  // the REAL state file of the workspace they happen to run inside.
+  beforeAll(() => {
+    sandbox = mkdtempSync(join(tmpdir(), 'conductor-db-test-'))
+    process.chdir(sandbox)
+  })
 
   beforeEach(() => {
     process.env = { ...ORIGINAL_ENV }
@@ -24,6 +35,8 @@ describe('conductor-db helpers', () => {
 
   afterAll(() => {
     process.env = ORIGINAL_ENV
+    process.chdir(ORIGINAL_CWD)
+    rmSync(sandbox, { recursive: true, force: true })
   })
 
   describe('workspaceBranchName', () => {
@@ -88,36 +101,18 @@ describe('conductor-db helpers', () => {
     })
   })
 
-  describe('readBranchState / writeBranchState (rename-safety)', () => {
-    // If these tests run inside a real Conductor workspace, .conductor/db-branch exists on disk
-    // (provision() writes one). Save it and start each test from a clean slate, then restore it —
-    // otherwise the tests would pass or fail depending on ambient repo state instead of what they
-    // actually exercise.
-    let original: string | null = null
-
-    beforeAll(() => {
-      mkdirSync('.conductor', { recursive: true })
-      try {
-        original = readFileSync(BRANCH_STATE_FILE, 'utf8')
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-      }
-      rmSync(BRANCH_STATE_FILE, { force: true })
-    })
-
+  describe('readBranchState / writeBranchState / setupIsPending (rename- and crash-safety)', () => {
+    // The suite-level chdir sandbox (above) means there is no real state file to protect here;
+    // each test starts from whatever the previous one wrote, so clean up after each.
     afterEach(() => {
-      rmSync(BRANCH_STATE_FILE, { force: true })
-    })
-
-    afterAll(() => {
-      if (original !== null) writeFileSync(BRANCH_STATE_FILE, original)
+      rmSync('.conductor/db-branch', { force: true })
     })
 
     it('returns null when no state file has been written', () => {
       expect(readBranchState()).toBeNull()
     })
 
-    it('round-trips the branch name written by provision()', () => {
+    it('creates the .conductor directory if missing and round-trips the branch name', () => {
       writeBranchState('conductor/my-feature')
       expect(readBranchState()).toBe('conductor/my-feature')
     })
@@ -129,6 +124,20 @@ describe('conductor-db helpers', () => {
       process.env.CONDUCTOR_WORKSPACE_NAME = 'renamed-workspace'
       expect(workspaceBranchName()).toBe('conductor/renamed-workspace') // re-deriving now gives a DIFFERENT (wrong) name
       expect(readBranchState()).toBe('conductor/original-name') // but the recorded name is still correct
+    })
+
+    it('defaults to ready — no file, and a plain write, are both "setup complete"', () => {
+      expect(setupIsPending()).toBe(false) // absent file
+      writeBranchState('conductor/my-feature') // default phase: ready
+      expect(setupIsPending()).toBe(false)
+    })
+
+    it('tracks the pending → ready lifecycle provision() uses for crash recovery', () => {
+      writeBranchState('conductor/my-feature', 'pending') // written right after branch create
+      expect(setupIsPending()).toBe(true)
+      expect(readBranchState()).toBe('conductor/my-feature')
+      writeBranchState('conductor/my-feature', 'ready') // written after baseline + seed succeed
+      expect(setupIsPending()).toBe(false)
     })
   })
 
