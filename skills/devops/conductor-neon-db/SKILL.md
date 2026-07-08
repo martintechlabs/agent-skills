@@ -20,10 +20,10 @@ parallel agents never read or write the same rows. On workspace setup, `scripts/
    and extensions (e.g. PostGIS reference data), but **zero production rows**. Neon copies no
    data, so this is fast and cheap, and no production data ever lands in a dev workspace.
 2. **Baselines** the ORM's migration history — Prisma or Drizzle (see "Why" below). First-time
-   setup is tracked with a `pending` marker in the state file, so a provision killed mid-setup
-   is recovered (idempotent re-baseline + seed) on the next run — while a fully set-up branch
-   is never re-baselined (stamping a migration the branch hasn't run would make migrate-deploy
-   silently skip it).
+   setup is tracked with a `pending` marker in the state file; a provision killed mid-setup is
+   recovered on the next run by **recreating the branch from scratch** (a half-set-up branch
+   holds nothing valuable, and re-baselining it later could stamp newer migrations as applied
+   without running them). A fully set-up branch is never re-baselined.
 3. **Seeds** test fixtures.
 4. Writes the branch's connection string to `.env.neondb` as `DATABASE_URL` (its own file — the
    project's real `.env` is never touched; the run script loads it via `dotenv -e .env.neondb -o`).
@@ -178,10 +178,13 @@ drop the `prisma generate` step (Drizzle has no client-generate step — `drizzl
 produces migration *files* at dev time and doesn't belong in workspace setup). `run_mode` can be
 `concurrent` because each workspace has its own DB and its own `$CONDUCTOR_PORT`. `sync`'s
 rename part is internally best-effort — it warns and exits 0 on any failure, so a Neon hiccup
-can never block the dev server over a cosmetic branch rename. Its one hard check is
-deliberate: if `.env.neondb` is missing (provisioning never succeeded), it exits non-zero so
-`dotenv -e` — which silently proceeds without the file — can't boot the app against a
-shared/ambient `DATABASE_URL`.
+can never block the dev server over a cosmetic branch rename. Its **hard gates** are
+deliberate, though — it exits non-zero when the workspace database isn't safe to use:
+`.env.neondb` missing (provisioning never succeeded — and `dotenv -e` silently proceeds
+without the file, which would boot the app against a shared/ambient `DATABASE_URL`), setup
+still marked `pending` (an interrupted provision left an unbaselined, unseeded branch), or the
+recorded branch no longer existing in Neon (the env file points at a dead endpoint). Each
+error names the fix — almost always "re-run workspace setup".
 
 ### 5. Tell the user the Conductor environment variables to set
 
@@ -207,9 +210,11 @@ seeds have (or should have) a guard that refuses non-local databases to prevent 
 production seeding — authorize it for **this branch only** (never production). The bundled
 script shows the pattern for a seed that allows a remote DB when `E2E_EXPECTED_DATABASE_URL ===
 DATABASE_URL`. If the project's seed is a plain `prisma db seed` with no guard, simplify the body
-to `runWithRetry('prisma', ['db', 'seed'], { ...process.env, DATABASE_URL: uri }, 2)`; a Drizzle
-project typically seeds via a tsx script — `runWithRetry('tsx', [SEED_SCRIPT], { ...process.env,
-DATABASE_URL: uri }, 2)`. If there's no seed, delete `seedWorkspace()` and its call.
+to `runWithRetry('prisma', ['db', 'seed'], childDbEnv(uri), 2)`; a Drizzle project typically
+seeds via a tsx script — `runWithRetry('tsx', [SEED_SCRIPT], childDbEnv(uri), 2)`. Always build
+the env with `childDbEnv(uri)` (not a hand-rolled `{ ...process.env, DATABASE_URL: uri }`) so
+every var in `DB_ENV_VARS` — e.g. a `DIRECT_URL` — is pinned to the branch too. If there's no
+seed, delete `seedWorkspace()` and its call.
 
 ### 7. Verify
 
@@ -240,9 +245,10 @@ The script can't harm production, by construction:
 - **Reuse preserves data — and schema correctness**: re-provisioning a fully set-up branch runs
   *only* the ORM's migrate-deploy (`prisma migrate deploy` / `drizzle-kit migrate`), never the
   baseline — baselining a reused branch would stamp migrations committed after branch creation
-  as applied without running them, silently drifting the schema. The *idempotent* baseline
-  (`WHERE NOT EXISTS`) re-runs only in the explicit crash-recovery case: the state file still
-  says `pending`, meaning first-time setup never completed.
+  as applied without running them, silently drifting the schema. A branch whose state is still
+  `pending` (first-time setup never completed) is recreated from scratch rather than patched,
+  for the same reason. The baseline itself is idempotent (`WHERE NOT EXISTS`), so retries
+  within one provision run never duplicate rows.
 - **Rename-safe, idempotent teardown** (unit-tested state handling): provision records the
   exact branch name in `.conductor/db-branch`; teardown prefers that record over re-deriving
   from `CONDUCTOR_WORKSPACE_NAME` (and checks both when they differ), so renaming a workspace
@@ -279,7 +285,10 @@ The script can't harm production, by construction:
   workspace comes up empty rather than failing setup. Set it to seed.
 - **Renaming a workspace is safe but eventually consistent**: teardown targets the recorded
   branch, provision renames a still-existing recorded branch instead of creating a duplicate,
-  and the Neon branch name itself catches up on the next dev-server start (`sync`).
+  and the Neon branch name itself catches up on the next dev-server start (`sync`). One caveat:
+  don't create a *new* workspace under a just-vacated name until the renamed workspace's dev
+  server has restarted once (so `sync` moved its branch) — branch identity is name-keyed, and
+  the new workspace would otherwise adopt the old workspace's still-unrenamed branch.
 - **Upgrading from a pre-state-file version of this script**: existing workspaces have `.env`
   (not `.env.neondb`) and no state record, so the first dev-server start fails `sync`'s gate —
   by design. **Re-run workspace setup once per live workspace**: provision reuses the existing
@@ -298,10 +307,11 @@ The script can't harm production, by construction:
   the branch and re-provision for Drizzle). **Never run `migrate reset` bare** — without the
   `dotenv -e .env.neondb -o --` prefix it auto-loads the project's real `.env` and resets whatever
   shared database that points at.
-- **Crash recovery may re-run the seed**: if a provision is killed mid-first-setup, the next
-  provision re-runs baseline *and seed* against the same branch. The baseline SQL is idempotent;
-  make the seed idempotent too (upserts / `skipDuplicates`) or recovery can fail on unique
-  constraints if the crash happened after the seed finished.
+- **Crash recovery recreates the branch**: if a provision is killed mid-first-setup (state
+  still `pending`), the next provision deletes that half-set-up branch and creates a fresh one
+  — it never tries to patch it up, because re-baselining an old snapshot against today's
+  migration files could stamp newer migrations as applied without running them. Anything
+  manually put into a `pending` branch is therefore disposable by definition.
 - **Drizzle needs `execSql` wired** (step 2): unlike Prisma's `db execute`, Drizzle has no SQL-
   runner CLI, so the baseline INSERT runs through the project's own Postgres driver. Left
   unconfigured, provisioning fails fast with a clear remediation message.
