@@ -70,9 +70,8 @@ DATABASE_URL="$CS" E2E_EXPECTED_DATABASE_URL="$CS" <seed-creds> <pm> tsx prisma/
 ```
 
 To produce `/tmp/baseline.sql` from the project's own logic, run a tiny script that imports
-`buildBaselineSql` from `scripts/conductor-db.ts`, feeds it the migrations read from
-`prisma/migrations/*/migration.sql`, and writes the result — that exercises the exact checksum
-code the real provisioning uses.
+`buildPrismaBaselineSql` and `readPrismaMigrations` from `scripts/conductor-db.ts` and writes
+the result — that exercises the exact checksum code the real provisioning uses.
 
 ## What "good" looks like
 
