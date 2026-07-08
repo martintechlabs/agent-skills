@@ -142,16 +142,16 @@ describe('conductor-db helpers', () => {
   })
 
   describe('withRetry (cold-compute backoff)', () => {
-    it('returns the result on first success without sleeping', () => {
+    it('returns the result on first success without sleeping', async () => {
       const waits: number[] = []
-      expect(withRetry('op', () => 'ok', 3, (ms) => waits.push(ms))).toBe('ok')
+      await expect(withRetry('op', () => 'ok', 3, (ms) => waits.push(ms))).resolves.toBe('ok')
       expect(waits).toEqual([])
     })
 
-    it('retries transient failures with exponential backoff (2s, 4s, …), then succeeds', () => {
+    it('retries transient failures with exponential backoff (2s, 4s, …), then succeeds', async () => {
       const waits: number[] = []
       let calls = 0
-      const result = withRetry(
+      const result = await withRetry(
         'op',
         () => {
           calls += 1
@@ -166,9 +166,26 @@ describe('conductor-db helpers', () => {
       expect(waits).toEqual([2000, 4000])
     })
 
-    it('throws the last error once attempts are exhausted', () => {
+    it('retries a rejected async operation the same way (used for the Drizzle execSql baseline)', async () => {
       const waits: number[] = []
-      expect(() =>
+      let calls = 0
+      const result = await withRetry(
+        'op',
+        async () => {
+          calls += 1
+          if (calls < 2) throw new Error('compute still booting')
+          return 'ok'
+        },
+        3,
+        (ms) => waits.push(ms),
+      )
+      expect(result).toBe('ok')
+      expect(waits).toEqual([2000])
+    })
+
+    it('rejects with the last error once attempts are exhausted', async () => {
+      const waits: number[] = []
+      await expect(
         withRetry(
           'op',
           () => {
@@ -177,7 +194,7 @@ describe('conductor-db helpers', () => {
           3,
           (ms) => waits.push(ms),
         ),
-      ).toThrow('still booting')
+      ).rejects.toThrow('still booting')
       expect(waits).toEqual([2000, 4000])
     })
   })

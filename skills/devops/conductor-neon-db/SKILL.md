@@ -31,9 +31,10 @@ parallel agents never read or write the same rows. On workspace setup, `scripts/
    branch even if the workspace is renamed later — a rename changes `CONDUCTOR_WORKSPACE_NAME`,
    which would otherwise re-derive a different slug and silently miss the real branch.
 
-On every dev-server start, `sync` refuses to start an unprovisioned workspace (missing
-`.env.neondb` → hard non-zero exit, because `dotenv -e` silently proceeds without the file and
-the app would boot against a shared/ambient `DATABASE_URL`), then best-effort renames the Neon
+On every dev-server start, `sync` refuses to start an unprovisioned or half-set-up workspace
+(missing `.env.neondb`, or a setup still marked `pending` → hard non-zero exit, because
+`dotenv -e` silently proceeds without the file and the app would boot against a shared/ambient
+`DATABASE_URL`, or against an unbaselined, unseeded branch), then best-effort renames the Neon
 branch to match a renamed workspace (Conductor has no rename event, so it piggybacks on `run` —
 a real Neon rename, not delete+recreate, so data and `DATABASE_URL` are untouched). On archive,
 the branch is deleted — **loudly**: a missing `NEON_API_KEY`/`NEON_PROJECT_ID` or a failed
@@ -78,7 +79,8 @@ either way.)
 
 This baseline assumes the **parent branch already contains the code's committed migrations** —
 true for the normal Conductor flow (workspaces branch from the default branch; production is
-deployed from it). If the parent ever lags, rebuild in the workspace (`prisma migrate reset`, or
+deployed from it). If the parent ever lags, rebuild in the workspace
+(`dotenv -e .env.neondb -- prisma migrate reset` — the prefix matters, see Gotchas — or
 drop the branch and re-provision for Drizzle).
 
 ## Setup
@@ -273,8 +275,14 @@ The script can't harm production, by construction:
   collisions between similarly-named workspaces were possible in the old flat-truncation
   scheme regardless of this script version; the hash suffix removes them going forward.
 - **Baseline assumption**: parent (production) must contain the code's committed migrations; if
-  it lags, rebuild in the workspace (`prisma migrate reset`, or drop the branch and re-provision
-  for Drizzle).
+  it lags, rebuild in the workspace (`dotenv -e .env.neondb -- prisma migrate reset`, or drop
+  the branch and re-provision for Drizzle). **Never run `migrate reset` bare** — without the
+  `dotenv -e .env.neondb --` prefix it auto-loads the project's real `.env` and resets whatever
+  shared database that points at.
+- **Crash recovery may re-run the seed**: if a provision is killed mid-first-setup, the next
+  provision re-runs baseline *and seed* against the same branch. The baseline SQL is idempotent;
+  make the seed idempotent too (upserts / `skipDuplicates`) or recovery can fail on unique
+  constraints if the crash happened after the seed finished.
 - **Drizzle needs `execSql` wired** (step 2): unlike Prisma's `db execute`, Drizzle has no SQL-
   runner CLI, so the baseline INSERT runs through the project's own Postgres driver. Left
   unconfigured, provisioning fails fast with a clear remediation message.
