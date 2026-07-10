@@ -1,17 +1,19 @@
 # Verifying against real Neon
 
 Read this when you want end-to-end confidence that provisioning works on the project's actual
-Neon project — beyond `tsc`/unit tests. It provisions a **throwaway** `conductor/verify` branch,
-confirms the schema-only → baseline → (seed) flow, and deletes it. Production is never touched:
-every database op uses the throwaway branch's connection string, and the branch name carries the
-`conductor/` prefix the safety guard requires.
+Neon project — beyond `tsc`/unit tests. It exercises the **true-ledger baseline**: a throwaway
+`conductor/verify` workspace branch (schema-only) plus a throwaway `tmp/verify` check branch
+(full data), confirms the check branch's real migration ledger gets copied verbatim into the
+workspace branch, confirms migrate-deploy applies whatever's still missing, and deletes both.
+Production is never touched: every database op targets one of the two throwaway branches, and
+both branch names carry the prefix (`conductor/` or `tmp/`) the safety guard requires.
 
 The walkthrough below is written for **Prisma**; a **Drizzle** variant follows at the end, with
 the per-step deltas (different migrations table, no `prisma db execute`, `drizzle-kit migrate`
 as the "nothing to apply" check).
 
 Assumes `neonctl` is authenticated (`neonctl auth`) and you know the Neon `PROJECT_ID` and the
-production/parent branch name.
+production/parent branch name. `<pm>` below is `pnpm exec` / `npx` / `yarn`.
 
 ## 1. A snapshot helper (shows the state of a branch)
 
@@ -37,74 +39,125 @@ BEGIN
 END $$;
 ```
 
-## 2. Run the flow
+## 2. Set up a *deliberately behind* parent, so the true-baseline fix actually has something to fix
 
-Set `PROJECT`, `PARENT` (e.g. `production`), and the package-manager exec prefix to match the
-project. `<pm>` below is `pnpm exec` / `npx` / `yarn`.
+The bug this mechanism fixes only shows up when production hasn't run every migration committed
+on this code branch — verifying against a parent that's already fully caught up would pass even
+with the old, buggy file-derived baseline. Pick (or create) a **throwaway** Neon branch to stand
+in as `PARENT` — never point this verification at real production — and leave at least one
+migration file committed locally that this stand-in parent has never run:
 
 ```bash
-PROJECT=<neon-project-id>; PARENT=production; BR=conductor/verify
-trap '<pm> neonctl branches delete "$BR" --project-id "$PROJECT" </dev/null >/dev/null 2>&1; echo "cleaned up $BR"' EXIT
-<pm> neonctl branches delete "$BR" --project-id "$PROJECT" </dev/null >/dev/null 2>&1  # clear leftover
+PROJECT=<neon-project-id>; PARENT=conductor/verify-parent
+<pm> neonctl branches delete "$PARENT" --project-id "$PROJECT" </dev/null >/dev/null 2>&1  # clear leftover
+<pm> neonctl branches create --project-id "$PROJECT" --name "$PARENT" --parent production --output json </dev/null >/dev/null && echo "created $PARENT"
+PCS=$(<pm> neonctl connection-string "$PARENT" --project-id "$PROJECT" </dev/null)
+# Apply all but the LATEST migration to $PARENT, e.g.:
+DATABASE_URL="$PCS" <pm> prisma migrate deploy   # or: apply all but the newest migration by hand
+```
 
-# 1) instant schema-only branch off production
+`$PARENT` now plays the role `NEON_PARENT_BRANCH` normally does — it's what the check branch and
+the workspace branch both clone from below.
+
+## 3. Run the flow
+
+```bash
+BR=conductor/verify; CHECK=tmp/verify
+trap '<pm> neonctl branches delete "$BR" --project-id "$PROJECT" </dev/null >/dev/null 2>&1; \
+      <pm> neonctl branches delete "$CHECK" --project-id "$PROJECT" </dev/null >/dev/null 2>&1; \
+      echo "cleaned up $BR and $CHECK"' EXIT
+<pm> neonctl branches delete "$BR" --project-id "$PROJECT" </dev/null >/dev/null 2>&1     # clear leftovers
+<pm> neonctl branches delete "$CHECK" --project-id "$PROJECT" </dev/null >/dev/null 2>&1
+
+# 1) instant schema-only workspace branch off the (deliberately behind) parent
 <pm> neonctl branches create --project-id "$PROJECT" --name "$BR" --parent "$PARENT" --schema-only --output json </dev/null >/dev/null && echo created
 CS=$(<pm> neonctl connection-string "$BR" --project-id "$PROJECT" </dev/null)
 
-# wake the cold compute (first connection may fail; the next command then succeeds)
-echo "SELECT 1;" | <pm> prisma db execute --url "$CS" --stdin >/dev/null 2>&1
-echo "SELECT 1;" | <pm> prisma db execute --url "$CS" --stdin >/dev/null 2>&1 && echo "compute awake"
+# 2) full-data check branch off the SAME parent — this is what teaches provisioning the parent's
+#    TRUE applied-migration set, instead of assuming the local migration files match it
+<pm> neonctl branches create --project-id "$PROJECT" --name "$CHECK" --parent "$PARENT" --output json </dev/null >/dev/null && echo "check branch created"
+CHECK_CS=$(<pm> neonctl connection-string "$CHECK" --project-id "$PROJECT" </dev/null)
 
-# 2) snapshot BEFORE baseline: expect postgis=t, spatial_ref_sys populated, _prisma_migrations=0, app tables=0
+# wake both cold computes (first connection may fail; the next command then succeeds)
+echo "SELECT 1;" | <pm> prisma db execute --url "$CS" --stdin >/dev/null 2>&1
+echo "SELECT 1;" | <pm> prisma db execute --url "$CS" --stdin >/dev/null 2>&1 && echo "workspace compute awake"
+echo "SELECT 1;" | <pm> prisma db execute --url "$CHECK_CS" --stdin >/dev/null 2>&1
+echo "SELECT 1;" | <pm> prisma db execute --url "$CHECK_CS" --stdin >/dev/null 2>&1 && echo "check compute awake"
+
+# 3) snapshot the WORKSPACE branch before baseline: expect postgis=t, spatial_ref_sys populated,
+#    _prisma_migrations=0, app tables=0
 <pm> prisma db execute --url "$CS" --file /tmp/snapshot.sql 2>&1 | grep -oiE 'SNAP .*'
 
-# 3) baseline using the project's OWN buildBaselineSql, then confirm migrate status is clean
-#    (generate the INSERT however you like; the script's baselineMigrations does exactly this)
-<pm> prisma db execute --url "$CS" --file /tmp/baseline.sql >/dev/null 2>&1
+# 4) snapshot the CHECK branch: this is the parent's TRUE state — _prisma_migrations should show
+#    fewer rows than the project's full migration count (that's the point of step 2 above)
+<pm> prisma db execute --url "$CHECK_CS" --file /tmp/snapshot.sql 2>&1 | grep -oiE 'SNAP .*'
+
+# 5) baseline the WORKSPACE branch from the CHECK branch's true ledger, then confirm migrate
+#    status is clean and the missing migration(s) actually ran
+<pm> prisma db execute --url "$CS" --file /tmp/true-baseline.sql >/dev/null 2>&1
+DATABASE_URL="$CS" <pm> prisma migrate deploy   # should apply exactly the migration(s) $PARENT never ran
 DATABASE_URL="$CS" <pm> prisma migrate status   # want: "Database schema is up to date!"
 
-# 4) seed (authorized for this branch only), then snapshot AFTER: _prisma_migrations matches the
-#    migration count, app tables now have fixtures
+# 6) delete the check branch NOW — provisioning does this immediately after reading the ledger,
+#    never keeping a connection to it open longer than necessary
+<pm> neonctl branches delete "$CHECK" --project-id "$PROJECT" </dev/null >/dev/null 2>&1 && echo "check branch deleted"
+
+# 7) seed (authorized for this branch only), then snapshot AFTER: _prisma_migrations matches the
+#    project's FULL migration count now (migrate deploy caught it up), app tables have fixtures
 DATABASE_URL="$CS" E2E_EXPECTED_DATABASE_URL="$CS" <seed-creds> <pm> tsx prisma/seed.ts
 <pm> prisma db execute --url "$CS" --file /tmp/snapshot.sql 2>&1 | grep -oiE 'SNAP .*'
 ```
 
-To produce `/tmp/baseline.sql` from the project's own logic, run a tiny script that imports
-`buildPrismaBaselineSql` and `readPrismaMigrations` from `scripts/conductor-db.ts` and writes
-the result — that exercises the exact checksum code the real provisioning uses.
+To produce `/tmp/true-baseline.sql`, run a tiny script that:
+1. Queries the check branch for its real ledger: `SELECT checksum, migration_name FROM "_prisma_migrations" WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL ORDER BY started_at`.
+2. Passes the rows to `buildPrismaLedgerBaselineSql` (imported from `scripts/conductor-db.ts`) and writes the result.
+
+This exercises the exact read/build code the real provisioning uses — the only difference is
+driving it by hand instead of through `provision()`.
 
 ## What "good" looks like
 
 ```
-before:  postgis=t  spatial_ref_sys=<N>  _prisma_migrations=0   app tables all 0
+workspace before: postgis=t  spatial_ref_sys=<N>  _prisma_migrations=0   app tables all 0
+check (true state): _prisma_migrations=<N-1>   (fewer than the project's full migration count)
+deploy:  applies exactly the migration(s) the check branch didn't have
 status:  Database schema is up to date!
-after:   postgis=t  spatial_ref_sys=<N>  _prisma_migrations=<migration count>  app tables seeded
+after:   postgis=t  spatial_ref_sys=<N>  _prisma_migrations=<full migration count>  app tables seeded
 ```
 
-If `migrate status` is **not** "up to date" after baselining, the checksums don't match Prisma's
-— check that migrations are read as the raw `migration.sql` bytes/text, unchanged.
+If `migrate status` is **not** "up to date" after baselining, the checksums don't match what
+Prisma itself wrote to the check branch's ledger — check that the baseline SQL used the rows
+read back from the check branch verbatim, not values recomputed from local `migration.sql` files
+(that's precisely the bug this mechanism replaces).
 
 ## Drizzle variant
 
-Same branch lifecycle (steps 1–2 are identical: a throwaway schema-only `conductor/verify`
-branch off production). Three deltas:
+Same two-branch lifecycle (steps 1–2 identical: a throwaway schema-only `conductor/verify`
+workspace branch **and** a throwaway full-data `tmp/verify` check branch, both off a
+deliberately-behind `$PARENT`). Deltas:
 
 1. **Migrations table.** Watch `__drizzle_migrations=` in the snapshot, not `_prisma_migrations=`
-   (it lives in the `drizzle` schema). Expect `0` before baseline, the migration count after.
-2. **Executing the baseline.** Drizzle has no `prisma db execute`, so feed `/tmp/baseline.sql`
-   through the project's Postgres driver — the same `execSql` you wired in the script — or, for a
-   throwaway manual check where `psql` is handy, `psql "$CS" -f /tmp/baseline.sql`. Produce
-   `/tmp/baseline.sql` from the project's own logic: a tiny script that imports
-   `buildDrizzleBaselineSql` and `readDrizzleMigrations` from `scripts/conductor-db.ts` and writes
-   the result — exercising the exact hash/journal code the real provisioning uses.
+   (it lives in the `drizzle` schema). On the check branch this should show fewer rows than the
+   project's full migration count; on the workspace branch, `0` before baseline.
+2. **Reading the true ledger and executing the baseline.** Drizzle has no `prisma db execute`,
+   so both the check branch's `SELECT hash, created_at FROM "drizzle"."__drizzle_migrations"`
+   read and the workspace branch's baseline INSERT go through the project's Postgres driver —
+   the same `execSql` you wired in the script — or, for a throwaway manual check where `psql` is
+   handy, `psql "$CHECK_CS" -c '...'` to read and `psql "$CS" -f /tmp/true-baseline.sql` to
+   write. Produce `/tmp/true-baseline.sql` by feeding the check branch's rows straight into
+   `buildDrizzleLedgerBaselineSql` (imported from `scripts/conductor-db.ts`) — exercising the
+   exact code the real provisioning uses.
 3. **The "nothing pending" check.** Instead of `prisma migrate status`, run
-   `DATABASE_URL="$CS" <pm> drizzle-kit migrate` — after a correct baseline it should report **no
-   migrations to apply** and run nothing. If it instead tries to apply migrations (and fails
-   because the tables already exist), the baseline rows are missing or their `created_at` doesn't
-   match the journal's `when` — drizzle-kit decides what to run by the latest `created_at`.
+   `DATABASE_URL="$CS" <pm> drizzle-kit migrate` after baselining — it should apply exactly the
+   migration(s) `$PARENT` never ran and then report nothing left to do. If it instead tries to
+   re-apply migrations the check branch's ledger DID have (and fails because those tables already
+   exist), the baseline rows are missing or their `created_at` doesn't match what the check
+   branch's ledger actually recorded — drizzle-kit decides what to run by the latest
+   `created_at`, so it must come from the observed rows, not a value re-derived locally.
 
 ```
-before:  postgis=t  spatial_ref_sys=<N>  __drizzle_migrations=0              app tables all 0
-migrate: No migrations to apply / nothing run
-after:   postgis=t  spatial_ref_sys=<N>  __drizzle_migrations=<migration count>  app tables seeded
+workspace before: postgis=t  spatial_ref_sys=<N>  __drizzle_migrations=0                app tables all 0
+check (true state): __drizzle_migrations=<N-1>  (fewer than the project's full migration count)
+migrate: applies exactly the migration(s) the check branch didn't have, then nothing left to run
+after:   postgis=t  spatial_ref_sys=<N>  __drizzle_migrations=<full migration count>  app tables seeded
 ```
