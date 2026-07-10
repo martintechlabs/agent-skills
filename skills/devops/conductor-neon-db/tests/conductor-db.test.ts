@@ -7,15 +7,20 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   assertDisposableChildBranch,
-  buildDrizzleBaselineSql,
-  buildPrismaBaselineSql,
+  assertDisposableCheckBranch,
+  buildDrizzleLedgerBaselineSql,
+  buildPrismaLedgerBaselineSql,
+  checkBranchName,
+  clearCheckBranchState,
   FatalError,
   legacyWorkspaceBranchName,
   readBranchState,
+  readCheckBranchState,
   setupIsPending,
   withRetry,
   workspaceBranchName,
   writeBranchState,
+  writeCheckBranchState,
 } from '../scripts/conductor-db'
 
 describe('conductor-db helpers', () => {
@@ -89,6 +94,20 @@ describe('conductor-db helpers', () => {
     })
   })
 
+  describe('checkBranchName (disposable per-run branch used to learn the true migration ledger)', () => {
+    it('shares workspaceBranchName\'s slug but under the tmp/ prefix', () => {
+      process.env.CONDUCTOR_WORKSPACE_NAME = 'My Cool Feature!'
+      expect(checkBranchName()).toBe('tmp/my-cool-feature')
+      expect(checkBranchName()).not.toBe(workspaceBranchName())
+    })
+
+    it('truncates and hashes independently of workspaceBranchName, never colliding across the two prefixes', () => {
+      process.env.CONDUCTOR_WORKSPACE_NAME = 'a'.repeat(100)
+      expect(checkBranchName()).toMatch(/^tmp\/a{39}-[0-9a-f]{8}$/)
+      expect(checkBranchName().slice('tmp/'.length)).toBe(workspaceBranchName().slice('conductor/'.length))
+    })
+  })
+
   describe('legacyWorkspaceBranchName (pre-hash-suffix fallback)', () => {
     it('is null for short names — old and new derivations agree', () => {
       process.env.CONDUCTOR_WORKSPACE_NAME = 'My Cool Feature!'
@@ -107,13 +126,31 @@ describe('conductor-db helpers', () => {
       expect(() => assertDisposableChildBranch('conductor/my-feature', 'production')).not.toThrow()
     })
 
-    it('refuses a branch that is not conductor/ prefixed (e.g. production)', () => {
+    it('allows a tmp/ check branch', () => {
+      expect(() => assertDisposableChildBranch('tmp/my-feature', 'production')).not.toThrow()
+    })
+
+    it('refuses a branch that is neither conductor/ nor tmp/ prefixed (e.g. production)', () => {
       expect(() => assertDisposableChildBranch('production', 'production')).toThrow(/workspace branch/)
       expect(() => assertDisposableChildBranch('development', 'production')).toThrow(/workspace branch/)
     })
 
     it('refuses operating on the parent branch even if it were conductor/ prefixed', () => {
       expect(() => assertDisposableChildBranch('conductor/x', 'conductor/x')).toThrow(/parent branch/)
+    })
+  })
+
+  describe('assertDisposableCheckBranch (stricter: tmp/ only, not conductor/)', () => {
+    it('allows a tmp/ check branch', () => {
+      expect(() => assertDisposableCheckBranch('tmp/my-feature', 'production')).not.toThrow()
+    })
+
+    it('refuses a conductor/ workspace branch even though assertDisposableChildBranch would allow it', () => {
+      expect(() => assertDisposableCheckBranch('conductor/my-feature', 'production')).toThrow(/check branch/)
+    })
+
+    it('refuses operating on the parent branch', () => {
+      expect(() => assertDisposableCheckBranch('tmp/x', 'tmp/x')).toThrow(/parent branch/)
     })
   })
 
@@ -152,8 +189,33 @@ describe('conductor-db helpers', () => {
       writeBranchState('conductor/my-feature', 'pending') // written right after branch create
       expect(setupIsPending()).toBe(true)
       expect(readBranchState()).toBe('conductor/my-feature')
-      writeBranchState('conductor/my-feature', 'ready') // written after baseline + seed succeed
+      writeBranchState('conductor/my-feature', 'ready') // written after baseline + deploy + seed succeed
       expect(setupIsPending()).toBe(false)
+    })
+  })
+
+  describe('readCheckBranchState / writeCheckBranchState / clearCheckBranchState (check-branch leak tracking)', () => {
+    afterEach(() => {
+      clearCheckBranchState()
+    })
+
+    it('returns null when nothing is recorded', () => {
+      expect(readCheckBranchState()).toBeNull()
+    })
+
+    it('round-trips the check branch name, independent of the workspace-branch state file', () => {
+      writeBranchState('conductor/my-feature')
+      writeCheckBranchState('tmp/my-feature')
+      expect(readCheckBranchState()).toBe('tmp/my-feature')
+      expect(readBranchState()).toBe('conductor/my-feature') // unaffected by the check-branch record
+    })
+
+    it('clears cleanly, leaving the workspace-branch record untouched', () => {
+      writeBranchState('conductor/my-feature')
+      writeCheckBranchState('tmp/my-feature')
+      clearCheckBranchState()
+      expect(readCheckBranchState()).toBeNull()
+      expect(readBranchState()).toBe('conductor/my-feature')
     })
   })
 
@@ -182,7 +244,7 @@ describe('conductor-db helpers', () => {
       expect(waits).toEqual([2000, 4000])
     })
 
-    it('retries a rejected async operation the same way (used for the Drizzle execSql baseline)', async () => {
+    it('retries a rejected async operation the same way (used for the execSql true-baseline read/write)', async () => {
       const waits: number[] = []
       let calls = 0
       const result = await withRetry(
@@ -233,73 +295,92 @@ describe('conductor-db helpers', () => {
     })
   })
 
-  describe('buildPrismaBaselineSql', () => {
-    it('returns null when there are no migrations', () => {
-      expect(buildPrismaBaselineSql([])).toBeNull()
+  describe('buildPrismaLedgerBaselineSql (seeds _prisma_migrations from the parent\'s TRUE ledger)', () => {
+    it('returns null when the parent has nothing genuinely applied yet', () => {
+      expect(buildPrismaLedgerBaselineSql([])).toBeNull()
     })
 
-    it('emits one _prisma_migrations row per migration with Prisma sha256 checksums', () => {
-      const migrations = [
-        { name: '0001_init', sql: 'CREATE TABLE "A" ();' },
-        { name: '0002_more', sql: 'ALTER TABLE "A" ADD b int;' },
+    it('emits one _prisma_migrations row per captured ledger row, verbatim (no local re-derivation)', () => {
+      const rows = [
+        { checksum: createHash('sha256').update('a').digest('hex'), migration_name: '0001_init' },
+        { checksum: createHash('sha256').update('b').digest('hex'), migration_name: '0002_more' },
       ]
-      const sql = buildPrismaBaselineSql(migrations)!
+      const sql = buildPrismaLedgerBaselineSql(rows)!
       expect(sql).toContain('INSERT INTO "_prisma_migrations"')
-      for (const { name, sql: body } of migrations) {
-        expect(sql).toContain(`'${name}'`)
-        expect(sql).toContain(createHash('sha256').update(body).digest('hex'))
+      for (const { checksum, migration_name } of rows) {
+        expect(sql).toContain(`'${migration_name}'`)
+        expect(sql).toContain(checksum)
       }
     })
 
     it('is idempotent — only inserts migrations not already recorded', () => {
-      const sql = buildPrismaBaselineSql([{ name: '0001_init', sql: 'x' }])!
+      const sql = buildPrismaLedgerBaselineSql([{ checksum: 'a'.repeat(64), migration_name: '0001_init' }])!
       expect(sql).toMatch(/WHERE NOT EXISTS/i)
       expect(sql).toContain('e.migration_name = m.migration_name')
     })
 
     it('escapes single quotes in migration names (valid SQL literal)', () => {
-      const sql = buildPrismaBaselineSql([{ name: "0001_o'brien", sql: 'x' }])!
+      const sql = buildPrismaLedgerBaselineSql([{ checksum: 'a'.repeat(64), migration_name: "0001_o'brien" }])!
       expect(sql).toContain("'0001_o''brien'")
+    })
+
+    it('rejects a non-hex checksum instead of splicing it into SQL', () => {
+      expect(() =>
+        buildPrismaLedgerBaselineSql([{ checksum: "'); DROP SCHEMA public CASCADE; --", migration_name: '0001_init' }]),
+      ).toThrow(/non-hex checksum/)
     })
   })
 
-  describe('buildDrizzleBaselineSql', () => {
-    it('returns null when there are no migrations', () => {
-      expect(buildDrizzleBaselineSql([])).toBeNull()
+  describe('buildDrizzleLedgerBaselineSql (seeds drizzle.__drizzle_migrations from the parent\'s TRUE ledger)', () => {
+    it('returns null when the parent has nothing genuinely applied yet', () => {
+      expect(buildDrizzleLedgerBaselineSql([])).toBeNull()
     })
 
     it('targets drizzle.__drizzle_migrations and ensures the table exists', () => {
-      const sql = buildDrizzleBaselineSql([{ sql: 'CREATE TABLE "A" ();', when: 1700000000000 }])!
+      const sql = buildDrizzleLedgerBaselineSql([{ hash: createHash('sha256').update('x').digest('hex'), created_at: 1700000000000 }])!
       expect(sql).toContain('CREATE SCHEMA IF NOT EXISTS "drizzle"')
       expect(sql).toContain('CREATE TABLE IF NOT EXISTS "drizzle"."__drizzle_migrations"')
       expect(sql).toContain('INSERT INTO "drizzle"."__drizzle_migrations" (hash, created_at)')
     })
 
-    it('emits one row per migration: sha256 of the file contents + the journal `when`', () => {
-      const migrations = [
-        { sql: 'CREATE TABLE "A" ();', when: 1700000000000 },
-        { sql: 'ALTER TABLE "A" ADD b int;', when: 1700000005000 },
+    it('emits one row per captured ledger row, verbatim (no local re-derivation)', () => {
+      const rows = [
+        { hash: createHash('sha256').update('a').digest('hex'), created_at: 1700000000000 },
+        { hash: createHash('sha256').update('b').digest('hex'), created_at: 1700000005000 },
       ]
-      const sql = buildDrizzleBaselineSql(migrations)!
-      for (const { sql: body, when } of migrations) {
-        const hash = createHash('sha256').update(body).digest('hex')
-        expect(sql).toContain(`('${hash}', ${when})`)
+      const sql = buildDrizzleLedgerBaselineSql(rows)!
+      for (const { hash, created_at } of rows) {
+        expect(sql).toContain(`('${hash}', ${created_at})`)
       }
     })
 
+    it('accepts a stringified created_at (as Postgres bigint columns come back over some drivers)', () => {
+      const hash = createHash('sha256').update('x').digest('hex')
+      const sql = buildDrizzleLedgerBaselineSql([{ hash, created_at: '1700000000000' }])!
+      expect(sql).toContain(`('${hash}', 1700000000000)`)
+    })
+
     it('is idempotent — only inserts migrations not already recorded', () => {
-      const sql = buildDrizzleBaselineSql([{ sql: 'x', when: 1700000000000 }])!
+      const sql = buildDrizzleLedgerBaselineSql([{ hash: 'a'.repeat(64), created_at: 1700000000000 }])!
       expect(sql).toMatch(/WHERE NOT EXISTS/i)
       expect(sql).toContain('e.hash = m.hash')
     })
 
-    it('rejects a journal `when` that is not a plain non-negative integer instead of splicing it into SQL', () => {
-      const corrupted = [{ sql: 'x', when: "0),('x',0); DROP SCHEMA public CASCADE; --" as unknown as number }]
-      expect(() => buildDrizzleBaselineSql(corrupted)).toThrow(/non-integer "when"/)
-      expect(() => buildDrizzleBaselineSql([{ sql: 'x', when: NaN }])).toThrow(/non-integer "when"/)
-      expect(() => buildDrizzleBaselineSql([{ sql: 'x', when: 1700000000000.5 }])).toThrow(/non-integer "when"/) // Postgres would silently round it
-      expect(() => buildDrizzleBaselineSql([{ sql: 'x', when: 1e21 }])).toThrow(/non-integer "when"/) // serializes as "1e+21", not a bigint literal
-      expect(() => buildDrizzleBaselineSql([{ sql: 'x', when: -1 }])).toThrow(/non-integer "when"/)
+    it('rejects a non-hex hash instead of splicing it into SQL', () => {
+      expect(() =>
+        buildDrizzleLedgerBaselineSql([{ hash: "'); DROP SCHEMA public CASCADE; --", created_at: 1700000000000 }]),
+      ).toThrow(/non-hex hash/)
+    })
+
+    it('rejects a created_at that is not a plain non-negative integer instead of splicing it into SQL', () => {
+      const hash = 'a'.repeat(64)
+      expect(() => buildDrizzleLedgerBaselineSql([{ hash, created_at: NaN }])).toThrow(/non-integer created_at/)
+      expect(() => buildDrizzleLedgerBaselineSql([{ hash, created_at: 1700000000000.5 }])).toThrow(/non-integer created_at/) // Postgres would silently round it
+      expect(() => buildDrizzleLedgerBaselineSql([{ hash, created_at: 1e21 }])).toThrow(/non-integer created_at/) // serializes as "1e+21", not a bigint literal
+      expect(() => buildDrizzleLedgerBaselineSql([{ hash, created_at: -1 }])).toThrow(/non-integer created_at/)
+      expect(() => buildDrizzleLedgerBaselineSql([{ hash, created_at: "0),('x',0); DROP SCHEMA public CASCADE; --" }])).toThrow(
+        /non-integer created_at/,
+      )
     })
   })
 })
