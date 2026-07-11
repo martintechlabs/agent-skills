@@ -35,6 +35,8 @@ design; there is no "reuse an existing branch, keep its data" path. Each run:
 3. **Seeds** test fixtures.
 4. Writes the branch's connection string to `.env.neondb` as `DATABASE_URL` (its own file — the
    project's real `.env` is never touched; the run script loads it via `dotenv -e .env.neondb -o`).
+   The same file also gets a copy of `NEON_API_KEY` / `NEON_PROJECT_ID` / `NEON_PARENT_BRANCH` —
+   see "Archive needs the Neon env vars too" below for why.
 5. Records the branch name in `.conductor/db-branch` (gitignored) so archive deletes the **same**
    branch even if the workspace is renamed later — a rename changes `CONDUCTOR_WORKSPACE_NAME`,
    which would otherwise re-derive a different slug and silently miss the real branch.
@@ -51,6 +53,27 @@ failures are exactly how Neon branches leak past Conductor's archive step. (An a
 branch is "nothing to clean", not an error — teardown stays idempotent. Archive also sweeps for
 a leaked `tmp/*` check branch, in case a provision was killed between creating one and cleaning
 it up.) The whole thing is driven by `.conductor/settings.toml`.
+
+### Archive needs the Neon env vars too
+
+Conductor's docs say scripts get the same environment variables as agents, so in principle
+`NEON_API_KEY` / `NEON_PROJECT_ID` / `NEON_PARENT_BRANCH` set in Conductor's Environment tabs
+should already be present when `archive` runs. In practice this has been observed to **not** hold
+— archive's process has been missing them even when a live shell in the same workspace has them
+(root cause unconfirmed on Conductor's side). Since teardown fails loudly without
+`NEON_API_KEY`/`NEON_PROJECT_ID` by design (see above), a missing var here means the Neon branch
+leaks instead of getting cleaned up.
+
+The fix is two-sided, and both sides matter:
+
+1. **provision() mirrors the three Neon vars into `.env.neondb`** alongside `DATABASE_URL` (and
+   any other `DB_ENV_VARS`) — not just derived from them, but copied verbatim from the same
+   `requireEnv()` calls provision already makes.
+2. **`archive` loads `.env.neondb` before running teardown**: `archive = "dotenv -e .env.neondb -o
+   -- tsx scripts/conductor-db.ts teardown"` (see step 4). `dotenv -e` silently no-ops if the file
+   is missing, so this is a safe no-op fallback for workspaces provisioned before this existed —
+   not a new requirement — and it doesn't replace setting the vars in Conductor's Environment
+   tabs (step 5), it backstops them for the one script invocation that's been seen not to get them.
 
 ## When this applies
 
@@ -247,7 +270,12 @@ and `git check-ignore .conductor/db-branch` (must print the path = ignored).
 # client, then FULLY REBUILDS an isolated SCHEMA-ONLY Neon branch (scripts/conductor-db.ts) —
 # every run, discarding any data from a prior run — baselines its migration history against
 # production's TRUE applied-migration state (via a disposable full-data check branch, never
-# production directly), and seeds fixtures. archive deletes the branch.
+# production directly), and seeds fixtures. Setup also writes NEON_API_KEY/NEON_PROJECT_ID/
+# NEON_PARENT_BRANCH into .env.neondb alongside DATABASE_URL. archive loads .env.neondb first
+# before deleting the branch: Conductor's Environment tabs are supposed to be enough on their
+# own, but archive's environment has been observed not to have them even when a live shell in
+# the same workspace does, so the copy setup wrote is a reliability fallback (`dotenv -e`
+# silently no-ops if the file is missing, so this is safe for pre-existing workspaces too).
 # run refuses to start if .env.neondb is missing (unprovisioned workspace), then best-effort
 # syncs the Neon branch's name to match the workspace (Conductor has no rename event, so this
 # catches up on the next dev-server start after a rename), then loads the generated
@@ -257,7 +285,7 @@ and `git check-ignore .conductor/db-branch` (must print the path = ignored).
 
 [scripts]
 setup = "corepack enable pnpm && pnpm install --frozen-lockfile && pnpm exec prisma generate && pnpm exec tsx scripts/conductor-db.ts provision"
-archive = "pnpm exec tsx scripts/conductor-db.ts teardown"
+archive = "pnpm exec dotenv -e .env.neondb -o -- pnpm exec tsx scripts/conductor-db.ts teardown"
 run = "pnpm exec tsx scripts/conductor-db.ts sync && pnpm exec dotenv -e .env.neondb -o -- pnpm dev --port $CONDUCTOR_PORT"
 run_mode = "concurrent"
 ```
@@ -293,6 +321,11 @@ cloud workspace can't see the Mac, so it needs them too). They are secrets — d
 **Do NOT add `DATABASE_URL`** — the script writes it per workspace. A value in the env tabs
 lands in `process.env` and overrides the isolated branch, silently collapsing every workspace
 back onto one shared database.
+
+Setting these in Conductor's Environment tabs is still required, even though `provision()` also
+mirrors them into `.env.neondb` for `archive` to load — see "Archive needs the Neon env vars too"
+above. The mirror is a fallback for one flaky script invocation, not a substitute for the real
+config; `sync` and a first-time `provision()` still read these from the environment directly.
 
 ### 6. Wire up seeding (adapt to the project)
 
@@ -390,6 +423,15 @@ The script can't harm production, by construction:
   setup = "..."
   ```
 - **`DATABASE_URL` must not be in Conductor's env tabs** (step 5) — it overrides the per-workspace branch.
+- **Archive can run without the Conductor env vars it's supposed to have**: `archive` should get
+  `NEON_API_KEY`/`NEON_PROJECT_ID`/`NEON_PARENT_BRANCH` from Conductor's Environment tabs the same
+  as any other script, but this has been observed not to hold in practice — archive's process
+  missing vars a live shell in the same workspace has. Since teardown fails loudly without them,
+  a missing var here silently leaks the Neon branch instead of erroring where you'd notice. The
+  fix is on both ends: `provision()` mirrors the three vars into `.env.neondb`, and `archive` in
+  `.conductor/settings.toml` loads that file first (`dotenv -e .env.neondb -o -- ...teardown`,
+  step 4) — see "Archive needs the Neon env vars too" above. If you copy this skill's `archive`
+  line without the `dotenv -e` prefix, you've reintroduced the leak this fix closes.
 - **`directUrl` / `shadowDatabaseUrl` leak the shared DB** if not covered: the ORM CLI and dev
   server still auto-load the project's real `.env`, so any DB URL var defined there that isn't
   in `DB_ENV_VARS` (step 2) wins for that connection — e.g. Prisma would run migrations over a
