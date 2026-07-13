@@ -21,6 +21,7 @@ Audit an existing AGENTS.md and patch its gaps — or generate one from scratch 
 - "set up AGENTS.md for this repo"
 - "bootstrap agent rules for this project"
 - "/optimize-agents-md"
+- "create autonomous agent rules for this pnpm monorepo"
 
 ## Instructions
 
@@ -37,7 +38,7 @@ Audit an existing AGENTS.md and patch its gaps — or generate one from scratch 
    - **Adequate** — present, specific to this repo, matches current tooling.
    - **Thin/generic** — present but boilerplate, doesn't reflect this repo's actual commands/conventions.
    - **Missing** — section absent entirely.
-   - **Stale** — references tooling, commands, or files that no longer match the repo (e.g. mentions `yarn` but the repo now has `pnpm-lock.yaml`).
+   - **Stale** — references tooling, commands, or files that no longer match the repo (e.g. mentions `yarn` but the repo now has `pnpm-lock.yaml`) (see Heuristics → Staleness).
    - **Conflicting** — the section's own words work against a fast, safe SDLC (see Heuristics → Superpowers alignment).
 
 4. Re-inspect the repo (same detection as the fallback path) so any proposed addition or edit is grounded in what's actually there, not assumed.
@@ -174,15 +175,3 @@ A good result:
 - never lets CLAUDE.md and AGENTS.md drift out of sync — one is always a pointer to the other,
 - optimizes for a fast *and* safe SDLC — autonomy, validation, and subagent policies reinforce TDD, brainstorming-before-creative-work, verification-before-completion, and subagent dispatch rather than quietly undercutting them,
 - stays short enough to actually be read every run — heavy reference material lives in linked docs, not inline.
-
-## Example invocations
-
-User: "Audit my AGENTS.md"
-User: "Is my AGENTS.md any good?"
-User: "Optimize AGENTS.md for this repo"
-User: "Fill gaps in AGENTS.md"
-User: "Make sure my AGENTS.md works well with superpowers/TDD/subagents"
-User: "Reconcile CLAUDE.md and AGENTS.md"
-User: "Set up AGENTS.md for this repo"
-User: "Create autonomous agent rules for this pnpm monorepo"
-User: "/optimize-agents-md"
