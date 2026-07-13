@@ -66,24 +66,22 @@ agent that's actually running right now.
 Leads with audit/optimize phrasing, keeps the old bootstrap triggers since
 they still work via the fallback path:
 
-> Audit and improve a repo's AGENTS.md file for a fast, safe SDLC —
-> patching gaps in an existing file rather than replacing it, generating
-> one from scratch only when none exists, making sure its autonomy,
-> validation, and subagent policies reinforce rather than fight
-> disciplines like TDD, brainstorming-before-creative-work,
-> verification-before-completion, and subagent dispatch, and splitting an
-> overgrown file into linked docs/ reference material when it's gotten too
-> long to stay useful. Also keeps
-> CLAUDE.md from duplicating AGENTS.md: collapses it to a one-line pointer
-> (`@AGENTS.md`), plus a short superpowers tie-in note when that plugin is
-> active. Use when auditing an AGENTS.md, asking "is my AGENTS.md any
-> good," filling gaps in agent rules, making sure AGENTS.md works well with
-> superpowers/TDD/subagents, reconciling CLAUDE.md and AGENTS.md, or still
-> when setting up AGENTS.md for a repo that has none. Triggered by requests
-> like "audit my AGENTS.md," "optimize AGENTS.md," "fill gaps in
-> AGENTS.md," "make sure my AGENTS.md plays well with superpowers," "set up
-> AGENTS.md for this repo," "bootstrap agent rules for this project," or
-> the /optimize-agents-md command.
+> Audit and patch a repo's AGENTS.md for a fast, safe SDLC — filling gaps
+> and fixing stale or conflicting sections in an existing file rather than
+> replacing it, falling back to generating one from scratch only if none
+> exists. Checks that autonomy, validation, and subagent policies reinforce
+> rather than undercut TDD, brainstorming-before-creative-work,
+> verification-before-completion, and subagent dispatch, and splits an
+> overgrown file into linked docs/ reference material. Also collapses
+> CLAUDE.md to a one-line pointer (`@AGENTS.md`), plus a superpowers tie-in
+> note when that plugin is active. Use when auditing, optimizing, or
+> filling gaps in an AGENTS.md, checking it plays well with
+> superpowers/TDD/subagents, reconciling CLAUDE.md with AGENTS.md, or
+> setting one up for a repo that has none — including the
+> /optimize-agents-md command.
+>
+> (Trimmed during plan-writing to fit the 1024-char frontmatter budget —
+> the original draft above was 1173 chars.)
 
 ## Workflow
 
