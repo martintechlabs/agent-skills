@@ -68,10 +68,12 @@ they still work via the fallback path:
 
 > Audit and improve a repo's AGENTS.md file for a fast, safe SDLC —
 > patching gaps in an existing file rather than replacing it, generating
-> one from scratch only when none exists, and making sure its autonomy,
+> one from scratch only when none exists, making sure its autonomy,
 > validation, and subagent policies reinforce rather than fight
 > disciplines like TDD, brainstorming-before-creative-work,
-> verification-before-completion, and subagent dispatch. Also keeps
+> verification-before-completion, and subagent dispatch, and splitting an
+> overgrown file into linked docs/ reference material when it's gotten too
+> long to stay useful. Also keeps
 > CLAUDE.md from duplicating AGENTS.md: collapses it to a one-line pointer
 > (`@AGENTS.md`), plus a short superpowers tie-in note when that plugin is
 > active. Use when auditing an AGENTS.md, asking "is my AGENTS.md any
@@ -85,7 +87,7 @@ they still work via the fallback path:
 
 ## Workflow
 
-Replaces the current 8-step "Instructions" list.
+Replaces the current 8-step "Instructions" list with 9 steps.
 
 1. **Locate files.** Find every AGENTS.md in the repo (root + nested) and,
    for each, check whether a sibling CLAUDE.md exists at the same
@@ -94,7 +96,7 @@ Replaces the current 8-step "Instructions" list.
    unchanged: inspect the repo (package manager, runtime, framework, test
    stack, database layer, monorepo shape), infer the operating model, and
    generate root + nested AGENTS.md files using the existing Heuristics and
-   Output template. Skip to step 6 for the CLAUDE.md pass.
+   Output template. Skip to step 7 for the CLAUDE.md pass.
 3. **AGENTS.md exists → audit.** For each existing AGENTS.md, classify every
    section from the canonical checklist (Operating mode, Autonomy policy,
    Decision rules, Subagent policy, Validation strategy, Package manager
@@ -125,10 +127,19 @@ Replaces the current 8-step "Instructions" list.
    silently changed. Conflicting sections are flagged with the specific
    discipline they undercut and a proposed rewording — never silently
    overridden, since the user may have written that rule on purpose.
-6. **Reconcile CLAUDE.md, per directory level.**
+6. **Check length; propose doc-splitting if needed.** If the file (root or
+   nested) has grown long, or a section is dominated by heavy reference
+   material rather than day-to-day decision guidance, propose extracting
+   that material to a linked doc and leaving a short summary + link in its
+   place. See Heuristics → Length and reference-doc splitting for the
+   threshold and location rules. This is a proposal like any other patch —
+   show what moves, where it goes, and what the shortened section reads
+   like — never split silently.
+7. **Reconcile CLAUDE.md, per directory level.**
    - If CLAUDE.md exists with real content: diff it against the
      (possibly just-patched) AGENTS.md at the same level. Anything present
-     only in CLAUDE.md gets folded into the AGENTS.md patch from step 5.
+     only in CLAUDE.md gets folded into the AGENTS.md patch from the
+     "Patch, don't rewrite" step above.
      Genuine contradictions (not just gaps) are flagged for the user
      instead of auto-resolved.
    - Once AGENTS.md is the source of truth at that level, collapse
@@ -143,15 +154,17 @@ Replaces the current 8-step "Instructions" list.
      content as above.
    - Applies at root and at every nested app/package directory that has
      its own AGENTS.md.
-7. **Escalate only when essential**, same policy as today: ask targeted
+8. **Escalate only when essential**, same policy as today: ask targeted
    questions only for things that can't be inferred (e.g. "should
    migrations require explicit approval?").
-8. **Output order:**
-   - Section-by-section audit table (adequate / thin / missing / stale) for
-     each AGENTS.md found, plus CLAUDE.md pointer status per directory.
+9. **Output order:**
+   - Section-by-section audit table (adequate / thin / missing / stale /
+     conflicting) for each AGENTS.md found, plus CLAUDE.md pointer status
+     per directory.
    - Proposed patch: only the sections being added or changed, not a full
      file dump — unless most sections are missing, in which case show the
-     full proposed file.
+     full proposed file. Includes any proposed doc-splitting (what moves,
+     where it goes, the shortened section text).
    - Nested-file findings, if monorepo.
    - Note on what was inferred vs. what needs explicit confirmation.
 
@@ -203,6 +216,36 @@ because getting it wrong makes the SDLC *slower*, not just messier.
   suite before declaring done") that happen to satisfy the discipline
   either way.
 
+### Length and reference-doc splitting
+AGENTS.md is read on every run — it stays useful only if it stays short
+enough that the agent actually reads and follows it. Heavy reference
+material belongs in a linked doc, not inline.
+
+- **Trigger:** the file (root or nested) has grown long overall, or a
+  single section is dominated by reference material — exhaustive command
+  lists, full API/config documentation, long tables — rather than the
+  handful of decisions an agent needs on a normal run. There's no single
+  hard line-count threshold; judge by whether a section is still something
+  the agent needs to see *every time* versus something it only needs when
+  that specific topic comes up.
+- **Where extracted docs go:** reuse the repo's existing `docs/`
+  directory and its subfolder conventions if one exists (e.g. an existing
+  `docs/testing.md` pattern means new material follows that same
+  shape). If there's no `docs/` directory at all, create
+  `docs/agents/<topic>.md` — separate from general project docs, so it's
+  clear this is agent-reference material.
+- **What stays inline:** a short summary plus a link, e.g. "See
+  `docs/agents/testing.md` for the full test matrix and fixtures
+  reference." The summary must still carry the actual decision-relevant
+  guidance (e.g. the one command to run for a targeted test) — splitting
+  moves *reference* material out, not the guidance itself.
+- This is distinct from nested AGENTS.md files: nested files carry
+  different *operating rules* for a different app/package. Doc-splitting
+  carries *reference material* out of a single AGENTS.md that's grown too
+  long for its own good.
+- Always a proposal, never silent — same patch-not-rewrite principle as
+  everything else in this skill.
+
 ### CLAUDE.md pointer hygiene
 - AGENTS.md is always the canonical file; CLAUDE.md is never a second
   place to maintain rules.
@@ -242,6 +285,8 @@ Existing bullets carry over. Add:
   subagent policies reinforce TDD, brainstorming-before-creative-work,
   verification-before-completion, and subagent dispatch rather than
   quietly undercutting them in the name of "autonomy."
+- Stays short enough to actually be read every run — heavy reference
+  material lives in linked docs, not inline.
 
 ## Output template
 
@@ -288,3 +333,6 @@ installable via `npx skills add`:
   reworded to satisfy TDD/verification/subagent-dispatch generically); the
   explicit superpowers reference lives only in CLAUDE.md, and only when
   the current session shows the plugin is active.
+- **Doc-splitting location:** reuse an existing `docs/` directory's own
+  conventions when present; default to `docs/agents/<topic>.md` when the
+  repo has no `docs/` directory at all.
