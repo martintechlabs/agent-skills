@@ -16,7 +16,7 @@ The goal is:
 
 1. Select the strongest available review mechanism.
 2. Fix all valid Critical and Major issues.
-3. Create a PR.
+3. Create or update the PR.
 4. Run `/greploop`.
 5. Iterate until Greploop reaches 5/5 or the maximum pass count is reached.
 
@@ -40,13 +40,38 @@ Choose the first mechanism that can actually run in the current harness:
 
 1. `/code-review max` when the harness exposes it. Invoke it as a skill or slash action; never run it as a shell command.
 2. The `codex-review` skill when it is available and usable. Follow that skill against the intended PR base.
-3. Direct Codex CLI review when `codex exec review` is available. Use a known PR base when one exists. Otherwise resolve the remote default branch, then run:
+3. Direct Codex CLI review when `codex exec review` is available. Use a known intended PR base when one exists, after verifying that it resolves to a commit. Otherwise resolve `BASE_REF` in this order:
+
+   1. `refs/remotes/origin/HEAD`, only when the symbolic ref and its target both resolve.
+   2. The first ref that resolves to a commit from `refs/heads/main`, `refs/remotes/origin/main`, `refs/heads/master`, and `refs/remotes/origin/master`.
+
+   Use this fallback discovery:
 
    ```bash
-   BASE_BRANCH=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD)
-   BASE_BRANCH=${BASE_BRANCH#origin/}
-   codex exec review --base "$BASE_BRANCH" -o /tmp/codex-review.txt
+   BASE_REF=""
+   if ORIGIN_HEAD=$(git symbolic-ref --quiet refs/remotes/origin/HEAD) &&
+      git rev-parse --verify --quiet "${ORIGIN_HEAD}^{commit}" >/dev/null
+   then
+     BASE_REF="$ORIGIN_HEAD"
+   else
+     for candidate in refs/heads/main refs/remotes/origin/main refs/heads/master refs/remotes/origin/master; do
+       if git rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null; then
+         BASE_REF="$candidate"
+         break
+       fi
+     done
+   fi
    ```
+
+   Invoke Codex only when the selected base is nonempty and still resolves immediately before review:
+
+   ```bash
+   test -n "$BASE_REF" &&
+   git rev-parse --verify --quiet "${BASE_REF}^{commit}" >/dev/null &&
+   codex exec review --base "$BASE_REF" -o /tmp/codex-review.txt
+   ```
+
+   If no base resolves, do not invoke Codex with an empty or unresolvable base. Fall through to native self-review and record why.
 
    Use `--uncommitted` when needed. If committed and uncommitted scopes both contain part of the change, review both and combine their findings into one pass.
 4. Native self-review when none of the preceding mechanisms can run.
@@ -108,9 +133,9 @@ A pass is one complete review of the full change. Multiple invocations needed to
 
 Maximum review passes: **5**
 
-### 6. Create the PR
+### 6. Create or update the PR
 
-Create a PR after the review loop is complete.
+After the review loop is complete, reuse and update an existing PR for the current branch. Create a PR only when none exists.
 
 The PR description must include:
 
@@ -126,11 +151,7 @@ Use a concise PR title that describes the actual risk reduced.
 
 ### 7. Run Greploop
 
-Run:
-
-```bash
-/greploop
-```
+Invoke `/greploop` as the Greploop skill or slash action. Never run it as a shell command.
 
 Greploop is a hard acceptance gate.
 
@@ -140,7 +161,7 @@ Review all Greploop findings. Fix anything required to reach 5/5. Do not game th
 
 ### 8. Repeat the Greploop loop
 
-Repeat `/greploop`, then fix remaining issues.
+Repeat the Greploop skill or slash action, then fix remaining issues.
 
 Stop when either:
 
