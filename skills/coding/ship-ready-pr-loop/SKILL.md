@@ -1,28 +1,26 @@
 ---
 name: ship-ready-pr-loop
-description: Run `/code-review max`, fix Critical and Major issues, create a PR, then run `/greploop` until the PR reaches 5/5 or the pass limit is hit. Use this when the user wants to harden a PR until it is ready to ship.
+description: Use when hardening a completed change or pull request through iterative review until it is ready to ship.
 metadata:
   author: stephen-martin
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # Ship-Ready PR Loop
 
 ## Purpose
 
-Use this skill to take a codebase from review findings to a ship-ready PR.
+Take a completed change from review findings to a ship-ready PR.
 
 The goal is:
 
-1. Run `/code-review max`.
+1. Select the strongest available review mechanism.
 2. Fix all valid Critical and Major issues.
 3. Create a PR.
 4. Run `/greploop`.
 5. Iterate until Greploop reaches 5/5 or the maximum pass count is reached.
 
-This skill is intentionally narrow. Do not perform broad cleanup, style refactors, architecture rewrites, or low-priority fixes unless they directly resolve a Critical/Major issue or are required for Greploop 5/5.
-
----
+Keep the work narrow. Do not perform broad cleanup, style refactors, architecture rewrites, or low-priority fixes unless they directly resolve a Critical/Major issue or are required for Greploop 5/5.
 
 ## Workflow
 
@@ -30,110 +28,103 @@ This skill is intentionally narrow. Do not perform broad cleanup, style refactor
 
 Before making changes:
 
-* Confirm the working tree status.
-* Create a new branch if needed.
-* Identify the project's validation commands:
-
-  * tests
-  * typecheck
-  * lint
-  * build
+- Confirm the working tree status.
+- Create a new branch if needed.
+- Identify the project's validation commands: tests, typecheck, lint, and build.
 
 If commands are not obvious, inspect package files, CI config, Makefiles, README files, or project docs.
 
----
+### 2. Select the review mechanism
 
-### 2. Run code review
+Choose the first mechanism that can actually run in the current harness:
 
-Run:
+1. `/code-review max` when the harness exposes it. Invoke it as a skill or slash action; never run it as a shell command.
+2. The `codex-review` skill when it is available and usable. Follow that skill against the intended PR base.
+3. Direct Codex CLI review when `codex exec review` is available. Use a known PR base when one exists. Otherwise resolve the remote default branch, then run:
 
-```bash
-/code-review max
-```
+   ```bash
+   BASE_BRANCH=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD)
+   BASE_BRANCH=${BASE_BRANCH#origin/}
+   codex exec review --base "$BASE_BRANCH" -o /tmp/codex-review.txt
+   ```
 
-Review the output and classify findings.
+   Use `--uncommitted` when needed. If committed and uncommitted scopes both contain part of the change, review both and combine their findings into one pass.
+4. Native self-review when none of the preceding mechanisms can run.
 
-Only act on:
+Keep a working mechanism for later passes when possible. If it cannot start or becomes unavailable, fall through to the next mechanism and record the transition. An unavailable preferred reviewer is not a blocker while another mechanism remains.
 
-* Critical issues
-* Major issues
+### 3. Run the review
 
-Ignore unless directly relevant:
+Review the complete change against the intended PR base, including relevant uncommitted and untracked files.
 
-* Minor issues
-* Low-priority issues
-* style-only comments
-* naming-only comments
-* broad technical debt
-* speculative refactors
+For native self-review:
 
----
+- Resolve the intended PR base rather than assuming `main`.
+- Inspect the branch diff, staged and unstaged changes, and every relevant untracked file listed by `git status --short`.
+- Read changed files plus relevant tests, callers, and surrounding code.
+- Check correctness and regressions, security and authorization, data loss or destructive behavior, error handling and recovery, concurrency and state consistency, compatibility and public APIs, and test coverage for changed behavior.
+- Produce concrete findings with severity, file location, impact, and rationale.
+- State: `Native self-review is not an independent second opinion.`
 
-### 3. Fix Critical and Major issues
+For every mechanism:
+
+- Classify findings as Critical, Major, Minor, or lower priority.
+- Triage each finding on its merits.
+- Act only on valid Critical and Major findings.
+- Document false positives instead of changing code for them.
+- Leave Minor, style-only, naming-only, broad technical-debt, and speculative-refactor findings alone unless directly required by a Critical/Major fix.
+
+### 4. Fix Critical and Major issues
 
 For each valid Critical/Major issue:
 
-* Fix the root cause.
-* Keep the change minimal.
-* Avoid unrelated rewrites.
-* Preserve existing behavior unless the issue requires behavior change.
-* Add or update tests where appropriate.
+- Fix the root cause.
+- Keep the change minimal.
+- Avoid unrelated rewrites.
+- Preserve existing behavior unless the issue requires a behavior change.
+- Add or update tests where appropriate.
 
-If a finding is a false positive:
-
-* Do not change the code.
-* Document why it is a false positive in the final PR notes.
-
-After each fix pass, run the project validation suite:
+After each fix pass, run the actual project validation suite, such as:
 
 ```bash
-# Use actual project commands
 npm test
 npm run typecheck
 npm run lint
 npm run build
 ```
 
-Adapt commands to the project.
+Adapt the commands to the project.
 
----
+### 5. Repeat the review loop
 
-### 4. Repeat code-review loop
+Repeat the selected review mechanism, fixing remaining valid Critical/Major issues after each pass.
 
-Repeat:
+Stop when either:
 
-```bash
-/code-review max
-```
+- no valid Critical or Major issues remain, or
+- 5 total review passes have been completed across all mechanisms.
 
-Then fix remaining Critical/Major issues.
+A pass is one complete review of the full change. Multiple invocations needed to cover committed and uncommitted scopes together count as one pass.
 
-Stop this loop when either:
+Maximum review passes: **5**
 
-* `/code-review max` reports no remaining Critical or Major issues, or
-* 5 total `/code-review max` passes have been completed.
+### 6. Create the PR
 
-Maximum code-review passes: **5**
-
----
-
-### 5. Create the PR
-
-Create a PR after the code-review loop is complete.
+Create a PR after the review loop is complete.
 
 The PR description must include:
 
-* Summary of Critical/Major issues fixed.
-* Validation commands run.
-* Number of `/code-review max` passes completed.
-* Any remaining findings and why they were not fixed.
-* Any false positives and rationale.
+- Critical/Major issues fixed.
+- Validation commands run.
+- Total review passes and passes per mechanism.
+- Any mechanism transition and why it occurred.
+- Any remaining findings and why they were not fixed.
+- Any false positives and rationale.
+- The native-review transparency note when native self-review was used.
 
 Use a concise PR title that describes the actual risk reduced.
 
----
-
-### 6. Run Greploop
+### 7. Run Greploop
 
 Run:
 
@@ -145,66 +136,48 @@ Greploop is a hard acceptance gate.
 
 Target score: **5/5**
 
-Review all Greploop findings. Fix anything required to reach 5/5.
+Review all Greploop findings. Fix anything required to reach 5/5. Do not game the score; fix the underlying issue.
 
-Do not game the score. Fix the underlying issue.
+### 8. Repeat the Greploop loop
 
----
+Repeat `/greploop`, then fix remaining issues.
 
-### 7. Repeat Greploop loop
+Stop when either:
 
-Repeat:
-
-```bash
-/greploop
-```
-
-Then fix remaining issues.
-
-Stop this loop when either:
-
-* Greploop reports 5/5, or
-* 5 total Greploop passes have been completed.
+- Greploop reports 5/5, or
+- 5 total Greploop passes have been completed.
 
 Maximum Greploop passes: **5**
 
 After each Greploop fix pass, rerun relevant validation commands.
 
----
-
 ## Acceptance Criteria
 
 The work is complete only when:
 
-* No unresolved valid Critical `/code-review max` findings remain.
-* No unresolved valid Major `/code-review max` findings remain.
-* Project validation passes.
-* PR exists.
-* Greploop score is 5/5.
+- At least one review mechanism completed successfully.
+- No unresolved valid Critical review findings remain.
+- No unresolved valid Major review findings remain.
+- Project validation passes.
+- A PR exists.
+- Greploop score is 5/5.
 
-If Greploop does not reach 5/5 within 5 passes, the PR must clearly document:
-
-* final Greploop score
-* number of Greploop passes completed
-* remaining blockers
-* why they remain
-* what is needed to finish
-
----
+If the review loop reaches five passes with valid Critical/Major findings, or Greploop does not reach 5/5 within five passes, the PR and final report must state the exact remaining blockers, why they remain, and what is needed to finish. Do not report the work as complete.
 
 ## Hard Rules
 
-* Do not fix low-priority issues unless needed for a Critical/Major fix or Greploop 5/5.
-* Do not perform broad rewrites.
-* Do not change public APIs unless required.
-* Do not suppress warnings without explaining why.
-* Do not remove tests to make validation pass.
-* Do not weaken validation.
-* Do not skip validation after code changes.
-* Do not create a PR that hides remaining blockers.
-* Do not claim Greploop is 5/5 unless the latest run confirms it.
-
----
+- Do not stop solely because a preferred review mechanism is unavailable.
+- Do not run a slash action as a shell command.
+- Do not present native self-review as independent review.
+- Do not fix low-priority issues unless needed for a Critical/Major fix or Greploop 5/5.
+- Do not perform broad rewrites.
+- Do not change public APIs unless required.
+- Do not suppress warnings without explaining why.
+- Do not remove tests to make validation pass.
+- Do not weaken validation.
+- Do not skip validation after code changes.
+- Do not create a PR that hides remaining blockers.
+- Do not claim Greploop is 5/5 unless the latest run confirms it.
 
 ## Final Response Format
 
@@ -215,23 +188,23 @@ When finished, report:
 
 PR: <link>
 
-Code-review passes: <number>
+Review mechanisms:
+- <mechanism>: <passes>
+Total review passes: <number>
 Greploop passes: <number>
 Final Greploop score: <score>
 
 Validation:
 - <command>: pass/fail
-- <command>: pass/fail
 
 Fixed:
-- <issue>
 - <issue>
 
 Remaining:
 - None
 
 Notes:
-- <false positives, blockers, or caveats>
+- <fallback transitions, native-review disclosure, false positives, blockers, or caveats>
 ```
 
 If incomplete, replace `Remaining: None` with the exact remaining blockers.
