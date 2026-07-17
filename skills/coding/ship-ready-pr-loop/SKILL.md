@@ -40,12 +40,23 @@ Choose the first mechanism that can actually run in the current harness:
 
 1. `/code-review max` when the harness exposes it. Invoke it as a skill or slash action; never run it as a shell command.
 2. The `codex-review` skill when it is available and usable. Follow that skill against the intended PR base.
-3. Direct Codex CLI review when `codex exec review` is available. Use a known intended PR base when one exists, after verifying that it resolves to a commit. Otherwise resolve `BASE_REF` in this order:
+3. Direct Codex CLI review when `codex exec review` is available. Set `BASE_REF` through exactly one of these mutually exclusive paths:
 
-   1. `refs/remotes/origin/HEAD`, only when the symbolic ref and its target both resolve.
-   2. The first ref that resolves to a commit from `refs/heads/main`, `refs/remotes/origin/main`, `refs/heads/master`, and `refs/remotes/origin/master`.
+   - **Known intended PR base:** Assign its exact local or remote ref to `BASE_REF`, then verify that it resolves to a commit:
 
-   Use this fallback discovery:
+     ```bash
+     BASE_REF="<exact known intended local or remote ref>"
+     git rev-parse --verify --quiet "${BASE_REF}^{commit}" >/dev/null
+     ```
+
+     If verification fails, optionally resolve or fetch that same intended base when doing so is in scope, then verify the same ref again. Never substitute `origin/HEAD`, `main`, or `master` for a different known intended base. If the intended base remains unresolved, do not invoke Codex. Record why and fall through to native self-review.
+
+   - **No intended PR base known:** Resolve `BASE_REF` in this order:
+
+     1. `refs/remotes/origin/HEAD`, only when the symbolic ref and its target both resolve.
+     2. The first ref that resolves to a commit from `refs/heads/main`, `refs/remotes/origin/main`, `refs/heads/master`, and `refs/remotes/origin/master`.
+
+   Use this fallback discovery only when no intended PR base is known:
 
    ```bash
    BASE_REF=""
@@ -85,6 +96,7 @@ Review the complete change against the intended PR base, including relevant unco
 For native self-review:
 
 - Resolve the intended PR base rather than assuming `main`.
+- When an intended base is known, use that same base. If it remains unresolved after any in-scope resolution or fetch, report the base as a blocker; do not substitute a default branch.
 - Inspect the branch diff, staged and unstaged changes, and every relevant untracked file listed by `git status --short`.
 - Read changed files plus relevant tests, callers, and surrounding code.
 - Check correctness and regressions, security and authorization, data loss or destructive behavior, error handling and recovery, concurrency and state consistency, compatibility and public APIs, and test coverage for changed behavior.

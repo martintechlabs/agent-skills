@@ -12,6 +12,9 @@
 
 - Select review mechanisms by capability, not by agent identity.
 - Never execute `/code-review max` as a shell command.
+- Never substitute a default branch for a different known intended PR base.
+- Reuse and update an existing PR for the current branch; create one only when none exists.
+- Invoke `/greploop` as a skill or slash action, never as a shell command.
 - Count at most five total pre-PR review passes across all mechanisms.
 - Fix every valid Critical and Major finding; triage findings rather than rubber-stamping them.
 - State that native self-review is not an independent second opinion.
@@ -69,7 +72,7 @@ The goal is:
 
 1. Select the strongest available review mechanism.
 2. Fix all valid Critical and Major issues.
-3. Create a PR.
+3. Create or update the PR.
 4. Run `/greploop`.
 5. Iterate until Greploop reaches 5/5 or the maximum pass count is reached.
 
@@ -93,13 +96,49 @@ Choose the first mechanism that can actually run in the current harness:
 
 1. `/code-review max` when the harness exposes it. Invoke it as a skill or slash action; never run it as a shell command.
 2. The `codex-review` skill when it is available and usable. Follow that skill against the intended PR base.
-3. Direct Codex CLI review when `codex exec review` is available. Use a known PR base when one exists. Otherwise resolve the remote default branch, then run:
+3. Direct Codex CLI review when `codex exec review` is available. Set `BASE_REF` through exactly one of these mutually exclusive paths:
+
+   - **Known intended PR base:** Assign its exact local or remote ref to `BASE_REF`, then verify that it resolves to a commit:
+
+     ```bash
+     BASE_REF="<exact known intended local or remote ref>"
+     git rev-parse --verify --quiet "${BASE_REF}^{commit}" >/dev/null
+     ```
+
+     If verification fails, optionally resolve or fetch that same intended base when doing so is in scope, then verify the same ref again. Never substitute `origin/HEAD`, `main`, or `master` for a different known intended base. If the intended base remains unresolved, do not invoke Codex. Record why and fall through to native self-review.
+
+   - **No intended PR base known:** Resolve `BASE_REF` in this order:
+
+     1. `refs/remotes/origin/HEAD`, only when the symbolic ref and its target both resolve.
+     2. The first ref that resolves to a commit from `refs/heads/main`, `refs/remotes/origin/main`, `refs/heads/master`, and `refs/remotes/origin/master`.
+
+   Use this fallback discovery only when no intended PR base is known:
 
    ```bash
-   BASE_BRANCH=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD)
-   BASE_BRANCH=${BASE_BRANCH#origin/}
-   codex exec review --base "$BASE_BRANCH" -o /tmp/codex-review.txt
+   BASE_REF=""
+   if ORIGIN_HEAD=$(git symbolic-ref --quiet refs/remotes/origin/HEAD) &&
+      git rev-parse --verify --quiet "${ORIGIN_HEAD}^{commit}" >/dev/null
+   then
+     BASE_REF="$ORIGIN_HEAD"
+   else
+     for candidate in refs/heads/main refs/remotes/origin/main refs/heads/master refs/remotes/origin/master; do
+       if git rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null; then
+         BASE_REF="$candidate"
+         break
+       fi
+     done
+   fi
    ```
+
+   Invoke Codex only when the selected base is nonempty and still resolves immediately before review:
+
+   ```bash
+   test -n "$BASE_REF" &&
+   git rev-parse --verify --quiet "${BASE_REF}^{commit}" >/dev/null &&
+   codex exec review --base "$BASE_REF" -o /tmp/codex-review.txt
+   ```
+
+   If no base resolves, do not invoke Codex with an empty or unresolvable base. Fall through to native self-review and record why.
 
    Use `--uncommitted` when needed. If committed and uncommitted scopes both contain part of the change, review both and combine their findings into one pass.
 4. Native self-review when none of the preceding mechanisms can run.
@@ -113,6 +152,7 @@ Review the complete change against the intended PR base, including relevant unco
 For native self-review:
 
 - Resolve the intended PR base rather than assuming `main`.
+- When an intended base is known, use that same base. If it remains unresolved after any in-scope resolution or fetch, report the base as a blocker; do not substitute a default branch.
 - Inspect the branch diff, staged and unstaged changes, and every relevant untracked file listed by `git status --short`.
 - Read changed files plus relevant tests, callers, and surrounding code.
 - Check correctness and regressions, security and authorization, data loss or destructive behavior, error handling and recovery, concurrency and state consistency, compatibility and public APIs, and test coverage for changed behavior.
@@ -161,9 +201,9 @@ A pass is one complete review of the full change. Multiple invocations needed to
 
 Maximum review passes: **5**
 
-### 6. Create the PR
+### 6. Create or update the PR
 
-Create a PR after the review loop is complete.
+After the review loop is complete, reuse and update an existing PR for the current branch. Create a PR only when none exists.
 
 The PR description must include:
 
@@ -179,11 +219,7 @@ Use a concise PR title that describes the actual risk reduced.
 
 ### 7. Run Greploop
 
-Run:
-
-```bash
-/greploop
-```
+Invoke `/greploop` as the Greploop skill or slash action. Never run it as a shell command.
 
 Greploop is a hard acceptance gate.
 
@@ -193,7 +229,7 @@ Review all Greploop findings. Fix anything required to reach 5/5. Do not game th
 
 ### 8. Repeat the Greploop loop
 
-Repeat `/greploop`, then fix remaining issues.
+Repeat the Greploop skill or slash action, then fix remaining issues.
 
 Stop when either:
 
@@ -263,7 +299,7 @@ Notes:
 If incomplete, replace `Remaining: None` with the exact remaining blockers.
 ````
 
-- [ ] **Step 3: Run four forward-test scenarios with fresh agents**
+- [ ] **Step 3: Run core and focused forward-test scenarios with fresh agents**
 
 Run each prompt in a fresh context with the revised skill. Do not tell the agent the expected mechanism.
 
@@ -293,12 +329,46 @@ Use the ship-ready-pr-loop skill at skills/coding/ship-ready-pr-loop/SKILL.md to
 
 Expected for all four: select the strongest stated capability; cover the full change; share one five-pass limit across mechanisms; fix valid Critical/Major findings; name the mechanism and pass count in PR/final reporting; preserve the Greploop gate. Expected for native only: include the exact independence disclosure and the required risk categories. If a scenario fails, tighten only the ambiguous guidance and rerun the failing scenario in another fresh context.
 
+Run these focused edge scenarios in additional fresh contexts:
+
+Missing `origin/HEAD` with local `main` available:
+
+```text
+Use the ship-ready-pr-loop skill at skills/coding/ship-ready-pr-loop/SKILL.md to prepare a completed feature branch for a pull request. The harness cannot invoke /code-review max, the codex-review skill is unavailable, and codex exec review is available. The intended PR base is not otherwise known, refs/remotes/origin/HEAD does not exist, and refs/heads/main exists. Do not modify files or create a pull request. Describe the exact base-resolution and review workflow, stopping conditions, and reporting.
+```
+
+Resolvable known non-default base:
+
+```text
+Use the ship-ready-pr-loop skill at skills/coding/ship-ready-pr-loop/SKILL.md for direct Codex review. The intended PR base is the known non-default ref refs/remotes/origin/release/2.x, that exact ref resolves to a commit, and origin/HEAD plus main also resolve. /code-review max and codex-review are unavailable; codex exec review is available. Do not modify files or run review. State the exact BASE_REF assignment and verification commands, whether default-base discovery runs, fallback behavior, stopping conditions, and reporting.
+```
+
+Unresolvable known non-default base with `main` available:
+
+```text
+Use the ship-ready-pr-loop skill at skills/coding/ship-ready-pr-loop/SKILL.md for direct Codex review. The intended PR base is the known non-default ref refs/remotes/origin/release/2.x, but that ref does not resolve locally; origin/HEAD and refs/heads/main resolve. /code-review max and codex-review are unavailable; codex exec review is available. Fetching the intended base is not authorized. Do not modify files or run review. State the exact BASE_REF assignment and verification commands, whether main may be substituted, and fallback behavior including native review, stopping conditions, and reporting.
+```
+
+Existing PR:
+
+```text
+Use the ship-ready-pr-loop skill at skills/coding/ship-ready-pr-loop/SKILL.md after the review loop is complete and validation passes. An open PR for the current branch already exists. Do not modify files or create or update a PR. Describe the exact PR-handling workflow, Greploop gate, stopping conditions, and reporting.
+```
+
+Greploop invocation semantics:
+
+```text
+Use the ship-ready-pr-loop skill at skills/coding/ship-ready-pr-loop/SKILL.md after the review loop is complete and a PR exists. The harness exposes /greploop only as a skill/slash action; there is no /greploop shell executable. Do not modify files, invoke Greploop, or update the PR. Describe the precise Greploop invocation semantics, stopping conditions, and reporting.
+```
+
+Expected: the missing-`origin/HEAD` case selects verified local `main`; the resolvable known-base case assigns and uses the exact release ref without default discovery; the unresolvable known-base case never substitutes `origin/HEAD`, `main`, or `master`, does not invoke Codex, and carries the intended-base blocker into native review; the existing-PR case reuses and updates that PR; and Greploop is always invoked as a skill/slash action. Rerun any failed scenario in another fresh context after tightening only the ambiguous guidance.
+
 - [ ] **Step 4: Run static skill validation**
 
 Run:
 
 ```bash
-python3 /Users/smartin/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/coding/ship-ready-pr-loop
+uv run --with PyYAML python /Users/smartin/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/coding/ship-ready-pr-loop
 git diff --check
 ```
 
@@ -312,6 +382,14 @@ git diff -- README.md skills.sh.json skills/coding/codex-review/SKILL.md
 ```
 
 Expected: both commands print nothing. The first proves acceptance/reporting no longer depends on the preferred reviewer; the second proves out-of-scope files are unchanged.
+
+Confirm the prescribed replacement remains identical to the skill:
+
+```bash
+ruby -e 'plan = File.read("docs/superpowers/plans/2026-07-17-ship-ready-pr-loop-review-fallback.md"); match = plan.match(/````markdown\n(.*?)\n````/m) or abort "replacement block missing"; abort "replacement differs from SKILL.md" unless match[1] + "\n" == File.read("skills/coding/ship-ready-pr-loop/SKILL.md"); puts "Plan replacement matches SKILL.md"'
+```
+
+Expected: `Plan replacement matches SKILL.md`.
 
 - [ ] **Step 5: Review and commit the implementation**
 
@@ -338,6 +416,8 @@ Expected: one implementation commit containing only `skills/coding/ship-ready-pr
 ## Final verification
 
 - [ ] Re-run the native-only forward-test once after any refactor wording changes.
-- [ ] Re-run `quick_validate.py` and `git diff --check` from Task 1.
-- [ ] Run `git log -3 --oneline` and confirm the design, plan, and implementation are separate commits.
+- [ ] Re-run both known non-default-base scenarios after any base-resolution wording changes.
+- [ ] Re-run the `uv`-based `quick_validate.py` command and `git diff --check` from Task 1.
+- [ ] Run `git log --oneline origin/main..HEAD` and inspect the complete branch history without assuming a fixed commit count.
+- [ ] Run `git diff --name-only origin/main...HEAD` and confirm the exact PR scope is `docs/superpowers/specs/2026-07-17-ship-ready-pr-loop-review-fallback-design.md`, `docs/superpowers/plans/2026-07-17-ship-ready-pr-loop-review-fallback.md`, and `skills/coding/ship-ready-pr-loop/SKILL.md`.
 - [ ] Run `git status --short` and confirm the working tree is clean.
