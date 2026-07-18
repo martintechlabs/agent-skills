@@ -343,5 +343,39 @@ test_sub_issue_link_dry_run
 test_sub_issue_fallback_on_failure
 test_sub_issue_fallback_no_duplicate_heading
 
+test_write_manifest() {
+  local d; d="$(mktemp -d)"
+  (cd "$d" && git init -q)
+  write_good_plan "$d/plan.json"
+  local outf errf; outf="$(mktemp)"; errf="$(mktemp)"
+  local bindir="$d/bin"; mkdir -p "$bindir"; cp "$HERE/fake-gh" "$bindir/gh"; chmod +x "$bindir/gh"
+  ( cd "$d" && \
+    PATH="$bindir:$PATH" FAKE_GH_ISSUES_JSON='[]' FAKE_GH_COUNTER_FILE="$d/counter" \
+    bash "$SCRIPT" --input "$d/plan.json" --repo octo/repo >"$outf" 2>"$errf" )
+  local manifest="$d/docs/superpowers/tickets/2026-07-18-example.md"
+  [ -f "$manifest" ] && ok "writes the manifest file" || bad "writes the manifest file" "not found: $manifest"
+  local content; content="$(cat "$manifest" 2>/dev/null || true)"
+  assert_contains "$content" "Epic: #100" "manifest records the epic number"
+  assert_contains "$content" "| #101 | complexity:small | model-tier:efficient | priority:p1 |" "manifest records ticket A's metadata"
+  assert_contains "$content" "| #102 | complexity:medium | model-tier:standard | priority:p1 | #101 |" "manifest resolves ticket B's dependency to a real number"
+  rm -f "$outf" "$errf"; rm -rf "$d"
+}
+
+test_manifest_skipped_on_dry_run() {
+  local d; d="$(mktemp -d)"
+  (cd "$d" && git init -q)
+  write_good_plan "$d/plan.json"
+  ( cd "$d" && PATH="$HERE/../tests:$PATH" true ) # no-op; real check below
+  local bindir="$d/bin"; mkdir -p "$bindir"; cp "$HERE/fake-gh" "$bindir/gh"; chmod +x "$bindir/gh"
+  ( cd "$d" && PATH="$bindir:$PATH" FAKE_GH_ISSUES_JSON='[]' bash "$SCRIPT" --input "$d/plan.json" --repo octo/repo --dry-run >/dev/null 2>/dev/null )
+  [ -e "$d/docs/superpowers/tickets/2026-07-18-example.md" ] \
+    && bad "dry-run does not write a manifest" "file exists" \
+    || ok "dry-run does not write a manifest"
+  rm -rf "$d"
+}
+
+test_write_manifest
+test_manifest_skipped_on_dry_run
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

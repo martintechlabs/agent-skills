@@ -34,6 +34,7 @@ main() {
   ensure_labels
   file_epic
   file_tickets
+  if [ "$DRY_RUN" != true ]; then write_manifest; fi
 }
 
 parse_args() {
@@ -272,6 +273,36 @@ append_checkbox_fallback() {
   fi
   body="$body"$'\n- [ ] #'"$ticket_num $title"
   gh issue edit "$EPIC_NUMBER" --repo "$REPO" --body "$body" >/dev/null
+}
+
+write_manifest() {
+  local plan_file slug outfile root count i num complexity tier priority deps
+  plan_file="$(jq -r '.plan_file' <<<"$PLAN_JSON")"
+  slug="$(basename "$plan_file" .md)"
+  root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  outfile="$root/docs/superpowers/tickets/$slug.md"
+  mkdir -p "$(dirname "$outfile")"
+  {
+    echo "# Tickets filed for $plan_file"
+    echo
+    echo "Epic: #$EPIC_NUMBER"
+    echo
+    echo "| Ticket | Complexity | Model tier | Priority | Depends on |"
+    echo "|---|---|---|---|---|"
+    count="$(jq '.tickets | length' <<<"$PLAN_JSON")"
+    i=0
+    while [ "$i" -lt "$count" ]; do
+      slug="$(jq -r ".tickets[$i].slug" <<<"$PLAN_JSON")"
+      num="$(slug_number "$slug")"
+      complexity="$(jq -r ".tickets[$i].labels[] | select(startswith(\"complexity:\"))" <<<"$PLAN_JSON")"
+      tier="$(jq -r ".tickets[$i].labels[] | select(startswith(\"model-tier:\"))" <<<"$PLAN_JSON")"
+      priority="$(jq -r ".tickets[$i].labels[] | select(startswith(\"priority:\"))" <<<"$PLAN_JSON")"
+      deps="$(resolved_deps "$i")"
+      echo "| #$num | $complexity | $tier | $priority | $deps |"
+      i=$((i + 1))
+    done
+  } > "$outfile"
+  echo "Wrote $outfile" >&2
 }
 
 main "$@"
