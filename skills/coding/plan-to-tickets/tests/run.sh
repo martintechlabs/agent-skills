@@ -163,5 +163,30 @@ test_input_invalid_json
 test_dependency_validation_fails
 test_dependency_validation_passes
 
+test_ensure_labels_dry_run_only_missing() {
+  local d; d="$(mktemp -d)"
+  write_good_plan "$d/plan.json"
+  run_ct "$d/bin" FAKE_GH_LABELS=$'epic\ncomplexity:small' -- --input "$d/plan.json" --dry-run
+  assert_contains "$ERR" "PLAN CREATE LABEL complexity:medium" "plans creating a missing label"
+  assert_contains "$ERR" "PLAN CREATE LABEL priority:p1" "plans creating another missing label"
+  assert_not_contains "$ERR" "PLAN CREATE LABEL epic" "does not re-plan an existing label"
+  assert_not_contains "$ERR" "PLAN CREATE LABEL complexity:small" "does not re-plan another existing label"
+  rm -rf "$d"
+}
+
+test_ensure_labels_real_run() {
+  local d; d="$(mktemp -d)"; local log="$d/gh.log"
+  write_good_plan "$d/plan.json"
+  run_ct "$d/bin" FAKE_GH_LABELS=$'epic' FAKE_GH_LOG="$log" FAKE_GH_COUNTER_FILE="$d/counter" \
+    -- --input "$d/plan.json" --repo octo/repo
+  local logtext; logtext="$(cat "$log")"
+  assert_contains "$logtext" "label create complexity:small --repo octo/repo --color 0e8a16 --force" "creates a missing label with its color"
+  assert_not_contains "$logtext" "label create epic" "does not recreate an existing label"
+  rm -rf "$d"
+}
+
+test_ensure_labels_dry_run_only_missing
+test_ensure_labels_real_run
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

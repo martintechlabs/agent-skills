@@ -31,6 +31,7 @@ main() {
   preflight
   if [ "$PREFLIGHT_ONLY" = true ]; then exit 0; fi
   load_plan
+  ensure_labels
 }
 
 parse_args() {
@@ -92,6 +93,45 @@ validate_dependency_order() {
     printf '%s\n' "$bad" >&2
     exit 1
   fi
+}
+
+label_color() {
+  case "$1" in
+    epic) echo "5319e7" ;;
+    complexity:small) echo "0e8a16" ;;
+    complexity:medium) echo "fbca04" ;;
+    priority:p1) echo "b60205" ;;
+    priority:p2) echo "d93f0b" ;;
+    priority:p3) echo "c5def5" ;;
+    model-tier:lite) echo "bfd4f2" ;;
+    model-tier:efficient) echo "1d76db" ;;
+    model-tier:standard) echo "0052cc" ;;
+    model-tier:flagship) echo "5319e7" ;;
+    *) echo "ededed" ;;
+  esac
+}
+
+required_labels() {
+  jq -r '["epic"] + [.tickets[].labels[]] | unique | .[]' <<<"$PLAN_JSON"
+}
+
+existing_labels() {
+  gh label list --repo "$REPO" --json name -q '.[].name' 2>/dev/null || true
+}
+
+ensure_labels() {
+  local existing name color
+  existing="$(existing_labels)"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if grep -qxF "$name" <<<"$existing"; then continue; fi
+    color="$(label_color "$name")"
+    if [ "$DRY_RUN" = true ]; then
+      echo "PLAN CREATE LABEL $name (color #$color)" >&2
+      continue
+    fi
+    gh label create "$name" --repo "$REPO" --color "$color" --force >/dev/null
+  done < <(required_labels)
 }
 
 main "$@"
