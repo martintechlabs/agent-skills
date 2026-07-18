@@ -30,6 +30,7 @@ main() {
   if [ "$PRINT_CONFIG" = true ]; then print_config; exit 0; fi
   preflight
   if [ "$PREFLIGHT_ONLY" = true ]; then exit 0; fi
+  load_plan
 }
 
 parse_args() {
@@ -61,6 +62,36 @@ preflight() {
   [ -n "$INPUT" ] || { echo "Missing --input <ticket-plan.json>." >&2; exit 2; }
   [ -f "$INPUT" ] || { echo "No such file: $INPUT" >&2; exit 1; }
   jq -e . "$INPUT" >/dev/null 2>&1 || { echo "$INPUT is not valid JSON." >&2; exit 1; }
+}
+
+load_plan() {
+  PLAN_JSON="$(cat "$INPUT")"
+  if [ -z "$REPO" ]; then
+    REPO="$(jq -r '.repo // empty' <<<"$PLAN_JSON")"
+  fi
+  if [ -z "$REPO" ]; then
+    REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+  fi
+  [ -n "$REPO" ] || { echo "Could not determine target repo. Pass --repo or set .repo in the ticket-plan JSON." >&2; exit 1; }
+  validate_dependency_order
+}
+
+validate_dependency_order() {
+  local bad
+  bad="$(jq -r '
+    [.tickets[].slug] as $slugs
+    | [ range(0; (.tickets | length)) as $i
+        | (.tickets[$i].depends_on_slugs // [])[] as $dep
+        | select( ($slugs[0:$i] | index($dep)) == null )
+        | "\(.tickets[$i].slug) depends on unknown/forward slug \($dep)"
+      ]
+    | .[]
+  ' <<<"$PLAN_JSON")"
+  if [ -n "$bad" ]; then
+    echo "Invalid ticket-plan JSON: every depends_on_slugs entry must name an earlier ticket's slug." >&2
+    printf '%s\n' "$bad" >&2
+    exit 1
+  fi
 }
 
 main "$@"

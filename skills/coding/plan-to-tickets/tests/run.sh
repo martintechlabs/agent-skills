@@ -84,5 +84,84 @@ test_preflight_auth_fail() {
 test_preflight_auth_ok
 test_preflight_auth_fail
 
+test_missing_input_value_flag() {
+  local d; d="$(mktemp -d)"
+  run_ct "$d/bin" -- --input
+  assert_eq "$RC" "2" "missing --input value exits 2"
+  assert_contains "$ERR" "Missing value for --input" "clear error for missing --input value"
+  rm -rf "$d"
+}
+
+test_input_not_found() {
+  local d; d="$(mktemp -d)"
+  run_ct "$d/bin" -- --input "$d/nope.json"
+  assert_eq "$RC" "1" "missing input file exits 1"
+  assert_contains "$ERR" "No such file" "clear error for missing input file"
+  rm -rf "$d"
+}
+
+test_input_invalid_json() {
+  local d; d="$(mktemp -d)"
+  printf 'not json' > "$d/bad.json"
+  run_ct "$d/bin" -- --input "$d/bad.json"
+  assert_eq "$RC" "1" "invalid JSON input exits 1"
+  assert_contains "$ERR" "not valid JSON" "clear error for invalid JSON"
+  rm -rf "$d"
+}
+
+write_good_plan() {
+  cat > "$1" <<'EOF'
+{
+  "repo": "octo/repo",
+  "plan_file": "docs/superpowers/plans/2026-07-18-example.md",
+  "epic": {"title": "Example Feature", "body": "Epic body text."},
+  "tickets": [
+    {"slug": "001-a", "title": "Ticket A", "body": "Body A",
+     "labels": ["complexity:small", "priority:p1", "model-tier:efficient"], "depends_on_slugs": []},
+    {"slug": "002-b", "title": "Ticket B", "body": "Body B",
+     "labels": ["complexity:medium", "priority:p1", "model-tier:standard"], "depends_on_slugs": ["001-a"]}
+  ]
+}
+EOF
+}
+
+write_bad_dependency_plan() {
+  cat > "$1" <<'EOF'
+{
+  "repo": "octo/repo",
+  "plan_file": "docs/superpowers/plans/2026-07-18-example.md",
+  "epic": {"title": "Example Feature", "body": "Epic body text."},
+  "tickets": [
+    {"slug": "001-a", "title": "Ticket A", "body": "Body A", "labels": ["complexity:small"], "depends_on_slugs": ["999-nope"]}
+  ]
+}
+EOF
+}
+
+test_dependency_validation_fails() {
+  local d; d="$(mktemp -d)"
+  write_bad_dependency_plan "$d/plan.json"
+  run_ct "$d/bin" -- --input "$d/plan.json"
+  assert_eq "$RC" "1" "unknown/forward dependency exits 1"
+  assert_contains "$ERR" "001-a depends on unknown/forward slug 999-nope" "names the bad ticket and slug"
+  rm -rf "$d"
+}
+
+test_dependency_validation_passes() {
+  local d; d="$(mktemp -d)"
+  write_good_plan "$d/plan.json"
+  # FAKE_GH_ISSUES_JSON/FAKE_GH_COUNTER_FILE are set so this test stays valid once later
+  # tasks wire more of main() past load_plan — right now (Task 4) main() stops here anyway.
+  run_ct "$d/bin" FAKE_GH_ISSUES_JSON='[]' FAKE_GH_COUNTER_FILE="$d/counter" -- --input "$d/plan.json"
+  assert_eq "$RC" "0" "well-ordered dependencies load cleanly"
+  rm -rf "$d"
+}
+
+test_missing_input_value_flag
+test_input_not_found
+test_input_invalid_json
+test_dependency_validation_fails
+test_dependency_validation_passes
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
