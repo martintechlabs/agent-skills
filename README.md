@@ -62,6 +62,7 @@ Skills the coding agent reaches for while working.
 | [`ship-ready-pr-loop`](skills/coding/ship-ready-pr-loop/SKILL.md) | Drives a change from review findings to a ship-ready PR: fixes Critical/Major issues, then loops Greptile until it reaches 5/5. |
 | [`optimize-agents-md`](skills/coding/optimize-agents-md/SKILL.md) | Audits and patches a repo's AGENTS.md for a fast, safe SDLC — reinforcing TDD, brainstorming, verification, and subagent dispatch — generating one from scratch only if none exists, and keeps CLAUDE.md as a one-line pointer to it. |
 | [`git-merge-origin-main`](skills/coding/git-merge-origin-main/SKILL.md) | Safely merges the latest `origin/main` into the current non-main branch, with hard stops for dirty working trees, in-progress Git operations, detached HEAD, and conflicts. |
+| [`plan-to-tickets`](skills/coding/plan-to-tickets/SKILL.md) | Turns a superpowers spec + implementation plan into a GitHub backlog — an epic issue plus complexity/model-tier/priority/dependency-tagged ticket sub-issues for independent workers to pick up. Idempotent, with a `--dry-run` preview gate before anything is filed. |
 
 ### DevOps
 
