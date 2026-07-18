@@ -22,9 +22,14 @@ run_ct() {
   local envs=()
   while [ "$1" != "--" ]; do envs+=("$1"); shift; done
   shift  # drop --
-  local outf errf
+  local outf errf workdir
   outf="$(mktemp)"; errf="$(mktemp)"
-  PATH="$(setup_path "$bindir")" env ${envs[@]+"${envs[@]}"} bash "$SCRIPT" "$@" >"$outf" 2>"$errf"
+  # Run from the test's own temp dir (parent of $bindir), never the repo root: a real
+  # (non-dry-run) invocation calls write_manifest, which resolves its output path via
+  # `git rev-parse --show-toplevel` — without this, that would resolve to *this* repo
+  # and leak a stray docs/superpowers/tickets/*.md file into it on every test run.
+  workdir="$(dirname "$bindir")"
+  ( cd "$workdir" && PATH="$(setup_path "$bindir")" env ${envs[@]+"${envs[@]}"} bash "$SCRIPT" "$@" >"$outf" 2>"$errf" )
   RC=$?
   OUT="$(cat "$outf")"; ERR="$(cat "$errf")"
   rm -f "$outf" "$errf"
