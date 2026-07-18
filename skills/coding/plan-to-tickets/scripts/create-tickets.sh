@@ -246,8 +246,32 @@ file_tickets() {
     fi
 
     record_slug "$slug" "$num" "$id"
+    link_sub_issue "$id" "$num" "$slug"
     i=$((i + 1))
   done
+}
+
+link_sub_issue() {
+  local ticket_id="$1" ticket_num="$2" slug="$3"
+  if [ "$DRY_RUN" = true ]; then
+    echo "PLAN LINK sub-issue ($slug) under epic \"$(jq -r '.epic.title' <<<"$PLAN_JSON")\"" >&2
+    return 0
+  fi
+  if ! gh api "repos/$REPO/issues/$EPIC_NUMBER/sub_issues" -f "sub_issue_id=$ticket_id" >/dev/null 2>&1; then
+    echo "Sub-issues API unavailable; falling back to checkbox list in epic body for ticket #$ticket_num." >&2
+    append_checkbox_fallback "$ticket_num"
+  fi
+}
+
+append_checkbox_fallback() {
+  local ticket_num="$1" title body
+  title="$(gh issue view "$ticket_num" --repo "$REPO" --json title -q .title)"
+  body="$(gh issue view "$EPIC_NUMBER" --repo "$REPO" --json body -q .body)"
+  if ! grep -q '^### Tickets' <<<"$body"; then
+    body="$body"$'\n\n### Tickets'
+  fi
+  body="$body"$'\n- [ ] #'"$ticket_num $title"
+  gh issue edit "$EPIC_NUMBER" --repo "$REPO" --body "$body" >/dev/null
 }
 
 main "$@"

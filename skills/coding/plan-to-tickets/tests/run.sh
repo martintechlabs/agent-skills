@@ -278,5 +278,70 @@ test_tickets_dry_run
 test_tickets_real_create_with_resolved_dependency
 test_tickets_idempotent_update
 
+test_sub_issue_link_success() {
+  local d; d="$(mktemp -d)"; local log="$d/gh.log"
+  write_good_plan "$d/plan.json"
+  run_ct "$d/bin" FAKE_GH_ISSUES_JSON='[]' FAKE_GH_LOG="$log" FAKE_GH_COUNTER_FILE="$d/counter" \
+    -- --input "$d/plan.json" --repo octo/repo
+  local logtext; logtext="$(cat "$log")"
+  assert_contains "$logtext" "api repos/octo/repo/issues/100/sub_issues -f sub_issue_id=9101" "links ticket A as a sub-issue by id (not number)"
+  assert_contains "$logtext" "api repos/octo/repo/issues/100/sub_issues -f sub_issue_id=9102" "links ticket B as a sub-issue by id"
+  rm -rf "$d"
+}
+
+test_sub_issue_link_dry_run() {
+  local d; d="$(mktemp -d)"
+  write_good_plan "$d/plan.json"
+  run_ct "$d/bin" FAKE_GH_ISSUES_JSON='[]' -- --input "$d/plan.json" --dry-run
+  assert_contains "$ERR" 'PLAN LINK sub-issue (001-a) under epic "Example Feature"' "plans linking ticket A"
+  rm -rf "$d"
+}
+
+test_sub_issue_fallback_on_failure() {
+  local d; d="$(mktemp -d)"; local log="$d/gh.log"
+  write_good_plan "$d/plan.json"
+  run_ct "$d/bin" FAKE_GH_ISSUES_JSON='[]' FAKE_GH_SUBISSUES_FAIL=true FAKE_GH_ISSUE_TITLE="Ticket A" \
+    FAKE_GH_LOG="$log" FAKE_GH_COUNTER_FILE="$d/counter" \
+    -- --input "$d/plan.json" --repo octo/repo
+  assert_contains "$ERR" "Sub-issues API unavailable; falling back to checkbox list in epic body for ticket #101." "reports the fallback (non-silent)"
+  local logtext; logtext="$(cat "$log")"
+  assert_contains "$logtext" "issue edit 100 --repo octo/repo --body" "falls back to editing the epic body"
+  assert_contains "$logtext" "### Tickets" "adds a Tickets heading"
+  assert_contains "$logtext" "- [ ] #101 Ticket A" "appends a checkbox line for the ticket"
+  rm -rf "$d"
+}
+
+test_sub_issue_fallback_no_duplicate_heading() {
+  local d; d="$(mktemp -d)"; local log="$d/gh.log"
+  # A single-ticket plan: exactly one fallback call, so the heading count below is
+  # unambiguous (a multi-ticket plan would append the pre-existing heading text once
+  # per ticket's independent issue-edit call, which is correct but would make a
+  # log-wide count meaningless).
+  cat > "$d/plan.json" <<'EOF'
+{
+  "repo": "octo/repo",
+  "plan_file": "docs/superpowers/plans/2026-07-18-example.md",
+  "epic": {"title": "Example Feature", "body": "Epic body text."},
+  "tickets": [
+    {"slug": "001-a", "title": "Ticket A", "body": "Body A",
+     "labels": ["complexity:small", "priority:p1", "model-tier:efficient"], "depends_on_slugs": []}
+  ]
+}
+EOF
+  run_ct "$d/bin" FAKE_GH_ISSUES_JSON='[]' FAKE_GH_SUBISSUES_FAIL=true \
+    FAKE_GH_EPIC_BODY=$'Epic body.\n\n### Tickets\n- [ ] #99 Existing ticket' \
+    FAKE_GH_LOG="$log" FAKE_GH_COUNTER_FILE="$d/counter" \
+    -- --input "$d/plan.json" --repo octo/repo
+  local heading_count
+  heading_count="$(grep -o '### Tickets' "$log" | wc -l | tr -d ' ')"
+  assert_eq "$heading_count" "1" "does not add a second Tickets heading when one already exists"
+  rm -rf "$d"
+}
+
+test_sub_issue_link_success
+test_sub_issue_link_dry_run
+test_sub_issue_fallback_on_failure
+test_sub_issue_fallback_no_duplicate_heading
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
