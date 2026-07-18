@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Fake `gh` for create-tickets.sh tests. Records every invocation to $FAKE_GH_LOG
+# (argv joined by spaces, one call per line) and emits canned/deterministic output
+# so tests never touch the network.
+#
+# Tunable via env vars:
+#   FAKE_GH_AUTH_FAIL          "true" makes `gh auth status` fail
+#   FAKE_GH_NAME_WITH_OWNER    default: octo/repo
+#   FAKE_GH_LABELS             newline-separated existing label names (default: empty)
+#   FAKE_GH_ISSUES_JSON        JSON array returned by `gh issue list` (default: [])
+#   FAKE_GH_COUNTER_FILE       file holding the next issue number to mint (required for `issue create`)
+#   FAKE_GH_SUBISSUES_FAIL     "true" makes the sub_issues POST fail
+#   FAKE_GH_ISSUE_TITLE        title returned by `gh issue view --json title` (default: "Fake Title")
+#   FAKE_GH_EPIC_BODY          body returned by `gh issue view --json body` (default: "")
+#
+# Issue "id" (the sub_issues linking field) is always number+9000, so tests can
+# catch code that mixes up number vs id.
+set -uo pipefail
+[ -n "${FAKE_GH_LOG:-}" ] && printf '%s\n' "$*" >>"$FAKE_GH_LOG"
+
+case "$1" in
+  auth)
+    [ "${FAKE_GH_AUTH_FAIL:-false}" = true ] && exit 1
+    exit 0 ;;
+  repo)
+    printf '%s\n' "${FAKE_GH_NAME_WITH_OWNER:-octo/repo}"
+    exit 0 ;;
+  api)
+    case "$*" in
+      *sub_issues*)
+        [ "${FAKE_GH_SUBISSUES_FAIL:-false}" = true ] && { echo "sub_issues unavailable" >&2; exit 1; }
+        printf '{}\n' ;;
+      *) printf '{}\n' ;;
+    esac
+    exit 0 ;;
+  label)
+    case "$2" in
+      list) printf '%s\n' "${FAKE_GH_LABELS:-}" ;;
+      create) exit 0 ;;
+      *) exit 0 ;;
+    esac
+    exit 0 ;;
+  issue)
+    case "$2" in
+      list)
+        printf '%s\n' "${FAKE_GH_ISSUES_JSON:-[]}" ;;
+      create)
+        counter_file="${FAKE_GH_COUNTER_FILE:?FAKE_GH_COUNTER_FILE must be set}"
+        [ -f "$counter_file" ] || echo 100 > "$counter_file"
+        n="$(cat "$counter_file")"
+        echo "$((n + 1))" > "$counter_file"
+        printf 'https://github.com/%s/issues/%s\n' "${FAKE_GH_NAME_WITH_OWNER:-octo/repo}" "$n" ;;
+      edit)
+        exit 0 ;;
+      view)
+        num="$3"
+        case "$*" in
+          *'.id'*) echo "$((num + 9000))" ;;
+          *'.title'*) printf '%s\n' "${FAKE_GH_ISSUE_TITLE:-Fake Title}" ;;
+          *'.body'*) printf '%s\n' "${FAKE_GH_EPIC_BODY:-}" ;;
+          *) printf '{}\n' ;;
+        esac ;;
+      *) exit 0 ;;
+    esac
+    exit 0 ;;
+  *)
+    exit 0 ;;
+esac
