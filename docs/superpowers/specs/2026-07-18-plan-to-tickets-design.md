@@ -10,9 +10,10 @@ A skill that takes a superpowers spec + implementation plan (the `docs/superpowe
 `docs/superpowers/plans/...` pair produced by `brainstorming` and `writing-plans`) and turns it
 into a GitHub backlog: one **epic issue** for the top-level spec/plan, and a set of **ticket
 sub-issues** that independent workers (out of scope for this skill) can pick up. Each ticket is
-tagged with a **complexity** (small/medium), a **suggested model**, a **priority**, and its
-**dependencies** on other tickets, so workers — human or agent — know what to build, how hard it
-is, which model fits it, and what order to build it in.
+tagged with a **complexity** (small/medium), a **suggested model tier** (an abstract capability
+level, not a specific model), a **priority**, and its **dependencies** on other tickets, so
+workers — human or agent — know what to build, how hard it is, roughly what capability tier fits
+it, and what order to build it in.
 
 The skill never dispatches or executes tickets itself. It stops once the backlog exists on
 GitHub.
@@ -49,7 +50,7 @@ GitHub.
 skills/coding/plan-to-tickets/
 ├── SKILL.md                      # frontmatter + full procedure (decompose, preview, confirm, file)
 ├── references/
-│   └── model-allocation.md       # editable complexity × task-nature → model table
+│   └── model-tiers.md            # editable complexity × task-nature → abstract model-tier table
 ├── scripts/
 │   └── create-tickets.sh         # idempotent gh-CLI mechanics; consumes a JSON ticket-plan
 └── tests/
@@ -95,9 +96,11 @@ Classify each raw Task as **tiny**, **right-sized**, or **oversized**, then:
 4. **Classify task nature**: `text` (docs/copy/config-only files), `mechanical` (isolated
    code change, fully spec'd), or `judgment` (multi-file integration, design decisions not fully
    spelled out) — from file extensions and step content.
-5. **Assign model**: cross complexity × task-nature against `references/model-allocation.md`
-   (see below) to get the `model:<name>` label. The table is a starting default, meant to be
-   edited per project/provider roster.
+5. **Assign a model tier**: cross complexity × task-nature against `references/model-tiers.md`
+   (see below) to get the `model-tier:<tier>` label. The skill never names a specific model or
+   vendor — it emits an abstract capability tier; mapping a tier to an actual model is left
+   entirely to whatever consumes the ticket (e.g. the worker's own dispatch config), so the
+   ticket never goes stale as a team's model roster changes.
 6. **Compute dependencies**: ticket B depends on ticket A when B's steps read or modify a file
    that A creates, or the plan's own ordering makes B build on A's output. Tickets with no
    file/content overlap and no ordering requirement are independent (parallel-safe) — no
@@ -109,9 +112,9 @@ Classify each raw Task as **tiny**, **right-sized**, or **oversized**, then:
 ## Preview / confirmation gate
 
 Filing GitHub issues is a visible, shared-state action. Before creating anything, the skill
-renders a table — ticket title, complexity, task nature, model, priority, dependencies — for the
+renders a table — ticket title, complexity, task nature, model tier, priority, dependencies — for the
 whole backlog (epic + all tickets) and asks for explicit confirmation. Nothing is created until
-the user approves. If the user requests changes (re-bucket a ticket, change a model, change
+the user approves. If the user requests changes (re-bucket a ticket, change a model tier, change
 priority), apply them and re-render before proceeding.
 
 ## GitHub mechanics
@@ -119,7 +122,7 @@ priority), apply them and re-render before proceeding.
 **Epic issue:**
 - Title: the spec's feature name.
 - Body: goal + architecture summary (from the spec), links to the committed spec and plan files,
-  a compact reference table of tickets (title, complexity, model, priority).
+  a compact reference table of tickets (title, complexity, model tier, priority).
 - Hidden marker comment: `<!-- plan-to-tickets: docs/superpowers/plans/<plan-file> -->` — used to
   detect a prior run of this skill against the same plan (idempotent: update the existing epic
   and its tickets instead of creating duplicates).
@@ -130,14 +133,15 @@ priority), apply them and re-render before proceeding.
   steps/code for that ticket's scope (reconstructed from the merged/split plan Tasks), not just a
   pointer to the plan. Includes a `Depends on: #N, #M` line when dependencies exist, and a `Part
   of #<epic>` line.
-- Labels: `complexity:small` or `complexity:medium`, `priority:p1`/`p2`/`p3`, `model:<name>`.
+- Labels: `complexity:small` or `complexity:medium`, `priority:p1`/`p2`/`p3`,
+  `model-tier:<tier>` (one of the four tiers from `references/model-tiers.md`).
 - Parent/child relationship: GitHub's native sub-issues API
   (`gh api repos/{owner}/{repo}/issues/{epic}/sub_issues -f sub_issue_id=<ticket>`), giving a
   real progress bar and nested list on the epic. If the API is unsupported (older GHES, feature
   disabled), fall back to a checkbox list (`- [ ] #N <title>`) in the epic body instead — and
   report the fallback explicitly rather than silently proceeding as if native linking worked.
 - Any missing label (`complexity:small`, `complexity:medium`, `priority:p1`, `priority:p2`,
-  `priority:p3`, `model:<name>` per name in use, `epic`) is created on first use.
+  `priority:p3`, `model-tier:<tier>` per tier in use, `epic`) is created on first use.
 - Dependency ordering guarantees ticket A (a dependency) is always created before ticket B (its
   dependent), so `Depends on:` can always reference a real, already-created issue number.
 
@@ -145,20 +149,37 @@ priority), apply them and re-render before proceeding.
 marker comment) and updates it and its tickets in place rather than creating duplicates. This
 mirrors `github-lockdown`'s upsert-by-marker approach.
 
-## `references/model-allocation.md`
+## `references/model-tiers.md`
 
-An editable markdown table, complexity × task-nature → model, e.g.:
+An editable markdown table, complexity × task-nature → **abstract model tier**. No specific model
+or vendor name ever appears here or on a ticket — only a capability tier. Mapping a tier to an
+actual model is a decision for whatever dispatches the ticket, made separately from this skill.
 
-| complexity | task nature | model            |
-|-----------|-------------|-------------------|
-| small     | text        | haiku             |
-| small     | mechanical  | *(mid-tier default — your team's standard cheap/open-weight coding model)* |
-| medium    | mechanical  | *(mid-tier default)* |
-| medium    | judgment    | *(most capable — e.g. fable/opus)* |
+Four tiers cover the space, because text-only work, mechanical code, everyday integration, and
+judgment-heavy work each demand a genuinely different capability level:
 
-Ships with placeholder guidance rather than a single hard-coded vendor roster, since teams differ
-in which providers/models they actually route to; the skill reads whatever this file currently
-says.
+- **`lite`** — no code-reasoning required: docs, copy, config-only changes.
+- **`efficient`** — cheap but code-capable: small, fully-specified, mechanical code changes.
+- **`standard`** — everyday integration work: multi-file but well-understood, moderate judgment.
+- **`flagship`** — the hardest judgment calls: architecture-adjacent decisions, ambiguous specs,
+  cross-cutting design.
+
+Default cross table (all `small`/`medium` × `text`/`mechanical`/`judgment` combinations; the two
+marked *rare* are edge cases folded into the nearest neighboring tier rather than earning a
+distinct fifth tier):
+
+| complexity | task nature | model tier             |
+|-----------|-------------|--------------------------|
+| small     | text        | `lite`                   |
+| small     | mechanical  | `efficient`              |
+| small     | judgment    | `standard` *(rare)*      |
+| medium    | text        | `efficient` *(rare)*     |
+| medium    | mechanical  | `standard`               |
+| medium    | judgment    | `flagship`                |
+
+This table is editable — a project can rename tiers, collapse them, or add one back — but ships
+with this 4-tier default since it's the smallest set that distinguishes every case this skill's
+own complexity/nature axes actually produce.
 
 ## `scripts/create-tickets.sh`
 
@@ -199,7 +220,7 @@ Plain-bash runner (no `bats` dependency), matching `github-lockdown`'s harness. 
 
 After a successful (non-dry-run) filing, write
 `docs/superpowers/tickets/<plan-slug>.md` — epic issue number/link, each ticket's issue
-number/link plus its complexity/model/priority/dependencies — and commit it alongside the spec
+number/link plus its complexity/model-tier/priority/dependencies — and commit it alongside the spec
 and plan, for the same traceability those already get.
 
 ## Open decisions (proceeding with these unless vetoed)
@@ -208,5 +229,6 @@ and plan, for the same traceability those already get.
 - **Category:** `coding`.
 - **Test harness:** plain-bash `tests/run.sh`, fake-`gh` (no `bats`, no network) — matching
   `github-lockdown`.
-- **Model table defaults:** ships with placeholder tiers rather than hard-coded model IDs, since
-  those go stale and teams route to different providers.
+- **Model tier count:** 4 (`lite`, `efficient`, `standard`, `flagship`) — the smallest set that
+  distinguishes every complexity × task-nature combination this skill produces. No specific model
+  or vendor name ever appears on a ticket.
