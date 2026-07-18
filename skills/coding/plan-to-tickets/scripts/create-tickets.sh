@@ -32,6 +32,7 @@ main() {
   if [ "$PREFLIGHT_ONLY" = true ]; then exit 0; fi
   load_plan
   ensure_labels
+  file_epic
 }
 
 parse_args() {
@@ -132,6 +133,53 @@ ensure_labels() {
     fi
     gh label create "$name" --repo "$REPO" --color "$color" --force >/dev/null
   done < <(required_labels)
+}
+
+find_issue_by_marker() {
+  local marker="$1"
+  gh issue list --repo "$REPO" --state all --json number,id,body --limit 200 2>/dev/null \
+    | jq -r --arg m "$marker" '
+        map(select(.body // "" | contains($m))) as $found
+        | if ($found | length) == 0 then empty else "\($found[0].number)\t\($found[0].id)" end
+      '
+}
+
+record_slug() {
+  local slug="$1" num="$2" id="$3"
+  SLUG_NUMBERS="$(jq --arg s "$slug" --arg n "$num" '. + {($s): $n}' <<<"$SLUG_NUMBERS")"
+  SLUG_IDS="$(jq --arg s "$slug" --arg i "$id" '. + {($s): $i}' <<<"$SLUG_IDS")"
+}
+
+slug_number() { jq -r --arg s "$1" '.[$s] // empty' <<<"$SLUG_NUMBERS"; }
+
+file_epic() {
+  local plan_file title body marker found num id
+  plan_file="$(jq -r '.plan_file' <<<"$PLAN_JSON")"
+  marker="<!-- plan-to-tickets:epic:$plan_file -->"
+  title="$(jq -r '.epic.title' <<<"$PLAN_JSON")"
+  body="$(jq -r '.epic.body' <<<"$PLAN_JSON")"$'\n\n'"$marker"
+
+  found="$(find_issue_by_marker "$marker")"
+  if [ -n "$found" ]; then
+    num="$(cut -f1 <<<"$found")"; id="$(cut -f2 <<<"$found")"
+    if [ "$DRY_RUN" = true ]; then
+      echo "PLAN UPDATE epic issue #$num" >&2
+    else
+      gh issue edit "$num" --repo "$REPO" --title "$title" --body "$body" >/dev/null
+    fi
+  else
+    if [ "$DRY_RUN" = true ]; then
+      echo "PLAN CREATE epic issue \"$title\"" >&2
+      num=""; id=""
+    else
+      local url
+      url="$(gh issue create --repo "$REPO" --title "$title" --body "$body" --label epic)"
+      num="$(basename "$url")"
+      id="$(gh issue view "$num" --repo "$REPO" --json id -q .id)"
+    fi
+  fi
+  EPIC_NUMBER="$num"; EPIC_ID="$id"
+  record_slug "epic" "$EPIC_NUMBER" "$EPIC_ID"
 }
 
 main "$@"

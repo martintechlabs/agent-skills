@@ -188,5 +188,51 @@ test_ensure_labels_real_run() {
 test_ensure_labels_dry_run_only_missing
 test_ensure_labels_real_run
 
+test_epic_dry_run_create_when_absent() {
+  local d; d="$(mktemp -d)"
+  write_good_plan "$d/plan.json"
+  run_ct "$d/bin" FAKE_GH_ISSUES_JSON='[]' -- --input "$d/plan.json" --dry-run
+  assert_contains "$ERR" 'PLAN CREATE epic issue "Example Feature"' "plans creating the epic when none exists"
+  rm -rf "$d"
+}
+
+test_epic_dry_run_update_when_present() {
+  local d; d="$(mktemp -d)"
+  write_good_plan "$d/plan.json"
+  local issues='[{"number":100,"id":9100,"body":"old body\n\n<!-- plan-to-tickets:epic:docs/superpowers/plans/2026-07-18-example.md -->"}]'
+  run_ct "$d/bin" FAKE_GH_ISSUES_JSON="$issues" -- --input "$d/plan.json" --dry-run
+  assert_contains "$ERR" "PLAN UPDATE epic issue #100" "plans updating the existing epic by marker"
+  rm -rf "$d"
+}
+
+test_epic_real_create() {
+  local d; d="$(mktemp -d)"; local log="$d/gh.log"
+  write_good_plan "$d/plan.json"
+  run_ct "$d/bin" FAKE_GH_ISSUES_JSON='[]' FAKE_GH_LOG="$log" FAKE_GH_COUNTER_FILE="$d/counter" \
+    -- --input "$d/plan.json" --repo octo/repo
+  assert_contains "$(cat "$log")" "issue create --repo octo/repo --title Example Feature" "creates the epic issue"
+  assert_contains "$(cat "$log")" "--label epic" "labels the epic issue"
+  rm -rf "$d"
+}
+
+test_epic_real_update() {
+  local d; d="$(mktemp -d)"; local log="$d/gh.log"
+  write_good_plan "$d/plan.json"
+  local issues='[{"number":100,"id":9100,"body":"old body\n\n<!-- plan-to-tickets:epic:docs/superpowers/plans/2026-07-18-example.md -->"}]'
+  run_ct "$d/bin" FAKE_GH_ISSUES_JSON="$issues" FAKE_GH_LOG="$log" FAKE_GH_COUNTER_FILE="$d/counter" \
+    -- --input "$d/plan.json" --repo octo/repo
+  assert_contains "$(cat "$log")" "issue edit 100 --repo octo/repo --title Example Feature" "updates the existing epic by number, not a new create"
+  # Scoped to the epic's own title, not "issue create" anywhere: once later tasks wire
+  # file_tickets into main(), this same plan's (not-yet-seeded) tickets legitimately get
+  # created — only the epic itself must never be recreated.
+  assert_not_contains "$(cat "$log")" "issue create --repo octo/repo --title Example Feature" "never creates a duplicate epic"
+  rm -rf "$d"
+}
+
+test_epic_dry_run_create_when_absent
+test_epic_dry_run_update_when_present
+test_epic_real_create
+test_epic_real_update
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
