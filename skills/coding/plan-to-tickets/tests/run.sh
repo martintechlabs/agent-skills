@@ -55,5 +55,16 @@ test_help() {
 
 test_help
 
+test_parse_args() {
+  local d; d="$(mktemp -d)"
+  run_ct "$d/bin" -- --print-config --input plan.json --repo acme/widgets --dry-run
+  assert_contains "$OUT" "INPUT=plan.json"     "parses --input"
+  assert_contains "$OUT" "REPO=acme/widgets"   "parses --repo"
+  assert_contains "$OUT" "DRY_RUN=true"        "parses --dry-run"
+  rm -rf "$d"
+}
+
+test_parse_args
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

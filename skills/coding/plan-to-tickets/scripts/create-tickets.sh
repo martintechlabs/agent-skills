@@ -27,15 +27,28 @@ EOF
 
 main() {
   parse_args "$@"
+  if [ "$PRINT_CONFIG" = true ]; then print_config; exit 0; fi
 }
 
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
+      --input) [ $# -ge 2 ] || { echo "Missing value for --input" >&2; exit 2; }; INPUT="$2"; shift 2 ;;
+      --repo) [ $# -ge 2 ] || { echo "Missing value for --repo" >&2; exit 2; }; REPO="$2"; shift 2 ;;
+      --dry-run) DRY_RUN=true; shift ;;
+      --print-config) PRINT_CONFIG=true; shift ;;
       --help) usage; exit 0 ;;
-      *) shift ;;   # extended in later tasks
+      *) echo "Unknown flag: $1" >&2; usage >&2; exit 2 ;;
     esac
   done
+}
+
+print_config() {
+  cat <<EOF
+INPUT=$INPUT
+REPO=$REPO
+DRY_RUN=$DRY_RUN
+EOF
 }
 
 main "$@"
