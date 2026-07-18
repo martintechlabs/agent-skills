@@ -33,6 +33,7 @@ main() {
   load_plan
   ensure_labels
   file_epic
+  file_tickets
 }
 
 parse_args() {
@@ -180,6 +181,73 @@ file_epic() {
   fi
   EPIC_NUMBER="$num"; EPIC_ID="$id"
   record_slug "epic" "$EPIC_NUMBER" "$EPIC_ID"
+}
+
+# resolved_deps <ticket-index>: "#101, #102" (resolved issue numbers) or "" if none.
+resolved_deps() {
+  local i="$1" dep deps out first n
+  deps="$(jq -r ".tickets[$i].depends_on_slugs[]?" <<<"$PLAN_JSON")"
+  [ -n "$deps" ] || { printf ''; return 0; }
+  out=""
+  first=true
+  while IFS= read -r dep; do
+    [ -n "$dep" ] || continue
+    n="#$(slug_number "$dep")"
+    if [ "$first" = true ]; then out="$n"; first=false; else out="$out, $n"; fi
+  done <<<"$deps"
+  printf '%s' "$out"
+}
+
+dependency_line() {
+  local i="$1" deps
+  deps="$(resolved_deps "$i")"
+  [ -n "$deps" ] || { printf ''; return 0; }
+  printf 'Depends on: %s' "$deps"
+}
+
+file_tickets() {
+  local count i slug title body marker found num id deps_line
+  count="$(jq '.tickets | length' <<<"$PLAN_JSON")"
+  i=0
+  while [ "$i" -lt "$count" ]; do
+    slug="$(jq -r ".tickets[$i].slug" <<<"$PLAN_JSON")"
+    title="$(jq -r ".tickets[$i].title" <<<"$PLAN_JSON")"
+    body="$(jq -r ".tickets[$i].body" <<<"$PLAN_JSON")"
+    marker="<!-- plan-to-tickets:ticket:$(jq -r '.plan_file' <<<"$PLAN_JSON"):$slug -->"
+
+    deps_line="$(dependency_line "$i")"
+    [ -n "$deps_line" ] && body="$body"$'\n\n'"$deps_line"
+    body="$body"$'\n\n'"Part of #$EPIC_NUMBER"$'\n'"$marker"
+
+    found="$(find_issue_by_marker "$marker")"
+    if [ -n "$found" ]; then
+      num="$(cut -f1 <<<"$found")"; id="$(cut -f2 <<<"$found")"
+      if [ "$DRY_RUN" = true ]; then
+        echo "PLAN UPDATE ticket issue #$num ($slug)" >&2
+      else
+        gh issue edit "$num" --repo "$REPO" --title "$title" --body "$body" >/dev/null
+      fi
+    else
+      if [ "$DRY_RUN" = true ]; then
+        echo "PLAN CREATE ticket \"$title\" ($slug)" >&2
+        num=""; id=""
+      else
+        local args=(--repo "$REPO" --title "$title" --body "$body")
+        local label
+        while IFS= read -r label; do
+          [ -n "$label" ] || continue
+          args+=(--label "$label")
+        done < <(jq -r ".tickets[$i].labels[]" <<<"$PLAN_JSON")
+        local url
+        url="$(gh issue create "${args[@]}")"
+        num="$(basename "$url")"
+        id="$(gh issue view "$num" --repo "$REPO" --json id -q .id)"
+      fi
+    fi
+
+    record_slug "$slug" "$num" "$id"
+    i=$((i + 1))
+  done
 }
 
 main "$@"

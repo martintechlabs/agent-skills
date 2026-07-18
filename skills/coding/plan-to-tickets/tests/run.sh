@@ -234,5 +234,49 @@ test_epic_dry_run_update_when_present
 test_epic_real_create
 test_epic_real_update
 
+test_tickets_dry_run() {
+  local d; d="$(mktemp -d)"
+  write_good_plan "$d/plan.json"
+  run_ct "$d/bin" FAKE_GH_ISSUES_JSON='[]' -- --input "$d/plan.json" --dry-run
+  assert_contains "$ERR" 'PLAN CREATE ticket "Ticket A" (001-a)' "plans creating ticket A"
+  assert_contains "$ERR" 'PLAN CREATE ticket "Ticket B" (002-b)' "plans creating ticket B"
+  rm -rf "$d"
+}
+
+test_tickets_real_create_with_resolved_dependency() {
+  local d; d="$(mktemp -d)"; local log="$d/gh.log"
+  write_good_plan "$d/plan.json"
+  run_ct "$d/bin" FAKE_GH_ISSUES_JSON='[]' FAKE_GH_LOG="$log" FAKE_GH_COUNTER_FILE="$d/counter" \
+    -- --input "$d/plan.json" --repo octo/repo
+  local logtext; logtext="$(cat "$log")"
+  assert_contains "$logtext" "issue create --repo octo/repo --title Ticket A --body Body A" "creates ticket A"
+  assert_contains "$logtext" "--label complexity:small --label priority:p1 --label model-tier:efficient" "labels ticket A"
+  assert_contains "$logtext" "issue create --repo octo/repo --title Ticket B --body Body B" "creates ticket B"
+  assert_contains "$logtext" "Depends on: #101" "ticket B's body resolves its dependency to a real issue number"
+  assert_contains "$logtext" "Part of #100" "ticket B's body references the epic"
+  rm -rf "$d"
+}
+
+test_tickets_idempotent_update() {
+  local d; d="$(mktemp -d)"; local log="$d/gh.log"
+  write_good_plan "$d/plan.json"
+  local issues='[
+    {"number":100,"id":9100,"body":"<!-- plan-to-tickets:epic:docs/superpowers/plans/2026-07-18-example.md -->"},
+    {"number":101,"id":9101,"body":"Body A\n\nPart of #100\n<!-- plan-to-tickets:ticket:docs/superpowers/plans/2026-07-18-example.md:001-a -->"},
+    {"number":102,"id":9102,"body":"Body B\n\nDepends on: #101\n\nPart of #100\n<!-- plan-to-tickets:ticket:docs/superpowers/plans/2026-07-18-example.md:002-b -->"}
+  ]'
+  run_ct "$d/bin" FAKE_GH_ISSUES_JSON="$issues" FAKE_GH_LOG="$log" FAKE_GH_COUNTER_FILE="$d/counter" \
+    -- --input "$d/plan.json" --repo octo/repo
+  local logtext; logtext="$(cat "$log")"
+  assert_contains "$logtext" "issue edit 101" "updates ticket A by number"
+  assert_contains "$logtext" "issue edit 102" "updates ticket B by number"
+  assert_not_contains "$logtext" "issue create --repo octo/repo --title Ticket" "never duplicates a ticket"
+  rm -rf "$d"
+}
+
+test_tickets_dry_run
+test_tickets_real_create_with_resolved_dependency
+test_tickets_idempotent_update
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
