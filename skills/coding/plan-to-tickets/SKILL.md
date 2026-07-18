@@ -113,7 +113,34 @@ Write a JSON file (e.g. to a scratch/temp path) matching this schema:
 slug that appears *earlier* in the array. `repo` is optional (the script falls back to
 the current repo).
 
-### 4. Preview and confirm before filing anything
+### 4. Check for existing similar issues
+
+The script's own idempotency (step 6) only recognizes issues *this skill created itself*
+— it finds them by a hidden marker comment. It has no way to notice a manually-filed
+issue, an issue from an unrelated plan, or a leftover from an earlier, differently
+decomposed run of this same plan. Before previewing, check whether anything already
+covers a candidate ticket:
+
+```bash
+gh issue list --repo <owner/repo> --state open --json number,title,url --limit 200
+```
+
+For each candidate ticket in the JSON you just built, use judgment — not a fixed keyword
+rule — to compare its intent against these existing open issues. Look for issues that
+plausibly cover the *same concrete piece of work*, not just superficial word overlap.
+Flag anything you're not sure about rather than silently deciding either way, e.g.:
+
+> ⚠️ possible existing duplicate: candidate ticket "Add API endpoint for user records"
+> may overlap with existing #142 "Implement REST API for user records".
+
+Carry any flags into the preview in step 5 and have the human resolve each one
+explicitly: drop the candidate ticket and depend on/reference the existing issue
+instead, keep both because they're actually different pieces of work, or link them as
+related. **Never auto-skip or auto-merge a candidate based on this check alone** — it
+surfaces a decision for the human, it doesn't make one. This check only applies to
+tickets; the epic itself is already covered by its own marker-based lookup.
+
+### 5. Preview and confirm before filing anything
 
 Filing GitHub issues is a visible, shared-state action. Run the script in `--dry-run`
 mode against the ticket-plan JSON:
@@ -125,13 +152,13 @@ skills/coding/plan-to-tickets/scripts/create-tickets.sh --input <ticket-plan.jso
 This both validates the JSON (invalid JSON, missing fields, or an out-of-order
 dependency all fail here with a clear error) and confirms exactly what would be created
 or updated. Render a human-readable table from the ticket-plan JSON itself — ticket
-title, complexity, task nature, model tier, priority, dependencies — for the whole
-backlog (epic + every ticket), and ask the user to confirm. If they request changes
-(re-bucket a ticket, change a tier, change priority), edit the ticket-plan JSON and
-re-run `--dry-run` before proceeding. **Do not run the script for real until the user
-confirms.**
+title, complexity, task nature, model tier, priority, dependencies, and any possible-
+duplicate flag from step 4 — for the whole backlog (epic + every ticket), and ask the
+user to confirm. If they request changes (re-bucket a ticket, change a tier, change
+priority, drop a flagged duplicate), edit the ticket-plan JSON and re-run `--dry-run`
+before proceeding. **Do not run the script for real until the user confirms.**
 
-### 5. File the backlog
+### 6. File the backlog
 
 Once confirmed, run without `--dry-run`:
 

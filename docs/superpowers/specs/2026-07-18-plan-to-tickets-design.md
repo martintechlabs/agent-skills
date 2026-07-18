@@ -33,6 +33,10 @@ GitHub.
 - Not responsible for keeping GitHub issue state in sync with plan-file edits after creation
   (re-running the skill on an edited plan updates the epic/tickets it created, but does not
   diff/merge arbitrary manual edits made on GitHub in the meantime).
+- The existing-issue overlap check is a best-effort, judgment-based heuristic for the agent to
+  flag to the human — not a guaranteed or exhaustive duplicate-detection system. It has no access
+  to closed issues, other repos, or non-GitHub trackers, and a missed overlap is not a defect in
+  the sense the marker-based idempotency (which is exact) is.
 
 ## Inputs
 
@@ -109,13 +113,26 @@ Classify each raw Task as **tiny**, **right-sized**, or **oversized**, then:
    tickets, `p2` for normal work, `p3` for optional/polish/cleanup work called out as such in the
    plan or spec. This is a proposal, adjustable at the preview gate (step below).
 
+## Existing-issue overlap check
+
+The script's marker-based idempotency (see below) only recognizes issues this skill created
+itself; it has no way to notice a manually-filed issue, an issue from an unrelated plan, or a
+leftover from an earlier, differently decomposed run of the same plan. Before the preview gate,
+the agent lists the target repo's open issues (`gh issue list --state open`) and uses judgment —
+not a fixed keyword rule — to flag candidate tickets that plausibly cover the same concrete work
+as an existing issue. Flags are surfaced to the human at the preview gate; the agent never
+auto-skips or auto-merges a candidate on the strength of this check alone — only the human
+decides whether to drop the candidate, keep both, or link them as related. This check applies
+only to tickets; the epic is already covered by its own marker lookup.
+
 ## Preview / confirmation gate
 
 Filing GitHub issues is a visible, shared-state action. Before creating anything, the skill
-renders a table — ticket title, complexity, task nature, model tier, priority, dependencies — for the
-whole backlog (epic + all tickets) and asks for explicit confirmation. Nothing is created until
-the user approves. If the user requests changes (re-bucket a ticket, change a model tier, change
-priority), apply them and re-render before proceeding.
+renders a table — ticket title, complexity, task nature, model tier, priority, dependencies, and
+any possible-duplicate flag from the overlap check above — for the whole backlog (epic + all
+tickets) and asks for explicit confirmation. Nothing is created until the user approves. If the
+user requests changes (re-bucket a ticket, change a model tier, change priority, drop a flagged
+duplicate), apply them and re-render before proceeding.
 
 ## GitHub mechanics
 

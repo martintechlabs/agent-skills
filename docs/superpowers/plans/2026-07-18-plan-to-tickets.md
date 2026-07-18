@@ -1668,3 +1668,21 @@ convention (`number + 9000`) is used consistently by every test that asserts on
 every function and every test assertion in this plan was hand-verified against a working
 copy of the script and fake-`gh` before being written into these tasks (not just
 transcribed from a mental model).
+
+## Addendum (added during PR review, before merge)
+
+A question surfaced a gap: the marker-based idempotency in Tasks 6/7 only recognizes issues
+this skill created itself — it has no way to notice a manually-filed issue, an issue from an
+unrelated plan, or a leftover from an earlier, differently decomposed run of the same plan.
+`SKILL.md` (Task 11) gained a new procedure step — "Check for existing similar issues" —
+inserted between "Build the ticket-plan JSON" and "Preview and confirm before filing anything",
+renumbering the remaining steps. It has the agent list the target repo's open issues and use
+judgment (not a fixed keyword rule) to flag candidate tickets that plausibly cover the same
+concrete work as an existing issue, carrying any flags into the preview gate for the human to
+resolve explicitly (drop the candidate, keep both, or link as related) — never auto-skipped or
+auto-merged. This is agent-side reasoning, like the decomposition algorithm itself; no script or
+test changes were needed. Task 11's embedded `SKILL.md` listing above predates this addition —
+`skills/coding/plan-to-tickets/SKILL.md` and
+`docs/superpowers/specs/2026-07-18-plan-to-tickets-design.md` are the current source of truth.
+Also fixed during this same review pass: `run_ct`'s missing cwd isolation (see the two commits
+titled "isolate test invocations to their own temp dir" / "fix run_ct to isolate cwd").
