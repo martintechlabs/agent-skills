@@ -66,5 +66,23 @@ test_parse_args() {
 
 test_parse_args
 
+test_preflight_auth_ok() {
+  local d; d="$(mktemp -d)"
+  run_ct "$d/bin" -- --preflight-only
+  assert_eq "$RC" "0" "preflight passes when authenticated"
+  rm -rf "$d"
+}
+
+test_preflight_auth_fail() {
+  local d; d="$(mktemp -d)"
+  run_ct "$d/bin" FAKE_GH_AUTH_FAIL=true -- --preflight-only
+  assert_eq "$RC" "1" "preflight fails when not authenticated"
+  assert_contains "$ERR" "Not authenticated" "clear error when not authenticated"
+  rm -rf "$d"
+}
+
+test_preflight_auth_ok
+test_preflight_auth_fail
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

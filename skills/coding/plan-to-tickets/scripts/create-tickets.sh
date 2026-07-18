@@ -28,6 +28,8 @@ EOF
 main() {
   parse_args "$@"
   if [ "$PRINT_CONFIG" = true ]; then print_config; exit 0; fi
+  preflight
+  if [ "$PREFLIGHT_ONLY" = true ]; then exit 0; fi
 }
 
 parse_args() {
@@ -37,6 +39,7 @@ parse_args() {
       --repo) [ $# -ge 2 ] || { echo "Missing value for --repo" >&2; exit 2; }; REPO="$2"; shift 2 ;;
       --dry-run) DRY_RUN=true; shift ;;
       --print-config) PRINT_CONFIG=true; shift ;;
+      --preflight-only) PREFLIGHT_ONLY=true; shift ;;
       --help) usage; exit 0 ;;
       *) echo "Unknown flag: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -49,6 +52,15 @@ INPUT=$INPUT
 REPO=$REPO
 DRY_RUN=$DRY_RUN
 EOF
+}
+
+preflight() {
+  command -v jq >/dev/null 2>&1 || { echo "jq is required. Install jq and retry." >&2; exit 1; }
+  gh auth status >/dev/null 2>&1 || { echo "Not authenticated. Run: gh auth login" >&2; exit 1; }
+  if [ "$PREFLIGHT_ONLY" = true ]; then return 0; fi
+  [ -n "$INPUT" ] || { echo "Missing --input <ticket-plan.json>." >&2; exit 2; }
+  [ -f "$INPUT" ] || { echo "No such file: $INPUT" >&2; exit 1; }
+  jq -e . "$INPUT" >/dev/null 2>&1 || { echo "$INPUT is not valid JSON." >&2; exit 1; }
 }
 
 main "$@"
