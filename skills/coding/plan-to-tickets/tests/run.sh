@@ -118,6 +118,8 @@ write_good_plan() {
   cat > "$1" <<'EOF'
 {
   "repo": "octo/repo",
+  "source_branch": "feature/metadata:proof#1",
+  "spec_file": "docs/superpowers/specs/2026-07-18-example-design.md",
   "plan_file": "docs/superpowers/plans/2026-07-18-example.md",
   "epic": {"title": "Example Feature", "body": "Epic body text."},
   "tickets": [
@@ -134,6 +136,8 @@ write_bad_dependency_plan() {
   cat > "$1" <<'EOF'
 {
   "repo": "octo/repo",
+  "source_branch": "feature/metadata:proof#1",
+  "spec_file": "docs/superpowers/specs/2026-07-18-example-design.md",
   "plan_file": "docs/superpowers/plans/2026-07-18-example.md",
   "epic": {"title": "Example Feature", "body": "Epic body text."},
   "tickets": [
@@ -162,11 +166,45 @@ test_dependency_validation_passes() {
   rm -rf "$d"
 }
 
+test_required_metadata_validation() {
+  local field variant filter d log logtext
+  for field in source_branch spec_file plan_file; do
+    for variant in missing null non_string empty; do
+      d="$(mktemp -d)"
+      log="$d/gh.log"
+      write_good_plan "$d/base.json"
+      case "$variant" in
+        missing)    filter='del(.[$field])' ;;
+        null)       filter='.[$field] = null' ;;
+        non_string) filter='.[$field] = 42' ;;
+        empty)      filter='.[$field] = ""' ;;
+      esac
+      jq --arg field "$field" "$filter" "$d/base.json" > "$d/plan.json"
+
+      run_ct "$d/bin" FAKE_GH_LOG="$log" FAKE_GH_ISSUES_JSON='[]' \
+        FAKE_GH_COUNTER_FILE="$d/counter" \
+        -- --input "$d/plan.json" --repo octo/repo
+
+      assert_eq "$RC" "1" "$field rejects $variant values"
+      assert_contains "$ERR" \
+        "Invalid ticket-plan JSON: .$field must be a non-empty string." \
+        "$field reports a clear $variant error"
+      logtext="$(cat "$log")"
+      assert_not_contains "$logtext" "label create" "$field $variant failure creates no labels"
+      assert_not_contains "$logtext" "issue create" "$field $variant failure creates no issues"
+      assert_not_contains "$logtext" "issue edit" "$field $variant failure edits no issues"
+      assert_not_contains "$logtext" "api " "$field $variant failure links no sub-issues"
+      rm -rf "$d"
+    done
+  done
+}
+
 test_missing_input_value_flag
 test_input_not_found
 test_input_invalid_json
 test_dependency_validation_fails
 test_dependency_validation_passes
+test_required_metadata_validation
 
 test_ensure_labels_dry_run_only_missing() {
   local d; d="$(mktemp -d)"
@@ -325,6 +363,8 @@ test_sub_issue_fallback_no_duplicate_heading() {
   cat > "$d/plan.json" <<'EOF'
 {
   "repo": "octo/repo",
+  "source_branch": "feature/metadata:proof#1",
+  "spec_file": "docs/superpowers/specs/2026-07-18-example-design.md",
   "plan_file": "docs/superpowers/plans/2026-07-18-example.md",
   "epic": {"title": "Example Feature", "body": "Epic body text."},
   "tickets": [

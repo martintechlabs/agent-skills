@@ -70,6 +70,7 @@ preflight() {
 
 load_plan() {
   PLAN_JSON="$(cat "$INPUT")"
+  validate_metadata
   if [ -z "$REPO" ]; then
     REPO="$(jq -r '.repo // empty' <<<"$PLAN_JSON")"
   fi
@@ -78,6 +79,18 @@ load_plan() {
   fi
   [ -n "$REPO" ] || { echo "Could not determine target repo. Pass --repo or set .repo in the ticket-plan JSON." >&2; exit 1; }
   validate_dependency_order
+}
+
+validate_metadata() {
+  local field
+  for field in source_branch spec_file plan_file; do
+    if ! jq -e --arg field "$field" \
+      '.[$field] | if type == "string" then length > 0 else false end' \
+      <<<"$PLAN_JSON" >/dev/null; then
+      echo "Invalid ticket-plan JSON: .$field must be a non-empty string." >&2
+      exit 1
+    fi
+  done
 }
 
 validate_dependency_order() {
