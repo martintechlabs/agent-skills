@@ -70,6 +70,7 @@ preflight() {
 
 load_plan() {
   PLAN_JSON="$(cat "$INPUT")"
+  validate_metadata
   if [ -z "$REPO" ]; then
     REPO="$(jq -r '.repo // empty' <<<"$PLAN_JSON")"
   fi
@@ -78,6 +79,18 @@ load_plan() {
   fi
   [ -n "$REPO" ] || { echo "Could not determine target repo. Pass --repo or set .repo in the ticket-plan JSON." >&2; exit 1; }
   validate_dependency_order
+}
+
+validate_metadata() {
+  local field
+  for field in source_branch spec_file plan_file; do
+    if ! jq -e --arg field "$field" \
+      '.[$field] | if type == "string" then length > 0 else false end' \
+      <<<"$PLAN_JSON" >/dev/null; then
+      echo "Invalid ticket-plan JSON: .$field must be a non-empty string." >&2
+      exit 1
+    fi
+  done
 }
 
 validate_dependency_order() {
@@ -276,14 +289,21 @@ append_checkbox_fallback() {
 }
 
 write_manifest() {
-  local plan_file slug outfile root count i num complexity tier priority deps
-  plan_file="$(jq -r '.plan_file' <<<"$PLAN_JSON")"
-  slug="$(basename "$plan_file" .md)"
+  local plan_file source_branch spec_file slug outfile root count i num complexity tier priority deps
+  plan_file="$(jq -c '.plan_file' <<<"$PLAN_JSON")"
+  source_branch="$(jq -c '.source_branch' <<<"$PLAN_JSON")"
+  spec_file="$(jq -c '.spec_file' <<<"$PLAN_JSON")"
+  slug="$(basename "$(jq -r '.plan_file' <<<"$PLAN_JSON")" .md)"
   root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   outfile="$root/docs/superpowers/tickets/$slug.md"
   mkdir -p "$(dirname "$outfile")"
   {
-    echo "# Tickets filed for $plan_file"
+    echo "---"
+    echo "source_branch: $source_branch"
+    echo "spec_file: $spec_file"
+    echo "plan_file: $plan_file"
+    echo "---"
+    echo "# Tickets filed for $(jq -r '.plan_file' <<<"$PLAN_JSON")"
     echo
     echo "Epic: #$EPIC_NUMBER"
     echo

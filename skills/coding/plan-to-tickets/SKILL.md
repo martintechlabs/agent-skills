@@ -10,7 +10,7 @@ description: >-
   once the backlog exists on GitHub.
 metadata:
   author: stephen-martin
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # Turn a plan into a GitHub ticket backlog
@@ -41,10 +41,19 @@ without one.
 
 ## Procedure
 
-### 1. Read the spec and plan
+### 1. Read the spec and plan, and record their provenance
 
-Read both files in full. Extract every `### Task N` block from the plan (its `Files:`
-list and every step) in order.
+Read both files in full. Record their exact repository-relative paths. Extract every
+`### Task N` block from the plan (its `Files:` list and every step) in order.
+
+Resolve the source branch explicitly:
+
+```bash
+git branch --show-current
+```
+
+Use the command's output as `source_branch`. If it is empty because the checkout is at
+detached HEAD, ask the user for the source branch — never emit `HEAD` or guess a branch.
 
 ### 2. Decompose plan Tasks into tickets
 
@@ -95,6 +104,8 @@ Write a JSON file (e.g. to a scratch/temp path) matching this schema:
 ```json
 {
   "repo": "owner/repo",
+  "source_branch": "feature/example",
+  "spec_file": "docs/superpowers/specs/YYYY-MM-DD-<feature>-design.md",
   "plan_file": "docs/superpowers/plans/YYYY-MM-DD-<feature>.md",
   "epic": { "title": "string", "body": "string (goal/architecture summary, links to the committed spec+plan files, a compact table of tickets: title/complexity/model tier/priority)" },
   "tickets": [
@@ -109,9 +120,11 @@ Write a JSON file (e.g. to a scratch/temp path) matching this schema:
 }
 ```
 
-`tickets` **must** be in dependency order: every `depends_on_slugs` entry must name a
-slug that appears *earlier* in the array. `repo` is optional (the script falls back to
-the current repo).
+`source_branch`, `spec_file`, and `plan_file` are required non-empty strings. Copy the
+branch and exact repository-relative paths recorded in step 1; the script never infers
+or rewrites them. `tickets` **must** be in dependency order: every
+`depends_on_slugs` entry must name a slug that appears *earlier* in the array. `repo`
+is optional (the script falls back to the current repo).
 
 ### 4. Check for existing similar issues
 
@@ -167,9 +180,11 @@ skills/coding/plan-to-tickets/scripts/create-tickets.sh --input <ticket-plan.jso
 ```
 
 Report the epic issue link, every ticket's issue link, and the path to the manifest the
-script writes (`docs/superpowers/tickets/<plan-slug>.md`). Re-running this skill against
-the same plan later (e.g. after editing it) updates the same epic/tickets in place —
-it will not create duplicates.
+script writes (`docs/superpowers/tickets/<plan-slug>.md`). The manifest begins with
+YAML front matter containing the exact `source_branch`, `spec_file`, and `plan_file`
+values from the ticket-plan JSON. Re-running this skill against the same plan later
+(e.g. after editing it) updates the same epic/tickets in place — it will not create
+duplicates.
 
 ## Flags (`scripts/create-tickets.sh`)
 

@@ -118,6 +118,8 @@ write_good_plan() {
   cat > "$1" <<'EOF'
 {
   "repo": "octo/repo",
+  "source_branch": "feature/metadata:proof#1",
+  "spec_file": "docs/superpowers/specs/2026-07-18-example-design.md",
   "plan_file": "docs/superpowers/plans/2026-07-18-example.md",
   "epic": {"title": "Example Feature", "body": "Epic body text."},
   "tickets": [
@@ -134,6 +136,8 @@ write_bad_dependency_plan() {
   cat > "$1" <<'EOF'
 {
   "repo": "octo/repo",
+  "source_branch": "feature/metadata:proof#1",
+  "spec_file": "docs/superpowers/specs/2026-07-18-example-design.md",
   "plan_file": "docs/superpowers/plans/2026-07-18-example.md",
   "epic": {"title": "Example Feature", "body": "Epic body text."},
   "tickets": [
@@ -162,11 +166,45 @@ test_dependency_validation_passes() {
   rm -rf "$d"
 }
 
+test_required_metadata_validation() {
+  local field variant filter d log logtext
+  for field in source_branch spec_file plan_file; do
+    for variant in missing null non_string empty; do
+      d="$(mktemp -d)"
+      log="$d/gh.log"
+      write_good_plan "$d/base.json"
+      case "$variant" in
+        missing)    filter='del(.[$field])' ;;
+        null)       filter='.[$field] = null' ;;
+        non_string) filter='.[$field] = 42' ;;
+        empty)      filter='.[$field] = ""' ;;
+      esac
+      jq --arg field "$field" "$filter" "$d/base.json" > "$d/plan.json"
+
+      run_ct "$d/bin" FAKE_GH_LOG="$log" FAKE_GH_ISSUES_JSON='[]' \
+        FAKE_GH_COUNTER_FILE="$d/counter" \
+        -- --input "$d/plan.json" --repo octo/repo
+
+      assert_eq "$RC" "1" "$field rejects $variant values"
+      assert_contains "$ERR" \
+        "Invalid ticket-plan JSON: .$field must be a non-empty string." \
+        "$field reports a clear $variant error"
+      logtext="$(cat "$log")"
+      assert_not_contains "$logtext" "label create" "$field $variant failure creates no labels"
+      assert_not_contains "$logtext" "issue create" "$field $variant failure creates no issues"
+      assert_not_contains "$logtext" "issue edit" "$field $variant failure edits no issues"
+      assert_not_contains "$logtext" "api " "$field $variant failure links no sub-issues"
+      rm -rf "$d"
+    done
+  done
+}
+
 test_missing_input_value_flag
 test_input_not_found
 test_input_invalid_json
 test_dependency_validation_fails
 test_dependency_validation_passes
+test_required_metadata_validation
 
 test_ensure_labels_dry_run_only_missing() {
   local d; d="$(mktemp -d)"
@@ -325,6 +363,8 @@ test_sub_issue_fallback_no_duplicate_heading() {
   cat > "$d/plan.json" <<'EOF'
 {
   "repo": "octo/repo",
+  "source_branch": "feature/metadata:proof#1",
+  "spec_file": "docs/superpowers/specs/2026-07-18-example-design.md",
   "plan_file": "docs/superpowers/plans/2026-07-18-example.md",
   "epic": {"title": "Example Feature", "body": "Epic body text."},
   "tickets": [
@@ -360,6 +400,14 @@ test_write_manifest() {
   local manifest="$d/docs/superpowers/tickets/2026-07-18-example.md"
   [ -f "$manifest" ] && ok "writes the manifest file" || bad "writes the manifest file" "not found: $manifest"
   local content; content="$(cat "$manifest" 2>/dev/null || true)"
+  assert_eq "$(sed -n '1p' "$manifest")" "---" "manifest starts YAML front matter"
+  assert_eq "$(sed -n '5p' "$manifest")" "---" "manifest closes YAML front matter"
+  assert_eq "$(sed -n '2s/^source_branch: //p' "$manifest" | jq -r .)" \
+    "feature/metadata:proof#1" "manifest records the exact source branch"
+  assert_eq "$(sed -n '3s/^spec_file: //p' "$manifest" | jq -r .)" \
+    "docs/superpowers/specs/2026-07-18-example-design.md" "manifest records the exact spec file"
+  assert_eq "$(sed -n '4s/^plan_file: //p' "$manifest" | jq -r .)" \
+    "docs/superpowers/plans/2026-07-18-example.md" "manifest records the exact plan file"
   assert_contains "$content" "Epic: #100" "manifest records the epic number"
   assert_contains "$content" "| #101 | complexity:small | model-tier:efficient | priority:p1 |" "manifest records ticket A's metadata"
   assert_contains "$content" "| #102 | complexity:medium | model-tier:standard | priority:p1 | #101 |" "manifest resolves ticket B's dependency to a real number"
@@ -381,6 +429,18 @@ test_manifest_skipped_on_dry_run() {
 
 test_write_manifest
 test_manifest_skipped_on_dry_run
+
+test_skill_documents_metadata_contract() {
+  local skill; skill="$(cat "$HERE/../SKILL.md")"
+  assert_contains "$skill" 'version: "0.2.0"' "skill version reflects the breaking schema change"
+  assert_contains "$skill" 'git branch --show-current' "skill resolves the source branch explicitly"
+  assert_contains "$skill" 'detached HEAD' "skill documents detached-HEAD handling"
+  assert_contains "$skill" '"source_branch"' "skill schema requires source_branch"
+  assert_contains "$skill" '"spec_file"' "skill schema requires spec_file"
+  assert_contains "$skill" 'YAML front matter' "skill documents manifest metadata output"
+}
+
+test_skill_documents_metadata_contract
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
