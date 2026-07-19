@@ -400,6 +400,14 @@ test_write_manifest() {
   local manifest="$d/docs/superpowers/tickets/2026-07-18-example.md"
   [ -f "$manifest" ] && ok "writes the manifest file" || bad "writes the manifest file" "not found: $manifest"
   local content; content="$(cat "$manifest" 2>/dev/null || true)"
+  assert_eq "$(sed -n '1p' "$manifest")" "---" "manifest starts YAML front matter"
+  assert_eq "$(sed -n '5p' "$manifest")" "---" "manifest closes YAML front matter"
+  assert_eq "$(sed -n '2s/^source_branch: //p' "$manifest" | jq -r .)" \
+    "feature/metadata:proof#1" "manifest records the exact source branch"
+  assert_eq "$(sed -n '3s/^spec_file: //p' "$manifest" | jq -r .)" \
+    "docs/superpowers/specs/2026-07-18-example-design.md" "manifest records the exact spec file"
+  assert_eq "$(sed -n '4s/^plan_file: //p' "$manifest" | jq -r .)" \
+    "docs/superpowers/plans/2026-07-18-example.md" "manifest records the exact plan file"
   assert_contains "$content" "Epic: #100" "manifest records the epic number"
   assert_contains "$content" "| #101 | complexity:small | model-tier:efficient | priority:p1 |" "manifest records ticket A's metadata"
   assert_contains "$content" "| #102 | complexity:medium | model-tier:standard | priority:p1 | #101 |" "manifest resolves ticket B's dependency to a real number"
