@@ -1,0 +1,324 @@
+---
+name: execute-tickets
+description: >-
+  Pick up a plan-to-tickets backlog on GitHub, drive each ready ticket through a
+  coding agent + codex code review + CI verification loop, then merge the PR back
+  to the plan's epic branch. Runs as up to 4 concurrent worker processes per
+  repo; each worker claims tickets via a per-slot lock label, sub-branches from
+  the epic branch, invokes a user-supplied `--agent-cmd`, runs `codex exec`
+  against the PR with a vendored review schema + prompt, blocks merge on codex
+  priority 0-1 findings and red CI checks, and feeds blocking findings back to
+  the agent for up to N iterations. Use when the user has a filed plan-to-tickets
+  backlog and wants tickets executed end-to-end (agent -> review -> merge), when
+  they ask to run/dispatch/execute a ticket backlog, or when they want the codex
+  review loop wired to a ticket queue. Never coordinates across plans or repos,
+  never merges the epic itself, and hard-caps at 4 workers per repo.
+metadata:
+  author: stephen-martin
+  version: "0.2.0"
+---
+
+# Execute a plan-to-tickets backlog end-to-end
+
+Pick up the epic + ticket sub-issues filed by `plan-to-tickets` and drive each
+ready ticket all the way to a merged PR on the plan's epic branch. The bundled
+`scripts/execute-tickets.sh` does the mechanical work: claim a ticket, sub-branch
+from the epic branch, invoke a user-supplied coding agent, open a PR, wait for
+CI, run codex code review, feed blocking findings back to the agent, and merge
+once the review is clean and CI is green.
+
+Designed to run as up to **4 concurrent worker processes per repo**, each with
+a distinct `--worker` slot ID (`1..4`) that becomes its lock label (`lock:N`).
+The 4-slot cap is a hard limit — beyond that the label mutex stops being a
+useful mental model.
+
+This skill never merges the epic PR itself, never retries a `needs-human`
+ticket automatically, and never coordinates across plans or repos.
+
+## When this applies
+
+- `plan-to-tickets` has already filed an epic + tickets on GitHub for a plan,
+  and the manifest `docs/superpowers/tickets/<plan-slug>.md` is committed to the
+  repo (its YAML front matter carries `source_branch`, `spec_file`, `plan_file`).
+- The target is a **GitHub** repo, `gh`, `git`, `jq`, and `codex` are on PATH,
+  and `gh auth status` is green.
+- Branch protection on the epic branch permits `gh pr merge` (or auto-merge is
+  enabled). If the epic branch is protected against direct merges by the user
+  running the executor, ticket merges will fail and land on `needs-human`.
+- The user has a coding agent CLI they want invoked per ticket. This skill does
+  not choose or ship an agent — the caller supplies `--agent-cmd`.
+
+If no plan slug is named, use the most recently modified manifest under
+`docs/superpowers/tickets/` and confirm it with the user before proceeding. If
+no manifest exists, stop and point at `plan-to-tickets` — do not try to
+reconstruct backlog metadata from issue bodies.
+
+## Branch topology
+
+`plan-to-tickets` puts the spec + plan on `source_branch` (the epic branch).
+Each ticket sub-branches from `origin/<source_branch>` and its PR targets the
+epic branch. Nothing merges to `main` until the epic itself is merged by a
+human — the executor stops at the epic boundary.
+
+```
+main
+ └─ source_branch (epic)  <- holds spec + plan, target for ticket PRs
+     ├─ ticket/142-add-parser        (PR merged back to epic)
+     ├─ ticket/143-wire-cli
+     └─ ticket/144-doc-updates
+```
+
+Because tickets merge into `source_branch` as they finish, workers re-fetch
+`origin/<source_branch>` at worktree creation time so later tickets start from
+sibling tickets' merged code. If two ticket branches touch the same lines,
+`gh pr merge` will refuse — that ticket lands on `needs-human` with the merge
+error, which is a real signal that the plan's decomposition was too coarse.
+
+## The per-ticket loop
+
+For each ticket picked up:
+
+1. **Claim** — add `lock:N` label, verify no other `lock:*` label is present.
+   If a race is detected, release and pick another.
+2. **Worktree** — `git worktree add --detach <path> origin/<source_branch>`,
+   then `git switch -c ticket/<n>-<slug>`. Worktree path includes the worker ID
+   so 4 workers never collide on disk.
+3. **Agent, iteration 1** — invoke `--agent-cmd` with all substitution tokens.
+   Agent commits on the ticket branch. If it forgot to push, executor pushes.
+4. **Open PR** — `gh pr create --base <source_branch> --head <branch> \
+   --body "Closes #<n>"`.
+5. **Wait for CI** — `gh pr checks --watch`, bounded by `--ci-timeout` per
+   iteration (default 1800s).
+6. **Codex review** — compose a prompt (vendored `references/codex-review-prompt.md`
+   + ticket body + spec path + plan path + PR diff), run `codex exec
+   --output-schema references/codex-review-schema.json --sandbox read-only -o
+   review.json - < prompt.md`.
+7. **Decide.** Blocking = any of:
+   - `overall_correctness == "patch is incorrect"`
+   - Any finding with `priority <= --block-priority-max` **and**
+     `confidence_score >= --min-confidence`
+   - Any CI check whose conclusion is not `SUCCESS`/`NEUTRAL`/`SKIPPED`
+     (checks still in `PENDING`/`IN_PROGRESS`/`QUEUED` are treated as
+     not-yet-final and won't block on their own)
+8. **Green path** — post P2/P3 (and low-confidence) findings as informational
+   PR comments, then `gh pr merge <method> --delete-branch --auto` (falling
+   back to synchronous merge if auto-merge isn't enabled). Release the lock.
+9. **Red path** — assemble a feedback bundle (blocking findings + failing check
+   names + verdict explanation) into a file, re-invoke `--agent-cmd` with
+   `{review_feedback}` pointing at that file and `{iteration}` incremented.
+   Agent pushes new commits. Loop back to step 5.
+10. **Iteration cap** — if the loop hits `--max-iterations` (default 5), remove
+    the lock, add `needs-human`, comment the last feedback bundle on the
+    issue, move on to the next ticket.
+
+## Severity model
+
+Codex's structured review output uses an integer `priority` field, **0..3, lower
+is more severe**:
+
+| priority | meaning | blocks merge? |
+|:--:|--|:--:|
+| 0 | severe (correctness, security, data loss) | yes |
+| 1 | major (design, error handling, performance) | yes |
+| 2 | minor (readability, non-critical refactors) | no — posted as PR comment |
+| 3 | nit (naming, formatting, wording) | no — posted as PR comment |
+
+Findings below `--min-confidence` (default `0.5`) are treated as informational
+regardless of priority — codex flagging itself as unsure is a signal not to
+loop the agent on it. `overall_correctness == "patch is incorrect"` always
+blocks even if no individual finding does; the reviewer sometimes emits a
+verdict without an accompanying finding at the required severity.
+
+The vendored review schema and prompt live at:
+
+- `references/codex-review-schema.json` — the structured-output schema.
+- `references/codex-review-prompt.md` — the reviewer system prompt, including
+  the priority scale defined above.
+
+Override both with `--review-schema <path>` and `--review-prompt <path>` when a
+repo needs different standards (stricter thresholds, project-specific rules,
+etc.). Do not edit the vendored files in place unless you're changing the
+default for every project using this skill.
+
+## Reviewer command
+
+Default (`--reviewer-cmd` unset):
+
+```
+codex exec --model "${CODEX_MODEL:-gpt-5-codex}" \
+  --output-schema {review_schema} \
+  -o {review_output} \
+  --sandbox read-only \
+  - < {review_prompt_composed}
+```
+
+`{review_prompt_composed}` is the vendored prompt with the ticket body, spec
+path, plan path, and PR diff appended — the executor builds it fresh per
+iteration. `--sandbox read-only` is non-negotiable: the reviewer must not
+write to the tree. Override the reviewer command with `--reviewer-cmd` only
+when you need a different codex model, an org-hosted proxy, or a bespoke
+reviewer entirely. Available tokens: `{review_schema}` `{review_prompt_composed}`
+`{review_output}` `{pr_number}` `{branch}` `{worktree}` `{head_sha}`.
+
+## Agent command
+
+`--agent-cmd` is a shell command run from inside the ticket worktree. Tokens
+(each shell-quoted independently, safe to interpolate anywhere):
+
+| token | value |
+|--|--|
+| `{issue_number}` | e.g. `142` |
+| `{issue_title}` | ticket title |
+| `{issue_body}` | path to a temp file with the ticket body |
+| `{spec_file}` | repo-relative path to spec |
+| `{plan_file}` | repo-relative path to plan |
+| `{model_tier}` | `lite` \| `efficient` \| `standard` \| `flagship` |
+| `{complexity}` | `small` \| `medium` |
+| `{priority}` | `p1` \| `p2` \| `p3` |
+| `{worktree}` | absolute path to the ticket worktree |
+| `{branch}` | new branch name (`ticket/<n>-<slug>`) |
+| `{review_feedback}` | path to feedback bundle on retries; empty string on iteration 1 |
+| `{iteration}` | `1` on first pass, `2..N` on review retries |
+
+Rules the agent must follow:
+
+- Commit on `{branch}`. Push is optional (executor pushes if missing).
+- **Never open a PR.** The executor opens it after verifying the first push.
+- On iterations `>=2`, read `{review_feedback}` and address only the blocking
+  findings + failing checks listed there. Do not re-open unrelated design
+  questions mid-review-loop.
+
+Ticket-level model routing (tier → concrete model) is the agent command's
+job, not the executor's — the `{model_tier}` token carries the tier through,
+and `--agent-cmd` decides what to do with it. See `plan-to-tickets`'s
+`references/model-tiers.md` for the tier vocabulary.
+
+## Procedure
+
+### 1. Confirm the backlog is ready to execute
+
+Read the manifest for the target plan. Confirm the epic and every ticket
+sub-issue still exist on GitHub (re-running `plan-to-tickets` in `--dry-run`
+on the same plan is the cheapest way — it lists what it would create/update
+without touching anything). Do not proceed if the manifest references a plan
+or spec file that is not committed on `source_branch`: the agent and the
+reviewer both need to read them.
+
+### 2. Choose the agent invocation
+
+Compose one shell command that:
+
+- Runs from inside the ticket worktree (executor `cd`s there before invoking).
+- Reads the ticket body from `{issue_body}` (a path — not inline text, because
+  ticket bodies contain characters that break shell escaping).
+- Consumes `{spec_file}` and `{plan_file}` as repo-relative paths.
+- Uses `{model_tier}` to pick a specific model.
+- Handles the `{review_feedback}` retry case: when `{iteration}` is `>=2` and
+  `{review_feedback}` is non-empty, read that file and fix only what it lists.
+- Commits its changes onto `{branch}`. Does not open a PR.
+
+### 3. Dry-run one worker first
+
+```bash
+skills/coding/execute-tickets/scripts/execute-tickets.sh \
+  --worker 1 --plan <plan-slug> \
+  --agent-cmd '<your command>' \
+  --dry-run --once
+```
+
+Prints the ticket the executor would pick, worktree path, branch name, and
+the fully-rendered agent + reviewer commands. Nothing is claimed, no worktree
+is created, no agent or codex call is made. Fix wrong tokens or manifests
+before going live.
+
+### 4. Launch up to 4 workers
+
+```bash
+for W in 1 2 3 4; do
+  skills/coding/execute-tickets/scripts/execute-tickets.sh \
+    --worker "$W" --plan <plan-slug> \
+    --agent-cmd '<your command>' \
+    > "logs/executor-w${W}.log" 2>&1 &
+done
+wait
+```
+
+Each worker loops: pick highest-priority ready ticket → claim → run the per-ticket
+loop above → release the lock (on merge) or set `needs-human` (on failure). If
+no ticket is ready (all locked, all blocked by open dependencies, or backlog
+empty), the worker sleeps `--poll` seconds (default 30) and tries again.
+`--once` runs a single pick + full ticket loop and exits — useful for cron.
+
+A ticket is "ready" when: (a) its body carries this plan's ticket marker, (b)
+it has no `lock:*` label, (c) it has no `needs-human` label, (d) it has no
+assignees, and (e) every issue referenced in its `Depends on: #NNN` line is
+closed. Merged ticket PRs close their issues, which unblocks dependents on the
+next poll — no scheduler needed.
+
+Do not run more than 4 workers against the same repo without extending the
+lock label set. The script hard-caps `--worker` at 4 by design.
+
+### 5. Handle `needs-human` tickets
+
+Any failure — agent exits non-zero, no commits pushed, `gh pr create` fails,
+reviewer command fails, review loop exhausted, merge fails after a clean
+review — causes the executor to remove its lock, add a `needs-human` label,
+comment the failure reason (and the last feedback bundle, if there is one)
+on the ticket, and move on.
+
+Triage:
+
+```bash
+gh issue list --repo <owner/repo> --label needs-human --state open
+```
+
+Common outcomes: fix the agent command and remove `needs-human` to re-queue;
+edit the ticket body to clarify scope; increase `--max-iterations` if the
+review loop was just close to converging; drop the ticket and re-run
+`plan-to-tickets` after revising the plan. The executor never silently
+retries — silent retries hide real problems.
+
+### 6. Stop conditions
+
+The executor stops when: the user kills the worker processes, `--once` was
+passed and a cycle completed, or (in long-running mode) the backlog is fully
+drained *and* the user kills the workers. There is no "done" state the script
+can detect on its own — more ready tickets can appear at any time (a
+`needs-human` label removed, a dependency PR merged, `plan-to-tickets` re-run
+with an updated plan).
+
+**Merging the epic PR is out of scope.** Whatever process merges the epic
+branch into `main` — human review, CI auto-merge, `gh pr merge --auto` on a
+schedule — is a separate decision, made by whoever trusts the collected
+ticket output.
+
+## Flags (`scripts/execute-tickets.sh`)
+
+| Flag | Effect |
+|--|--|
+| `--worker <N>` | Worker slot ID, 1..4 (required). Becomes lock label `lock:N`. |
+| `--plan <slug>` | Plan slug: basename of `docs/superpowers/tickets/<slug>.md` (required). |
+| `--agent-cmd <cmd>` | Shell command to run per ticket, with `{token}` substitutions (required). |
+| `--repo <owner/repo>` | Target repo (default: current repo via `gh repo view`). |
+| `--reviewer-cmd <cmd>` | Codex review command (default: `codex exec ... --sandbox read-only`). |
+| `--review-schema <path>` | Override review output schema (default: vendored). |
+| `--review-prompt <path>` | Override reviewer system prompt (default: vendored). |
+| `--block-priority-max <N>` | Findings with `priority <= N` block merge. Default: `1` (P0+P1 block). |
+| `--min-confidence <F>` | Findings below this confidence never block. Default: `0.5`. |
+| `--max-iterations <N>` | Max agent+review cycles before `needs-human`. Default: `5`. |
+| `--merge-method <flag>` | One of `--squash`, `--rebase`, `--merge`. Default: `--squash`. |
+| `--ci-timeout <seconds>` | Per-iteration wait for PR checks to settle. Default: `1800`. |
+| `--poll <seconds>` | Sleep between empty polls in loop mode. Default: `30`. |
+| `--once` | Pick + run at most one ticket, then exit. |
+| `--dry-run` | Print the selected ticket + composed commands; do not claim/worktree/agent/review/merge. |
+| `--help` | Show help. |
+
+## What this skill deliberately does not do
+
+- **Merge the epic PR** (or anything to `main`). Stops at the epic branch.
+- **Retry `needs-human` tickets.** All failures require human triage.
+- **Map model tiers to concrete models.** That's `--agent-cmd`'s job.
+- **Coordinate across plans or repos.** One invocation, one plan, one repo.
+- **Scale past 4 workers per repo.** The 4-slot lock label set is the cap.
+- **Auto-merge PRs before codex says the patch is correct.** `overall_correctness`
+  is a hard gate, even without matching high-priority findings.
