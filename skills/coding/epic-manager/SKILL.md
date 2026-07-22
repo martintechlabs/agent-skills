@@ -13,7 +13,7 @@ description: >-
   individual ticket issues (except filing new ones for rework:).
 metadata:
   author: stephen-martin
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # Supervise a plan-to-tickets epic end-to-end
