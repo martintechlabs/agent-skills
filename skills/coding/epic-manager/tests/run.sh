@@ -237,3 +237,65 @@ test_final_review_posts_findings() {
   rm -rf "$d"
 }
 test_final_review_posts_findings
+
+# ---- Task 7 tests: human commands ----
+
+test_ship_it_merges() {
+  local d; d="$(mktemp -d)"
+  setup_drained_epic "$d"
+  # Pre-seed an open epic PR + a ship-it comment.
+  jq '.prs["1"] = {number:1,title:"Epic",body:"",base:"main",head:"epic",headRefOid:"sha-1",statusCheckRollup:[],merged:false,state:"open",comments:[]} | .next_pr=2 | .issues["100"].comments=[{databaseId:1,body:"ship it",createdAt:"2026-07-22T10:00:00Z"}]' \
+    "$d/state" > "$d/state.tmp" && mv "$d/state.tmp" "$d/state"
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" FAKE_GH_LOG="$d/gh.log" \
+    FAKE_CODEX_REVIEW_JSON='{"findings":[],"overall_correctness":"patch is correct","overall_explanation":"ok","overall_confidence_score":0.9}' \
+    -- --plan test-plan --once
+  assert_file_contains "$d/gh.log" "PR_MERGE" "ship it triggered a merge"
+  rm -rf "$d"
+}
+test_ship_it_merges
+
+test_ship_it_held_when_rework_open() {
+  local d; d="$(mktemp -d)"
+  setup_drained_epic "$d"
+  # Add an open (ready) rework-filed ticket -> blocks ship it.
+  local t102; t102="$(issue_json 102 'Rework' '<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:rework-1 -->' '[]')"
+  jq --argjson t "$t102" '.issues["102"] = $t' "$d/state" > "$d/state.tmp" && mv "$d/state.tmp" "$d/state"
+  jq '.prs["1"] = {number:1,title:"Epic",body:"",base:"main",head:"epic",headRefOid:"sha-1",statusCheckRollup:[],merged:false,state:"open",comments:[]} | .next_pr=2 | .issues["100"].comments=[{databaseId:1,body:"ship it",createdAt:"2026-07-22T10:00:00Z"}]' \
+    "$d/state" > "$d/state.tmp" && mv "$d/state.tmp" "$d/state"
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" FAKE_GH_LOG="$d/gh.log" \
+    FAKE_CODEX_REVIEW_JSON='{"findings":[],"overall_correctness":"patch is correct","overall_explanation":"ok","overall_confidence_score":0.9}' \
+    -- --plan test-plan --once
+  assert_file_contains "$d/gh.log" "waiting on" "ship it held with a waiting message"
+  assert_not_contains "$(cat "$d/gh.log")" "PR_MERGE" "no merge attempted"
+  rm -rf "$d"
+}
+test_ship_it_held_when_rework_open
+
+test_rework_files_new_ticket() {
+  local d; d="$(mktemp -d)"
+  setup_drained_epic "$d"
+  jq '.prs["1"] = {number:1,title:"Epic",body:"",base:"main",head:"epic",headRefOid:"sha-1",statusCheckRollup:[],merged:false,state:"open",comments:[]} | .next_pr=2 | .issues["100"].comments=[{databaseId:1,body:"rework: change the button to blue",createdAt:"2026-07-22T10:00:00Z"}]' \
+    "$d/state" > "$d/state.tmp" && mv "$d/state.tmp" "$d/state"
+  local meta_json='{"priority":"p1","complexity":"small","model_tier":"efficient","reasoning":"tiny copy change"}'
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" FAKE_GH_LOG="$d/gh.log" \
+    FAKE_CODEX_REVIEW_JSON="$meta_json" -- --plan test-plan --once
+  assert_file_contains "$d/gh.log" "issue create" "rework filed a new ticket"
+  assert_file_contains "$d/gh.log" "priority:p1" "new ticket has codex-chosen priority"
+  assert_file_contains "$d/gh.log" "change the button to blue" "filing comment includes the description"
+  rm -rf "$d"
+}
+test_rework_files_new_ticket
+
+test_abandon_closes_pr_and_issue() {
+  local d; d="$(mktemp -d)"
+  setup_drained_epic "$d"
+  jq '.prs["1"] = {number:1,title:"Epic",body:"",base:"main",head:"epic",headRefOid:"sha-1",statusCheckRollup:[],merged:false,state:"open",comments:[]} | .next_pr=2 | .issues["100"].comments=[{databaseId:1,body:"abandon",createdAt:"2026-07-22T10:00:00Z"}]' \
+    "$d/state" > "$d/state.tmp" && mv "$d/state.tmp" "$d/state"
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" FAKE_GH_LOG="$d/gh.log" -- --plan test-plan --once
+  assert_file_contains "$d/gh.log" "PR_CLOSE" "abandon closes the PR"
+  # Check issue closed in state
+  local epic_state; epic_state="$(jq -r '.issues["100"].state' "$d/state")"
+  assert_eq "$epic_state" "closed" "abandon closes the epic issue"
+  rm -rf "$d"
+}
+test_abandon_closes_pr_and_issue

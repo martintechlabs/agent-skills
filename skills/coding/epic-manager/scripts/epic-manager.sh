@@ -234,6 +234,13 @@ run_one_cycle() {
       vlog "executors still working; would post progress + exit"
     else
       vlog "backlog drained; would proceed to checklist gate"
+      local checklist_path
+      checklist_path="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/$CHECKLIST_FILE"
+      if [ ! -f "$checklist_path" ]; then
+        vlog "checklist: skipped (no file at $checklist_path)"
+      else
+        vlog "checklist: would run items from $checklist_path"
+      fi
     fi
     return 0
   fi
@@ -247,19 +254,22 @@ run_one_cycle() {
   local ready_count in_progress_count
   ready_count="$(jq '.ready | length' <<<"$state")"
   in_progress_count="$(jq '.in_progress | length' <<<"$state")"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  local pr_number=""
   if [ "$ready_count" -gt 0 ] || [ "$in_progress_count" -gt 0 ]; then
-    vlog "executors still working (ready=$ready_count in_progress=$in_progress_count); exiting."
+    vlog "executors still working (ready=$ready_count in_progress=$in_progress_count); parsing commands + exiting."
+    # Parse commands every cycle so the human gets feedback even mid-execution.
+    parse_and_handle_commands "" "$state" "$tmpdir"
     release_lock
+    rm -rf "$tmpdir"
     return 0
   fi
   vlog "backlog drained; proceeding to checklist gate."
-  local tmpdir; tmpdir="$(mktemp -d)"
   if ! run_checklist "$tmpdir"; then
     release_lock
     rm -rf "$tmpdir"
     return 0   # failure already posted + labeled; not an error exit
   fi
-  local pr_number
   pr_number="$(open_or_find_epic_pr)" || { log "Failed to open/find epic PR."; release_lock; rm -rf "$tmpdir"; return 1; }
   vlog "epic PR: #$pr_number"
   local review_json="$tmpdir/final-review.json"
@@ -269,7 +279,8 @@ run_one_cycle() {
     log "Final review failed; posting a note."
     gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "⚠️ Final integration review failed to run. Review the PR manually: #$pr_number" >/dev/null 2>&1 || true
   fi
-  # Command parsing implemented in Task 7.
+  # Parse + handle human commands (idempotent: skip already-processed comment ids).
+  parse_and_handle_commands "$pr_number" "$state" "$tmpdir"
   release_lock
   rm -rf "$tmpdir"
   return 0
@@ -584,6 +595,141 @@ post_final_review_comment() {
   gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body-file "$body_file" >/dev/null 2>&1 || true
   gh pr comment "$pr" --repo "$REPO" --body "Final review: $verdict ($findings_count findings, $blocking_count blocking). See epic #$EPIC_NUMBER for detail." >/dev/null 2>&1 || true
   rm -f "$body_file"
+}
+
+to_lower() { tr '[:upper:]' '[:lower:]' <<<"$1"; }
+
+parse_and_handle_commands() {
+  local pr="$1" state="$2" tmpdir="$3"
+  local comments
+  comments="$(gh issue view "$EPIC_NUMBER" --repo "$REPO" --json comments -q '.comments' 2>/dev/null || echo '[]')"
+  [ "$(jq 'length' <<<"$comments" 2>/dev/null || echo 0)" -eq 0 ] && return 0
+  # Idempotency: skip comments already processed (tracked by a manager:processed marker).
+  local processed
+  processed="$(jq -r '[.[] | select(.body | test("<!-- manager:processed:")) | (.body | capture("<!-- manager:processed:(?<ids>[0-9,]+) -->").ids)] | last // ""' <<<"$comments" 2>/dev/null || echo "")"
+  local new_ids=""
+  while IFS= read -r cmd_obj; do
+    local cid body first_line lower
+    cid="$(jq -r '.databaseId // 0' <<<"$cmd_obj")"
+    # Skip already-processed.
+    case " $processed " in *" $cid "*) continue ;; esac
+    body="$(jq -r '.body' <<<"$cmd_obj")"
+    first_line="$(head -1 <<<"$body")"
+    lower="$(to_lower "$first_line")"
+    new_ids+="$cid,"
+    vlog "command from comment #$cid: $first_line"
+    case "$lower" in
+      ship\ it|"#shipit"|🚀|lgtm|merge\ it) handle_ship_it "$pr" "$state" ;;
+      rework*) handle_rework "$body" "$tmpdir" ;;
+      abandon) handle_abandon "$pr" ;;
+      *) vlog "  (not a recognized command; ignoring)" ;;
+    esac
+  done < <(jq -c '.[]' <<<"$comments" 2>/dev/null)
+  [ -n "$new_ids" ] && gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "<!-- manager:processed:${new_ids%,} -->" >/dev/null 2>&1 || true
+}
+
+handle_ship_it() {
+  local pr="$1" state="$2"
+  # Guard 1: no ready tickets, no in-progress tickets.
+  local ready_count in_progress_count
+  ready_count="$(jq '.ready | length' <<<"$state" 2>/dev/null || echo 0)"
+  in_progress_count="$(jq '.in_progress | length' <<<"$state" 2>/dev/null || echo 0)"
+  if [ "$ready_count" -gt 0 ] || [ "$in_progress_count" -gt 0 ]; then
+    local msg="ship it held: waiting on "
+    [ "$ready_count" -gt 0 ] && msg+="ready tickets ($(jq -r '.ready|join(",")' <<<"$state")) "
+    [ "$in_progress_count" -gt 0 ] && msg+="in-progress ($(jq -r '.in_progress|join(",")' <<<"$state"))"
+    gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "⚠️ $msg" >/dev/null 2>&1 || true
+    return 0
+  fi
+  # Guard 2: no epic PR yet (backlog drained but PR not opened).
+  if [ -z "$pr" ] || [ "$pr" = "null" ]; then
+    gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "⚠️ ship it: epic PR not yet open." >/dev/null 2>&1 || true
+    return 0
+  fi
+  # Re-verify CI green.
+  local checks_json failing
+  checks_json="$(gh pr view "$pr" --repo "$REPO" --json statusCheckRollup -q '.statusCheckRollup' 2>/dev/null || echo '[]')"
+  failing="$(jq '[.[] | select(.conclusion != null and (.conclusion | ascii_upcase) != "SUCCESS" and (.conclusion | ascii_upcase) != "NEUTRAL" and (.conclusion | ascii_upcase) != "SKIPPED")] | length' <<<"$checks_json" 2>/dev/null || echo 0)"
+  if [ "$failing" -gt 0 ]; then
+    gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "⚠️ ship it held: $failing CI check(s) failing. Fix and re-post \`ship it\`." >/dev/null 2>&1 || true
+    return 0
+  fi
+  # Merge.
+  if gh pr merge "$pr" --repo "$REPO" --squash --delete-branch --auto >/dev/null 2>&1 \
+     || gh pr merge "$pr" --repo "$REPO" --squash --delete-branch >/dev/null 2>&1; then
+    local sha; sha="$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q .headRefOid 2>/dev/null || echo unknown)"
+    gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "🚢 Merged epic PR #$pr ($sha). Epic complete." >/dev/null 2>&1 || true
+  else
+    gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "⚠️ ship it: merge failed on PR #$pr. Needs human." >/dev/null 2>&1 || true
+    gh issue edit "$EPIC_NUMBER" --repo "$REPO" --add-label "needs-human" >/dev/null 2>&1 || true
+  fi
+}
+
+handle_rework() {
+  local comment_body="$1" tmpdir="$2"
+  # Parse "rework [#N]: <description>"
+  local desc ref=""
+  if [[ "$comment_body" =~ ^[[:space:]]*rework[[:space:]]+#([0-9]+)[[:space:]]*:[[:space:]]*(.+)$ ]]; then
+    ref="${BASH_REMATCH[1]}"
+    desc="${BASH_REMATCH[2]}"
+  elif [[ "$comment_body" =~ ^[[:space:]]*rework[[:space:]]*:[[:space:]]*(.+)$ ]]; then
+    desc="${BASH_REMATCH[1]}"
+  else
+    return 0
+  fi
+  # Codex picks metadata.
+  local meta_json meta_prompt meta_schema cmd
+  meta_json="$tmpdir/metadata.json"
+  meta_prompt="$tmpdir/metadata-prompt.md"
+  {
+    cat "$SKILL_DIR/references/metadata-guess-prompt.md"
+    echo
+    echo "## Rework description"
+    echo
+    echo "$desc"
+  } > "$meta_prompt"
+  meta_schema="$SKILL_DIR/references/metadata-guess-schema.json"
+  cmd="$(render_cmd "$REVIEWER_CMD" \
+    final_review_schema "$meta_schema" \
+    final_review_output "$meta_json" \
+    final_review_prompt_composed "$meta_prompt")"
+  ( bash -c "$cmd" ) || true
+  local priority complexity model_tier reasoning
+  priority="$(jq -r '.priority // "p1"' "$meta_json" 2>/dev/null || echo p1)"
+  complexity="$(jq -r '.complexity // "medium"' "$meta_json" 2>/dev/null || echo medium)"
+  model_tier="$(jq -r '.model_tier // "standard"' "$meta_json" 2>/dev/null || echo standard)"
+  reasoning="$(jq -r '.reasoning // ""' "$meta_json" 2>/dev/null || echo "")"
+  # File the new ticket.
+  local body_file; body_file="$(mktemp)"
+  local marker="<!-- plan-to-tickets:ticket:$PLAN_FILE:rework-$(date +%s) -->"
+  {
+    echo "## Rework request"
+    echo
+    echo "$desc"
+    [ -n "$ref" ] && echo && echo "Refines #$ref"
+    echo
+    echo "$marker"
+  } > "$body_file"
+  local url
+  url="$(gh issue create --repo "$REPO" \
+          --title "Rework: $desc" \
+          --body-file "$body_file" \
+          --label "complexity:$complexity" --label "priority:$priority" --label "model-tier:$model_tier" 2>/dev/null)" || return 1
+  local new_n; new_n="$(basename "$url")"
+  rm -f "$body_file"
+  gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "Filed #$new_n from rework request: $desc
+
+Codex picked: \`priority:$priority\`, \`complexity:$complexity\`, \`model-tier:$model_tier\`.
+$reasoning
+
+If this touches security or large refactors, consider \`model-tier:flagship\` / \`complexity:large\`; edit #$new_n's labels to retune before an executor picks it up." >/dev/null 2>&1 || true
+}
+
+handle_abandon() {
+  local pr="$1"
+  [ -n "$pr" ] && [ "$pr" != "null" ] && gh pr close "$pr" --repo "$REPO" >/dev/null 2>&1 || true
+  gh issue close "$EPIC_NUMBER" --repo "$REPO" --reason "not planned" >/dev/null 2>&1 || true
+  gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "🛑 Abandoned per human request. Epic PR and issue closed." >/dev/null 2>&1 || true
 }
 
 log() { printf '[%s manager] %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
