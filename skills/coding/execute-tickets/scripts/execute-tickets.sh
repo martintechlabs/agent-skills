@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # execute-tickets.sh: pick ready plan-to-tickets issues, drive each through an
 # agent -> codex review -> CI verification loop, then merge the PR back to the
-# plan's epic branch. Designed to run as up to 4 parallel worker processes per
-# repo; per-worker label locks (`lock:1..lock:4`) make ticket claim atomic.
+# plan's epic branch. Designed to run as up to 10 parallel worker processes per
+# repo; per-worker label locks (`lock:alice`..`lock:justin`) make ticket claim atomic.
 #
 # Each ticket branch is sub-branched from the manifest's source_branch (the
 # epic branch). Only priority 0/1 codex findings block merge; priority 2/3
@@ -21,7 +21,12 @@ POLL_SECONDS=30
 ONCE=false
 DRY_RUN=false
 VERBOSE=true
-MAX_WORKERS=4
+# Worker identity: a fixed, ordered list of names (not numbers) so lock
+# labels read as text in a GitHub issue's label list instead of an
+# easily-misread single digit next to priority:p3/complexity:small/etc.
+# Order only matters for readability -- nothing depends on the list being
+# sorted. Extend by editing this array; nothing else needs to change.
+WORKER_NAMES=(alice bob carol dave eve frank gordon hank isaac justin)
 MAX_ITERATIONS=5
 BLOCK_PRIORITY_MAX=1     # findings with priority <= this block merge (0=severe, 1=major)
 MIN_CONFIDENCE="0.5"     # findings below this confidence never block
@@ -43,10 +48,12 @@ usage() {
 execute-tickets.sh -- dispatch plan-to-tickets issues through agent + codex review + merge.
 
 Usage:
-  execute-tickets.sh --worker <1..4> --plan <plan-slug> --agent-cmd <cmd> [flags]
+  execute-tickets.sh --worker <name> --plan <plan-slug> --agent-cmd <cmd> [flags]
 
 Required flags:
-  --worker <N>          Worker slot ID (1..4). Distinct per concurrent process.
+  --worker <name>       Worker identity (case-insensitive), one of:
+                          alice bob carol dave eve frank gordon hank isaac justin
+                        Distinct per concurrent process.
   --plan <slug>         Plan slug: basename of docs/superpowers/tickets/<slug>.md.
   --agent-cmd <cmd>     Shell command to run the coding agent. Runs from inside the
                         ticket worktree. Token substitutions (each shell-quoted):
@@ -140,9 +147,9 @@ parse_args() {
       *) die 2 "Unknown flag: $1" ;;
     esac
   done
-  [ -n "$WORKER" ] || die 2 "Missing --worker <1..$MAX_WORKERS>"
-  [[ "$WORKER" =~ ^[1-9][0-9]*$ ]] || die 2 "--worker must be a positive integer"
-  [ "$WORKER" -le "$MAX_WORKERS" ] || die 2 "--worker must be <= $MAX_WORKERS"
+  [ -n "$WORKER" ] || die 2 "Missing --worker <name>. Valid names: ${WORKER_NAMES[*]}"
+  WORKER="${WORKER,,}"
+  is_valid_worker_name "$WORKER" || die 2 "--worker must be one of: ${WORKER_NAMES[*]} (got: $WORKER)"
   [ -n "$PLAN_SLUG" ] || die 2 "Missing --plan <slug>"
   [ -n "$AGENT_CMD" ] || die 2 "Missing --agent-cmd <cmd>"
   case "$MERGE_METHOD" in --squash|--rebase|--merge) ;; *) die 2 "--merge-method must be --squash|--rebase|--merge" ;; esac
@@ -154,6 +161,14 @@ parse_args() {
 
 req_val() { [ $# -ge 2 ] || die 2 "Missing value for $1"; }
 die() { local code="$1"; shift; echo "$*" >&2; exit "$code"; }
+
+is_valid_worker_name() {
+  local w="$1" name
+  for name in "${WORKER_NAMES[@]}"; do
+    [ "$name" = "$w" ] && return 0
+  done
+  return 1
+}
 
 preflight() {
   command -v gh >/dev/null 2>&1 || die 1 "gh is required."
@@ -174,7 +189,7 @@ ensure_lock_labels() {
   local existing name
   existing="$(gh label list --repo "$REPO" --json name -q '.[].name' 2>/dev/null || true)"
   local w
-  for w in $(seq 1 "$MAX_WORKERS"); do
+  for w in "${WORKER_NAMES[@]}"; do
     name="lock:$w"
     grep -qxF "$name" <<<"$existing" && continue
     [ "$DRY_RUN" = true ] && continue

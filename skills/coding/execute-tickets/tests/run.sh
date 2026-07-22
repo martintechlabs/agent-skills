@@ -36,7 +36,7 @@ test_manifest_not_found() {
   make_repo "$d" plan1
   local bin; bin="$(bindir_for "$d")"
   run_et "$d/work" "$bin" FAKE_GH_STATE="$d/state.json" \
-    -- --worker 1 --plan does-not-exist --agent-cmd echo --once
+    -- --worker alice --plan does-not-exist --agent-cmd echo --once
   assert_eq "$RC" "1" "missing manifest exits 1"
   assert_contains "$ERR" "Manifest not found" "clear error for missing manifest"
   rm -rf "$d"
@@ -56,7 +56,7 @@ test_dry_run_reports_selected_ticket() {
      labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
   ]')"
   run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
-    -- --worker 1 --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --dry-run --once
+    -- --worker alice --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --dry-run --once
   assert_eq "$RC" "0" "dry-run exits 0"
   assert_contains "$ERR" "ticket:            #101" "dry-run reports the selected ticket"
   assert_contains "$ERR" "source_branch:     epic" "dry-run reports the epic branch"
@@ -80,10 +80,11 @@ test_green_path_merges_and_closes_issue() {
      labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
   ]')"
   run_et "$d/work" "$bin" FAKE_GH_STATE="$state" FAKE_GH_LOG="$log" \
-    -- --worker 1 --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --once
+    -- --worker alice --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --once
   assert_eq "$RC" "0" "green path exits 0"
+  assert_contains "$(cat "$log")" "label create lock:justin" "ensure_lock_labels creates all 10 named lock labels, not just 4"
   jqok "$(cat "$state")" '.issues["101"].state == "closed"' "ticket issue is explicitly closed on merge"
-  jqok "$(cat "$state")" '(.issues["101"].labels | index("lock:1")) == null' "lock label released on merge"
+  jqok "$(cat "$state")" '(.issues["101"].labels | index("lock:alice")) == null' "lock label released on merge"
   jqok "$(cat "$state")" '.prs["1"].merged == true' "PR is merged"
   assert_contains "$(cat "$log")" "issue close 101" "executor explicitly closes the ticket issue (Closes # keyword is a no-op against a non-default base branch)"
   rm -rf "$d"
@@ -111,7 +112,7 @@ test_dependency_gating_blocks_when_open() {
   local state="$d/state.json"
   seed_two_tickets_with_dependency "$state" "open"
   run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
-    -- --worker 1 --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --dry-run --once
+    -- --worker alice --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --dry-run --once
   assert_contains "$ERR" "ticket:            #101" "picks the dependency-free ticket first"
   assert_not_contains "$ERR" "ticket:            #102" "does not pick a ticket whose dependency is still open"
   rm -rf "$d"
@@ -124,7 +125,7 @@ test_dependency_gating_unblocks_when_closed() {
   local state="$d/state.json"
   seed_two_tickets_with_dependency "$state" "closed"
   run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
-    -- --worker 1 --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --dry-run --once
+    -- --worker alice --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --dry-run --once
   assert_contains "$ERR" "ticket:            #102" "picks the dependent ticket once its dependency issue is closed"
   rm -rf "$d"
 }
@@ -151,10 +152,10 @@ test_swallowed_push_failure_on_retry_is_flagged_needs_human() {
   ]')"
   local responses; responses="$(write_codex_responses "$d/codex-responses" "$BLOCKING_REVIEW" "$CLEAN_REVIEW")"
   run_et "$d/work" "$bin" FAKE_GH_STATE="$state" FAKE_GH_LOG="$log" FAKE_CODEX_RESPONSES_DIR="$responses" \
-    -- --worker 1 --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --once
+    -- --worker alice --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --once
   jqok "$(cat "$state")" '(.issues["101"].labels | index("needs-human")) != null' "ticket is flagged needs-human when the retry push is silently rejected"
   jqok "$(cat "$state")" '.prs["1"].merged != true' "PR is not merged when the fix never actually reached origin"
-  assert_contains "$(cat "$log")" "BODY_CONTENT(#101): Executor (worker 1) gave up: no new commits pushed on iteration 2" "needs-human reason names the real push failure, not a stale merge"
+  assert_contains "$(cat "$log")" "BODY_CONTENT(#101): Executor (worker alice) gave up: no new commits pushed on iteration 2" "needs-human reason names the real push failure, not a stale merge"
   rm -rf "$d"
 }
 
@@ -178,7 +179,7 @@ test_red_path_feeds_blocking_findings_back_to_agent() {
   ]')"
   local responses; responses="$(write_codex_responses "$d/codex-responses" "$BLOCKING_REVIEW" "$CLEAN_REVIEW")"
   run_et "$d/work" "$bin" FAKE_GH_STATE="$state" FAKE_CODEX_RESPONSES_DIR="$responses" RESULTS_DIR="$results" \
-    -- --worker 1 --plan plan1 --agent-cmd "$AGENT_CMD_LOGGING" --once
+    -- --worker alice --plan plan1 --agent-cmd "$AGENT_CMD_LOGGING" --once
   assert_file_contains "$results/agent-calls.log" "iter=1 feedback_nonempty=no" "iteration 1 gets no feedback bundle"
   assert_file_contains "$results/agent-calls.log" "iter=2 feedback_nonempty=yes" "agent is re-invoked with iteration=2 once a blocking finding comes back"
   assert_file_contains "$results/feedback-content.log" "Null deref" "the feedback bundle passed to the agent names the blocking finding"
@@ -201,7 +202,7 @@ test_max_iterations_gives_up_and_flags_needs_human() {
      labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
   ]')"
   run_et "$d/work" "$bin" FAKE_GH_STATE="$state" FAKE_GH_LOG="$log" FAKE_CODEX_REVIEW_JSON="$BLOCKING_REVIEW" \
-    -- --worker 1 --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --max-iterations 2 --once
+    -- --worker alice --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --max-iterations 2 --once
   jqok "$(cat "$state")" '(.issues["101"].labels | index("needs-human")) != null' "ticket is flagged needs-human once max-iterations is hit"
   jqok "$(cat "$state")" '.prs["1"].merged != true' "PR is never merged when the review stays blocking"
   assert_contains "$(cat "$log")" "gave up: review loop exhausted after 2 iterations" "needs-human comment names the iteration cap as the reason"
@@ -224,7 +225,7 @@ test_merge_failure_flags_needs_human() {
   ]')"
   run_et "$d/work" "$bin" FAKE_GH_STATE="$state" FAKE_GH_LOG="$log" \
     FAKE_GH_MERGE_AUTO_FAIL=true FAKE_GH_MERGE_SYNC_FAIL=true \
-    -- --worker 1 --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --once
+    -- --worker alice --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --once
   jqok "$(cat "$state")" '(.issues["101"].labels | index("needs-human")) != null' "ticket is flagged needs-human when both merge attempts fail"
   assert_contains "$(cat "$log")" "gave up: merge failed after clean review" "needs-human comment names the merge failure as the reason"
   assert_not_contains "$(cat "$log")" "issue close 101" "the ticket issue is not closed when the merge never actually happened"
@@ -248,12 +249,12 @@ test_claim_ticket_releases_lock_on_rival_lock_race() {
     {number:101, title:"Ticket A", body:"Body A\n\n<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->",
      labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
   ]')"
-  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" FAKE_GH_INJECT_RIVAL_LOCK="lock:2" \
-    -- --worker 1 --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --once
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" FAKE_GH_INJECT_RIVAL_LOCK="lock:bob" \
+    -- --worker alice --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --once
   assert_eq "$RC" "0" "cycle exits 0 even when the claim race is lost"
   assert_contains "$ERR" "Lost claim race on #101" "reports the lost race instead of silently proceeding"
-  jqok "$(cat "$state")" '(.issues["101"].labels | index("lock:1")) == null' "releases its own lock label after detecting a rival lock"
-  jqok "$(cat "$state")" '(.issues["101"].labels | index("lock:2")) != null' "does not touch the rival lock label"
+  jqok "$(cat "$state")" '(.issues["101"].labels | index("lock:alice")) == null' "releases its own lock label after detecting a rival lock"
+  jqok "$(cat "$state")" '(.issues["101"].labels | index("lock:bob")) != null' "does not touch the rival lock label"
   jqok "$(cat "$state")" '(.issues["101"].assignees | length) == 0' "never assigns itself to a ticket it lost the race on"
   rm -rf "$d"
 }
@@ -276,7 +277,7 @@ test_unexpected_error_is_caught_immediately_not_ground_through_all_iterations() 
      labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
   ]')"
   run_et "$d/work" "$bin" FAKE_GH_STATE="$state" FAKE_GH_LOG="$log" FAKE_CODEX_REVIEW_JSON="$BLOCKING_REVIEW" \
-    -- --worker 1 --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --block-priority-max abc --once
+    -- --worker alice --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --block-priority-max abc --once
   local agent_calls; agent_calls="$(grep -c "Agent (iter" <<<"$ERR" || true)"
   assert_eq "$agent_calls" "1" "the unexpected error aborts on the first iteration instead of grinding through all 5"
   assert_contains "$(cat "$log")" "gave up: unexpected error in run_ticket" "needs-human reason names the real cause (an unguarded internal failure), not a fabricated iteration-exhaustion"
@@ -316,7 +317,7 @@ test_worker_refetches_epic_branch_between_tickets_in_loop_mode() {
      labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
   ]')"
   ( cd "$d/work" && PATH="$bin:$PATH" FAKE_GH_STATE="$state" RESULTS_DIR="$results" REMOTE_URL="$d/remote.git" \
-      bash "$SCRIPT" --worker 1 --plan plan1 --agent-cmd "$AGENT_CMD_STALE_FETCH_CHECK" --poll 1 \
+      bash "$SCRIPT" --worker alice --plan plan1 --agent-cmd "$AGENT_CMD_STALE_FETCH_CHECK" --poll 1 \
       >"$d/loop-stdout.log" 2>"$d/loop-stderr.log" & echo $! > "$d/pid" )
   local waited=0 found=""
   while [ "$waited" -lt 20 ]; do
@@ -332,3 +333,43 @@ test_worker_refetches_epic_branch_between_tickets_in_loop_mode() {
 }
 
 test_worker_refetches_epic_branch_between_tickets_in_loop_mode
+
+# --- An unrecognized --worker value is a hard error at argument-parsing
+# time, before any GitHub mutation, listing the valid names -- not a silent
+# fallback and not a generic "invalid argument" message.
+test_invalid_worker_name_is_rejected() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json" log="$d/gh.log"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" FAKE_GH_LOG="$log" \
+    -- --worker zack --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --once
+  assert_eq "$RC" "2" "an unrecognized worker name exits 2"
+  assert_contains "$ERR" "alice" "error lists a valid worker name"
+  assert_contains "$ERR" "justin" "error lists the full set of valid worker names"
+  assert_eq "$(cat "$log" 2>/dev/null)" "" "no gh calls happen before worker-name validation"
+  rm -rf "$d"
+}
+
+test_invalid_worker_name_is_rejected
+
+# --- --worker is case-insensitive: the name is normalized to lowercase
+# wherever it's used (lock label, worktree path, log prefix), so "Carol" and
+# "carol" produce the same lock label.
+test_worker_name_is_case_insensitive() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json"
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Ticket A", body:"Body A\n\n<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->",
+     labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker Carol --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --dry-run --once
+  assert_eq "$RC" "0" "a mixed-case worker name is accepted"
+  assert_contains "$ERR" "DRY RUN (worker carol):" "the worker name is normalized to lowercase everywhere it's used"
+  rm -rf "$d"
+}
+
+test_worker_name_is_case_insensitive
