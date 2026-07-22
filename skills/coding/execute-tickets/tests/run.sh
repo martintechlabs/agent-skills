@@ -373,3 +373,77 @@ test_worker_name_is_case_insensitive() {
 }
 
 test_worker_name_is_case_insensitive
+
+# --- init-agents.sh scaffolds .execute-tickets/agents.yml from the vendored
+# Claude template, refuses overwrite without --force, and never touches checklist.yml.
+INIT_SCRIPT="$HERE/../scripts/init-agents.sh"
+
+test_init_agents_writes_file() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  bash "$INIT_SCRIPT" --repo-root "$d/work"
+  assert_eq "$?" "0" "init-agents exits 0"
+  [ -f "$d/work/.execute-tickets/agents.yml" ] && ok "agents.yml created" || bad "agents.yml created" "missing file"
+  assert_file_contains "$d/work/.execute-tickets/agents.yml" "lite:" "template has lite key"
+  assert_file_contains "$d/work/.execute-tickets/agents.yml" "efficient:" "template has efficient key"
+  assert_file_contains "$d/work/.execute-tickets/agents.yml" "standard:" "template has standard key"
+  assert_file_contains "$d/work/.execute-tickets/agents.yml" "flagship:" "template has flagship key"
+  assert_file_contains "$d/work/.execute-tickets/agents.yml" "claude" "Claude defaults mention claude CLI"
+  [ ! -f "$d/work/.execute-tickets/checklist.yml" ] && ok "does not create checklist.yml" || bad "does not create checklist.yml" "checklist was created"
+  rm -rf "$d"
+}
+
+test_init_agents_writes_file
+
+test_init_agents_refuses_overwrite_without_force() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  mkdir -p "$d/work/.execute-tickets"
+  echo "lite: keep-me" > "$d/work/.execute-tickets/agents.yml"
+  bash "$INIT_SCRIPT" --repo-root "$d/work" >"$d/out" 2>"$d/err"
+  assert_eq "$?" "1" "second init without --force exits 1"
+  assert_file_contains "$d/err" "--force" "error mentions --force"
+  assert_file_contains "$d/work/.execute-tickets/agents.yml" "keep-me" "existing file left intact"
+  rm -rf "$d"
+}
+
+test_init_agents_refuses_overwrite_without_force
+
+test_init_agents_force_overwrites() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  mkdir -p "$d/work/.execute-tickets"
+  echo "lite: old" > "$d/work/.execute-tickets/agents.yml"
+  bash "$INIT_SCRIPT" --repo-root "$d/work" --force >"$d/out" 2>"$d/err"
+  assert_eq "$?" "0" "--force init exits 0"
+  assert_file_contains "$d/work/.execute-tickets/agents.yml" "flagship:" "overwritten with full template"
+  assert_not_contains "$(cat "$d/work/.execute-tickets/agents.yml")" "lite: old" "old content replaced"
+  rm -rf "$d"
+}
+
+test_init_agents_force_overwrites
+
+test_init_agents_dry_run_writes_nothing() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  bash "$INIT_SCRIPT" --repo-root "$d/work" --dry-run >"$d/out" 2>"$d/err"
+  assert_eq "$?" "0" "dry-run exits 0"
+  [ ! -f "$d/work/.execute-tickets/agents.yml" ] && ok "dry-run does not write agents.yml" || bad "dry-run does not write agents.yml" "file was written"
+  assert_file_contains "$d/out" "lite:" "dry-run prints template to stdout"
+  rm -rf "$d"
+}
+
+test_init_agents_dry_run_writes_nothing
+
+test_init_agents_preserves_existing_checklist() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  mkdir -p "$d/work/.execute-tickets"
+  echo "checklist: true" > "$d/work/.execute-tickets/checklist.yml"
+  bash "$INIT_SCRIPT" --repo-root "$d/work"
+  assert_eq "$?" "0" "init exits 0 beside checklist"
+  assert_file_contains "$d/work/.execute-tickets/checklist.yml" "checklist: true" "checklist.yml untouched"
+  rm -rf "$d"
+}
+
+test_init_agents_preserves_existing_checklist

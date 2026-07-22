@@ -1,0 +1,39 @@
+# .execute-tickets/agents.yml — per model-tier coding agent commands for execute-tickets.
+# Each value is a shell command run from the ticket worktree.
+# Tokens (shell-quoted by the executor): {issue_number} {issue_title} {issue_body}
+#   {spec_file} {plan_file} {model_tier} {complexity} {priority}
+#   {worktree} {branch} {review_feedback} {iteration}
+# Agent must commit on {branch} and must NOT open a PR.
+# Edit model aliases for your org. Scaffold with: scripts/init-agents.sh
+
+lite: >
+  claude -p "Implement execute-tickets work for issue {issue_number} ({issue_title}).
+  Read the full ticket body from file path {issue_body}. Spec: {spec_file}. Plan: {plan_file}.
+  Tier={model_tier} complexity={complexity} priority={priority}. Iteration={iteration}.
+  If {review_feedback} is a non-empty path, read it and fix ONLY those blocking findings.
+  Commit all changes on branch {branch}. Do not open a pull request."
+  --model haiku --permission-mode acceptEdits
+
+efficient: >
+  claude -p "Implement execute-tickets work for issue {issue_number} ({issue_title}).
+  Read the full ticket body from file path {issue_body}. Spec: {spec_file}. Plan: {plan_file}.
+  Tier={model_tier} complexity={complexity} priority={priority}. Iteration={iteration}.
+  If {review_feedback} is a non-empty path, read it and fix ONLY those blocking findings.
+  Commit all changes on branch {branch}. Do not open a pull request."
+  --model sonnet --permission-mode acceptEdits
+
+standard: >
+  claude -p "Implement execute-tickets work for issue {issue_number} ({issue_title}).
+  Read the full ticket body from file path {issue_body}. Spec: {spec_file}. Plan: {plan_file}.
+  Tier={model_tier} complexity={complexity} priority={priority}. Iteration={iteration}.
+  If {review_feedback} is a non-empty path, read it and fix ONLY those blocking findings.
+  Commit all changes on branch {branch}. Do not open a pull request."
+  --model sonnet --permission-mode acceptEdits
+
+flagship: >
+  claude -p "Implement execute-tickets work for issue {issue_number} ({issue_title}).
+  Read the full ticket body from file path {issue_body}. Spec: {spec_file}. Plan: {plan_file}.
+  Tier={model_tier} complexity={complexity} priority={priority}. Iteration={iteration}.
+  If {review_feedback} is a non-empty path, read it and fix ONLY those blocking findings.
+  Commit all changes on branch {branch}. Do not open a pull request."
+  --model opus --permission-mode acceptEdits

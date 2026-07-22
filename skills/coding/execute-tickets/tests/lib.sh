@@ -136,3 +136,23 @@ write_codex_responses() {
   done
   printf '%s' "$dir"
 }
+
+# write_agents_yml <repo_work_dir> [lite_cmd] [efficient_cmd] [standard_cmd] [flagship_cmd]
+# Writes <repo_work_dir>/.execute-tickets/agents.yml with four non-empty tier commands.
+# Defaults are echo-based commands that leave a marker file per tier for assertions.
+write_agents_yml() {
+  local root="$1"
+  local lite="${2:-echo lite > agent-tier.txt}"
+  local efficient="${3:-echo efficient > agent-tier.txt}"
+  local standard="${4:-echo standard > agent-tier.txt}"
+  local flagship="${5:-echo flagship > agent-tier.txt}"
+  mkdir -p "$root/.execute-tickets"
+  # YAML double-quoted strings; escape backslash and double-quote in commands.
+  yaml_dq() { printf '"' ; printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' ; printf '"' ; }
+  {
+    printf 'lite: %s\n' "$(yaml_dq "$lite")"
+    printf 'efficient: %s\n' "$(yaml_dq "$efficient")"
+    printf 'standard: %s\n' "$(yaml_dq "$standard")"
+    printf 'flagship: %s\n' "$(yaml_dq "$flagship")"
+  } > "$root/.execute-tickets/agents.yml"
+}
