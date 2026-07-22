@@ -20,6 +20,7 @@ REVIEW_PROMPT=""
 POLL_SECONDS=30
 ONCE=false
 DRY_RUN=false
+VERBOSE=true
 MAX_WORKERS=4
 MAX_ITERATIONS=5
 BLOCK_PRIORITY_MAX=1     # findings with priority <= this block merge (0=severe, 1=major)
@@ -81,6 +82,9 @@ Optional flags:
   --once                    Pick+run at most one ticket, then exit.
   --dry-run                 Print the selected ticket + composed commands; do not
                             claim/worktree/agent/review/merge.
+  --quiet                   Reduce stderr progress logging. Ticket audit comments
+                            (model, verdicts, findings, feedback bundles) always post
+                            so a human can trace what happened from the issue alone.
   --help                    Show this help.
 EOF
 }
@@ -131,6 +135,7 @@ parse_args() {
       --poll) req_val "$@"; POLL_SECONDS="$2"; shift 2 ;;
       --once) ONCE=true; shift ;;
       --dry-run) DRY_RUN=true; shift ;;
+      --quiet) VERBOSE=false; shift ;;
       --help) usage; exit 0 ;;
       *) die 2 "Unknown flag: $1" ;;
     esac
@@ -204,6 +209,11 @@ load_manifest() {
   [ -n "$SPEC_FILE" ] || die 1 "Manifest missing spec_file: $MANIFEST_FILE"
   [ -n "$PLAN_FILE" ] || die 1 "Manifest missing plan_file: $MANIFEST_FILE"
   TICKET_MARKER_PREFIX="<!-- plan-to-tickets:ticket:$PLAN_FILE:"
+  vlog "manifest: $MANIFEST_FILE"
+  vlog "  source_branch: $SOURCE_BRANCH"
+  vlog "  spec_file:     $SPEC_FILE"
+  vlog "  plan_file:     $PLAN_FILE"
+  vlog "  reviewer model: $(reviewer_model)"
 }
 
 run_one_cycle() {
@@ -368,6 +378,12 @@ run_ticket() (
   complexity="$(label_value "$candidate" complexity)"
   priority="$(label_value "$candidate" priority)"
 
+  vlog "ticket #$n: $title"
+  vlog "  agent model_tier=$tier  complexity=$complexity  priority=$priority"
+  vlog "  reviewer model: $(reviewer_model)"
+  vlog "  worktree: $worktree"
+  vlog "  branch:   $branch"
+
   body_file="$(mktemp)"
   jq -r '.body' <<<"$candidate" > "$body_file"
 
@@ -439,9 +455,10 @@ run_ticket() (
     if [ ! -s "$feedback_file" ]; then
       # Post informational (P2/P3) findings as PR comments before merging, if any.
       post_informational_findings "$pr_number" "$review_json"
+      audit_comment "$n" "$iteration" "$pr_number" green "$review_json" "$ci_json" "" "$tier"
       log "Iteration $iteration: green. Merging PR #$pr_number ($MERGE_METHOD)."
       if ! merge_pr "$pr_number"; then
-        flag_needs_human "$n" "merge failed after clean review" "$feedback_file"
+        flag_needs_human "$n" "merge failed after clean review" ""
         cleanup_ticket_state "$worktree" "$body_file" "$tmpdir"
         return 1
       fi
@@ -456,22 +473,24 @@ run_ticket() (
     fi
 
     if [ "$iteration" -ge "$MAX_ITERATIONS" ]; then
+      audit_comment "$n" "$iteration" "$pr_number" exhausted "$review_json" "$ci_json" "$feedback_file" "$tier"
       log "Iteration $iteration: max iterations reached; needs-human."
-      flag_needs_human "$n" "review loop exhausted after $iteration iterations" "$feedback_file"
+      flag_needs_human "$n" "review loop exhausted after $iteration iterations" ""
       cleanup_ticket_state "$worktree" "$body_file" "$tmpdir"
       return 1
     fi
 
+    audit_comment "$n" "$iteration" "$pr_number" blocking "$review_json" "$ci_json" "$feedback_file" "$tier"
     iteration=$((iteration + 1))
     log "Iteration $iteration: feeding blocking findings back to agent."
     if ! invoke_agent "$n" "$title" "$body_file" "$tier" "$complexity" "$priority" \
                       "$worktree" "$branch" "$feedback_file" "$iteration"; then
-      flag_needs_human "$n" "agent failed on iteration $iteration" "$feedback_file"
+      flag_needs_human "$n" "agent failed on iteration $iteration" ""
       cleanup_ticket_state "$worktree" "$body_file" "$tmpdir"
       return 1
     fi
     if ! ensure_branch_pushed "$worktree" "$branch"; then
-      flag_needs_human "$n" "no new commits pushed on iteration $iteration" "$feedback_file"
+      flag_needs_human "$n" "no new commits pushed on iteration $iteration" ""
       cleanup_ticket_state "$worktree" "$body_file" "$tmpdir"
       return 1
     fi
@@ -505,6 +524,7 @@ invoke_agent() {
     review_feedback "$review_feedback" \
     iteration "$iteration")"
   log "Agent (iter $iteration) for #$n: cd $worktree"
+  vlog "agent cmd: $cmd"
   ( cd "$worktree" && bash -c "$cmd" )
 }
 
@@ -540,6 +560,7 @@ wait_for_ci() {
   # gh pr checks --watch blocks until checks settle; timeout it and then re-read state.
   timeout "$timeout" gh pr checks "$pr" --repo "$REPO" --watch >/dev/null 2>&1 || true
   gh pr view "$pr" --repo "$REPO" --json statusCheckRollup > "$out" 2>/dev/null || echo '{}' > "$out"
+  vlog_ci "$out"
 }
 
 # Run the reviewer. Composes prompt = vendored prompt + PR context, then invokes
@@ -578,9 +599,11 @@ run_reviewer() {
     branch "$branch" \
     worktree "$worktree" \
     head_sha "$head_sha")"
+  vlog "reviewer cmd: $cmd"
   ( cd "$worktree" && bash -c "$cmd" ) || return 1
   [ -s "$review_json" ] || { log "Reviewer produced no output at $review_json"; return 1; }
   jq -e . "$review_json" >/dev/null 2>&1 || { log "Reviewer output is not valid JSON"; return 1; }
+  vlog_review_summary "$review_json"
   return 0
 }
 
@@ -613,8 +636,10 @@ build_feedback_bundle() {
   num_blocking="$(jq 'length' <<<"$blocking")"
 
   if [ "$num_blocking" = "0" ] && [ -z "$failing_checks" ] && [ "$overall_bad" != "true" ]; then
+    vlog "decision: GREEN — merging (no blocking findings, no failing CI, overall correct)"
     return 0  # empty file -> clean
   fi
+  vlog "decision: BLOCKING — blocking_findings=$num_blocking, failing_ci=$([ -n "$failing_checks" ] && echo yes || echo no), overall_incorrect=$overall_bad"
 
   {
     echo "# Review feedback"
@@ -638,6 +663,8 @@ build_feedback_bundle() {
       echo "Fix these so the PR checks turn green."
     fi
   } > "$out"
+  vlog "feedback bundle (fed to agent on next iteration):"
+  while IFS= read -r line; do vlog "  $line"; done < "$out"
 }
 
 # Post informational (P2/P3, or low-confidence) findings as PR comments before merge.
@@ -659,8 +686,68 @@ post_informational_findings() {
   gh pr comment "$pr" --repo "$REPO" --body "$body" >/dev/null 2>&1 || true
 }
 
+# Post an audit comment to the TICKET ISSUE (not the PR) so a human can trace
+# what happened from the issue thread alone -- without worker logs, which are
+# ephemeral, and without the PR, which is merged + deleted. One comment per
+# iteration carries the reviewer model, the verdict, every finding, the CI
+# state, the GREEN/BLOCKING/EXHAUSTED decision, and -- on blocking iterations
+# -- the full feedback bundle that was fed to the agent, collapsed so the
+# thread stays scannable. Always fires, regardless of --quiet: the audit trail
+# on the ticket is the durable record this executor exists to produce.
+audit_comment() {
+  local n="$1" iteration="$2" pr="$3" decision="$4"
+  local review_json="$5" ci_json="$6" feedback_file="${7:-}" tier="${8:-}"
+
+  local verdict conf explanation findings_count findings_list
+  verdict="$(jq -r '.overall_correctness // "unknown"' "$review_json" 2>/dev/null || echo unknown)"
+  conf="$(jq -r '.overall_confidence_score // "unknown"' "$review_json" 2>/dev/null || echo unknown)"
+  explanation="$(jq -r '.overall_explanation // ""' "$review_json" 2>/dev/null || true)"
+  findings_count="$(jq '(.findings // []) | length' "$review_json" 2>/dev/null || echo 0)"
+  case "$findings_count" in ''|*[!0-9]*) findings_count=0 ;; esac
+  findings_list="$(jq -r '(.findings // [])[] | "- P\(.priority) [conf \(.confidence_score)] \(.title) — \(.code_location.absolute_file_path):\(.code_location.line_range.start)-\(.code_location.line_range.end)"' "$review_json" 2>/dev/null || true)"
+
+  local ci_count ci_summary
+  ci_count="$(jq '(.statusCheckRollup // []) | length' "$ci_json" 2>/dev/null || echo 0)"
+  case "$ci_count" in ''|*[!0-9]*) ci_count=0 ;; esac
+  if [ "$ci_count" -eq 0 ]; then
+    ci_summary="no checks configured"
+  else
+    ci_summary="$(jq -r '(.statusCheckRollup // []) | map(.name + " -> " + ((.conclusion // .status // "unknown") | ascii_downcase)) | join(", ")' "$ci_json" 2>/dev/null || echo unknown)"
+  fi
+
+  local emoji
+  case "$decision" in
+    green)     emoji="✅" ;;
+    blocking)  emoji="🔴" ;;
+    exhausted) emoji="🛑" ;;
+    *)         emoji="ℹ️" ;;
+  esac
+
+  local body_file
+  body_file="$(mktemp)"
+  {
+    printf '### %s Iteration %s\n\n' "$emoji" "$iteration"
+    printf '**Agent**: model_tier=%s · PR #%s\n' "$tier" "$pr"
+    printf '**Reviewer**: %s\n' "$(reviewer_model)"
+    printf '**Verdict**: %s (confidence %s)\n' "$verdict" "$conf"
+    printf '**Findings**: %s\n' "$findings_count"
+    [ -n "$findings_list" ] && printf '%s\n' "$findings_list"
+    printf '**CI**: %s\n' "$ci_summary"
+    printf '**Decision**: %s %s\n' "$emoji" "$decision"
+    [ -n "$explanation" ] && printf '\n> %s\n' "$explanation"
+    if [ -n "$feedback_file" ] && [ -s "$feedback_file" ]; then
+      printf '\n<details><summary>Feedback bundle (fed to agent on next iteration)</summary>\n\n'
+      cat "$feedback_file"
+      printf '\n</details>\n'
+    fi
+  } > "$body_file"
+  gh issue comment "$n" --repo "$REPO" --body-file "$body_file" >/dev/null 2>&1 || true
+  rm -f "$body_file"
+}
+
 merge_pr() {
   local pr="$1"
+  vlog "merging PR #$pr ($MERGE_METHOD)"
   # First attempt: auto-merge with the configured strategy, delete the ticket branch.
   if gh pr merge "$pr" --repo "$REPO" "$MERGE_METHOD" --delete-branch --auto >/dev/null 2>&1; then
     return 0
@@ -736,11 +823,56 @@ DRY RUN (worker $WORKER):
   review prompt:     $REVIEW_PROMPT
   agent cmd:         $agent_cmd
   reviewer cmd:      $reviewer_cmd
+  reviewer model:    $(reviewer_model)
 EOF
 }
 
 log() {
   printf '[%s worker=%s] %s\n' "$(date -u +%FT%TZ)" "$WORKER" "$*" >&2
+}
+
+# vlog: verbose line (suppressed by --quiet). Carries the back-and-forth a user needs
+# to follow what the executor is actually doing: model in use, rendered agent/reviewer
+# commands, review verdicts + findings, feedback bundles, CI states, merge attempts.
+vlog() {
+  [ "$VERBOSE" = true ] || return 0
+  printf '[%s worker=%s]   %s\n' "$(date -u +%FT%TZ)" "$WORKER" "$*" >&2
+}
+
+# Reviewer model is only knowable when using the default reviewer cmd (which embeds
+# ${CODEX_MODEL:-gpt-5-codex}). A custom --reviewer-cmd owns its own model choice.
+reviewer_model() {
+  if [ "$REVIEWER_CMD" = "$REVIEWER_CMD_DEFAULT" ]; then
+    echo "${CODEX_MODEL:-gpt-5-codex}"
+  else
+    echo "(set by --reviewer-cmd)"
+  fi
+}
+
+vlog_review_summary() {
+  local r="$1" n
+  vlog "review verdict: $(jq -r '.overall_correctness' "$r") (confidence $(jq -r '.overall_confidence_score' "$r"))"
+  vlog "  explanation: $(jq -r '.overall_explanation' "$r")"
+  n="$(jq '(.findings // []) | length' "$r" 2>/dev/null || echo 0)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  vlog "  findings ($n):"
+  if [ "$n" -gt 0 ]; then
+    jq -r '.findings[] | "    P\(.priority) [conf \(.confidence_score)] \(.title) — \(.code_location.absolute_file_path):\(.code_location.line_range.start)-\(.code_location.line_range.end)"' "$r" \
+      | while IFS= read -r line; do vlog "$line"; done
+  fi
+}
+
+vlog_ci() {
+  local c="$1" n
+  n="$(jq '(.statusCheckRollup // []) | length' "$c" 2>/dev/null || echo 0)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  if [ "$n" -eq 0 ]; then
+    vlog "ci: no checks configured on repo"
+    return
+  fi
+  vlog "ci checks ($n):"
+  jq -r '(.statusCheckRollup // [])[] | "    \(.name // .context // "check") -> \((.conclusion // .status // "unknown") | ascii_downcase)"' "$c" 2>/dev/null \
+    | while IFS= read -r line; do vlog "$line"; done
 }
 
 main "$@"

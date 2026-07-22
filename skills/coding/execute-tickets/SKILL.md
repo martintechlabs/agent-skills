@@ -15,7 +15,7 @@ description: >-
   never merges the epic itself, and hard-caps at 4 workers per repo.
 metadata:
   author: stephen-martin
-  version: "0.3.0"
+  version: "0.4.0"
 ---
 
 # Execute a plan-to-tickets backlog end-to-end
