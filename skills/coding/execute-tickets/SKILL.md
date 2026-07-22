@@ -15,7 +15,7 @@ description: >-
   never merges the epic itself, and hard-caps at 4 workers per repo.
 metadata:
   author: stephen-martin
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # Execute a plan-to-tickets backlog end-to-end
@@ -86,7 +86,10 @@ For each ticket picked up:
 3. **Agent, iteration 1** — invoke `--agent-cmd` with all substitution tokens.
    Agent commits on the ticket branch. If it forgot to push, executor pushes.
 4. **Open PR** — `gh pr create --base <source_branch> --head <branch> \
-   --body "Closes #<n>"`.
+   --body "Ticket: #<n>"`. Not `Closes #<n>`: GitHub only honors closing
+   keywords when the PR targets the repo's *default* branch, and this PR
+   targets the epic branch, so the keyword would silently do nothing — see
+   step 8.
 5. **Wait for CI** — `gh pr checks --watch`, bounded by `--ci-timeout` per
    iteration (default 1800s).
 6. **Codex review** — compose a prompt (vendored `references/codex-review-prompt.md`
@@ -102,7 +105,11 @@ For each ticket picked up:
      not-yet-final and won't block on their own)
 8. **Green path** — post P2/P3 (and low-confidence) findings as informational
    PR comments, then `gh pr merge <method> --delete-branch --auto` (falling
-   back to synchronous merge if auto-merge isn't enabled). Release the lock.
+   back to synchronous merge if auto-merge isn't enabled). Once merged,
+   explicitly `gh issue close <n>` — the PR's "Closes #n" keyword never fires
+   against a non-default base branch, so the executor closes the ticket issue
+   itself; this is what lets dependents unblock (see "ready" below). Release
+   the lock.
 9. **Red path** — assemble a feedback bundle (blocking findings + failing check
    names + verdict explanation) into a file, re-invoke `--agent-cmd` with
    `{review_feedback}` pointing at that file and `{iteration}` incremented.
@@ -252,8 +259,9 @@ empty), the worker sleeps `--poll` seconds (default 30) and tries again.
 A ticket is "ready" when: (a) its body carries this plan's ticket marker, (b)
 it has no `lock:*` label, (c) it has no `needs-human` label, (d) it has no
 assignees, and (e) every issue referenced in its `Depends on: #NNN` line is
-closed. Merged ticket PRs close their issues, which unblocks dependents on the
-next poll — no scheduler needed.
+closed. The executor explicitly closes a ticket's issue on merge (step 8 of
+the per-ticket loop), which unblocks dependents on the next poll — no
+scheduler needed.
 
 Do not run more than 4 workers against the same repo without extending the
 lock label set. The script hard-caps `--worker` at 4 by design.

@@ -89,12 +89,25 @@ main() {
   parse_args "$@"
   preflight
   load_manifest
+  # run_one_cycle is called as a bare statement, never as the tested command
+  # of an if/&&/||/! -- bash suppresses errexit (and ERR traps) for a
+  # command's *entire* call tree in that position, which would silently
+  # disable run_ticket's unexpected-error cleanup several frames down. Instead
+  # its ordinary (non-error) nonzero returns -- "no ready ticket", "lost the
+  # claim race" -- are absorbed with a `set +e`/`set -e` toggle around the
+  # call, which does not carry that suppression into the callee.
   if [ "$ONCE" = true ]; then
-    run_one_cycle || true
+    set +e
+    run_one_cycle
+    set -e
     exit 0
   fi
   while true; do
-    if ! run_one_cycle; then
+    set +e
+    run_one_cycle
+    local cycle_rc=$?
+    set -e
+    if [ "$cycle_rc" -ne 0 ]; then
       sleep "$POLL_SECONDS"
     fi
   done
@@ -191,8 +204,6 @@ load_manifest() {
   [ -n "$SPEC_FILE" ] || die 1 "Manifest missing spec_file: $MANIFEST_FILE"
   [ -n "$PLAN_FILE" ] || die 1 "Manifest missing plan_file: $MANIFEST_FILE"
   TICKET_MARKER_PREFIX="<!-- plan-to-tickets:ticket:$PLAN_FILE:"
-  # Ensure our local ref for source_branch is up to date; ticket branches sub-branch from it.
-  git fetch origin "$SOURCE_BRANCH" >/dev/null 2>&1 || log "Warning: could not fetch origin/$SOURCE_BRANCH"
 }
 
 run_one_cycle() {
@@ -213,7 +224,15 @@ run_one_cycle() {
     log "Lost claim race on #$n; will retry."
     return 1
   fi
-  if run_ticket "$candidate"; then
+  # Bare statement + explicit rc capture, not `if run_ticket ...; then` --
+  # run_ticket is a subshell with its own ERR trap for unexpected failures,
+  # and calling it as an if/&&/||/! test would suppress that trap for its
+  # entire execution (see main()'s comment for the underlying bash behavior).
+  set +e
+  run_ticket "$candidate"
+  local ticket_rc=$?
+  set -e
+  if [ "$ticket_rc" -eq 0 ]; then
     log "Completed #$n."
   else
     log "Failed #$n; marked needs-human."
@@ -304,6 +323,10 @@ release_ticket() {
   gh issue edit "$1" --repo "$REPO" --remove-label "$LOCK_LABEL" >/dev/null 2>&1 || true
 }
 
+close_ticket_issue() {
+  gh issue close "$1" --repo "$REPO" >/dev/null 2>&1 || true
+}
+
 flag_needs_human() {
   local n="$1" reason="$2" attach="${3:-}"
   gh issue edit "$n" --repo "$REPO" --add-label "needs-human" \
@@ -319,7 +342,19 @@ flag_needs_human() {
 }
 
 # Full per-ticket loop: worktree -> agent -> PR -> (CI + codex) -> [re-agent] -> merge.
-run_ticket() {
+# A subshell (parens, not braces): its ERR trap below only needs to guarantee
+# THIS ticket's cleanup runs and THIS ticket ends in needs-human -- it must
+# not be able to kill the whole worker process out from under the other
+# tickets it still has to process. Requires the call site to invoke this as a
+# bare statement (see run_one_cycle) -- calling it as an if/&&/||/! test
+# would suppress -e/the trap for its entire execution regardless of this
+# subshell.
+run_ticket() (
+  # -E (errtrace): without it, the ERR trap below only fires for commands
+  # written directly in this function's own body, not for failures inside the
+  # helpers it calls (build_feedback_bundle, run_reviewer, etc.) -- which is
+  # most of what actually runs here.
+  set -Ee
   local candidate="$1"
   local n title body_file slug branch worktree root tier complexity priority
   n="$(jq -r '.number' <<<"$candidate")"
@@ -343,8 +378,15 @@ run_ticket() {
         git worktree remove --force "'"$worktree"'" 2>/dev/null || true; \
         rm -rf "'"$tmpdir"'" "'"$body_file"'"' ERR
 
-  # Sub-branch from source_branch (freshly fetched). Force to origin state so
-  # workers pick up sibling tickets already merged into the epic branch.
+  # Fetch fresh per ticket, not once per process: sibling tickets merge into
+  # source_branch as this worker (and others) complete them, so a fetch done
+  # only at process startup would go stale after the very first ticket and
+  # every later worktree would branch from a snapshot that predates its
+  # siblings' merged work.
+  git fetch origin "$SOURCE_BRANCH" >/dev/null 2>&1 || log "Warning: could not fetch origin/$SOURCE_BRANCH"
+
+  # Sub-branch from source_branch (freshly fetched above). Force to origin
+  # state so workers pick up sibling tickets already merged into the epic branch.
   git worktree add --detach "$worktree" "origin/$SOURCE_BRANCH" >/dev/null 2>&1 \
     || { flag_needs_human "$n" "worktree add failed" ""; cleanup_ticket_state "$worktree" "$body_file" "$tmpdir"; return 1; }
   git -C "$worktree" switch -c "$branch" >/dev/null 2>&1 \
@@ -403,6 +445,11 @@ run_ticket() {
         cleanup_ticket_state "$worktree" "$body_file" "$tmpdir"
         return 1
       fi
+      # The PR targets the epic branch, not the repo's default branch, so
+      # GitHub ignores "Closes #n" entirely (closing keywords only take effect
+      # against the default branch) -- close the ticket issue explicitly so
+      # dependents relying on "Depends on: #n" -> closed can unblock.
+      close_ticket_issue "$n"
       release_ticket "$n"
       cleanup_ticket_state "$worktree" "$body_file" "$tmpdir"
       return 0
@@ -430,7 +477,7 @@ run_ticket() {
     fi
     # Loop back: re-wait CI, re-review, re-decide.
   done
-}
+)
 
 cleanup_ticket_state() {
   local worktree="$1" body_file="$2" tmpdir="$3"
@@ -464,7 +511,10 @@ invoke_agent() {
 open_pr() {
   local n="$1" title="$2" branch="$3"
   local pr_body
-  pr_body=$'Closes #'"$n"$'\n\nOpened by execute-tickets.sh (worker '"$WORKER"$').'
+  # NOT "Closes #n": this PR targets the epic branch, not the repo's default
+  # branch, so GitHub ignores closing keywords here. The executor closes the
+  # ticket issue explicitly on merge (see close_ticket_issue).
+  pr_body=$'Ticket: #'"$n"$'\n\nOpened by execute-tickets.sh (worker '"$WORKER"$').'
   local url
   url="$(gh pr create --repo "$REPO" --base "$SOURCE_BRANCH" --head "$branch" \
           --title "$title" --body "$pr_body" 2>/dev/null)" || return 1
@@ -474,10 +524,13 @@ open_pr() {
 ensure_branch_pushed() {
   local worktree="$1" branch="$2"
   # Prefer whatever the agent already pushed; otherwise push on its behalf.
+  # Propagate the real push exit status either way -- swallowing a failed
+  # push here would let the caller believe new commits reached origin when
+  # they didn't, silently re-reviewing/merging a stale PR head.
   if git -C "$worktree" rev-parse --verify --quiet "origin/$branch" >/dev/null 2>&1; then
     # Also push any newer local commits (agent may have committed after last push).
-    git -C "$worktree" push origin "$branch" >/dev/null 2>&1 || true
-    return 0
+    git -C "$worktree" push origin "$branch" >/dev/null 2>&1
+    return $?
   fi
   git -C "$worktree" push -u origin "$branch" >/dev/null 2>&1
 }
