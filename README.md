@@ -62,9 +62,16 @@ Skills the coding agent reaches for while working.
 | [`ship-ready-pr-loop`](skills/coding/ship-ready-pr-loop/SKILL.md) | Drives a change from review findings to a ship-ready PR: fixes Critical/Major issues, then loops Greptile until it reaches 5/5. |
 | [`optimize-agents-md`](skills/coding/optimize-agents-md/SKILL.md) | Audits and patches a repo's AGENTS.md for a fast, safe SDLC — reinforcing TDD, brainstorming, verification, and subagent dispatch — generating one from scratch only if none exists, and keeps CLAUDE.md as a one-line pointer to it. |
 | [`git-merge-origin-main`](skills/coding/git-merge-origin-main/SKILL.md) | Safely merges the latest `origin/main` into the current non-main branch, with hard stops for dirty working trees, in-progress Git operations, detached HEAD, and conflicts. |
-| [`plan-to-tickets`](skills/coding/plan-to-tickets/SKILL.md) | Turns a superpowers spec + implementation plan into a GitHub backlog — an epic issue plus complexity/model-tier/priority/dependency-tagged ticket sub-issues for independent workers to pick up. Idempotent, with a `--dry-run` preview gate before anything is filed. |
-| [`execute-tickets`](skills/coding/execute-tickets/SKILL.md) | Picks up a plan-to-tickets backlog, drives each ready ticket through agent + codex review + CI verification, and merges the PR back to the plan's epic branch. Runs as up to 10 named concurrent workers (`alice`–`justin`) with per-slot `lock:<name>` labels. |
-| [`epic-manager`](skills/coding/epic-manager/SKILL.md) | Supervises a plan-to-tickets epic end-to-end: tracks executor progress, gates the epic→`main` PR behind a per-project hybrid checklist (run: shell + judge: codex), runs a final integration review, and obeys human commands (`ship it` / `rework:` / `abandon`) posted as comments on the epic issue. Singleton, cron-friendly, communicates through GitHub state only. |
+
+### Delivery pipeline
+
+Turn a plan into a live GitHub backlog and drive it to done.
+
+| Skill | What it does |
+|-------|--------------|
+| [`plan-to-tickets`](skills/delivery-pipeline/plan-to-tickets/SKILL.md) | Turns a superpowers spec + implementation plan into a GitHub backlog — an epic issue plus complexity/model-tier/priority/dependency-tagged ticket sub-issues for independent workers to pick up. Idempotent, with a `--dry-run` preview gate before anything is filed. |
+| [`execute-tickets`](skills/delivery-pipeline/execute-tickets/SKILL.md) | Picks up a plan-to-tickets backlog, drives each ready ticket through agent + codex review + CI verification, and merges the PR back to the plan's epic branch. Runs as up to 10 named concurrent workers (`alice`–`justin`) with per-slot `lock:<name>` labels. |
+| [`epic-manager`](skills/delivery-pipeline/epic-manager/SKILL.md) | Supervises a plan-to-tickets epic end-to-end: tracks executor progress, gates the epic→`main` PR behind a per-project hybrid checklist (run: shell + judge: codex), runs a final integration review, and obeys human commands (`ship it` / `rework:` / `abandon`) posted as comments on the epic issue. Singleton, cron-friendly, communicates through GitHub state only. |
 
 ### DevOps
 
@@ -89,7 +96,7 @@ agent-skills/
             └── references/    # Optional supporting files the skill loads on demand
 ```
 
-Skills are organized into **category directories** under `skills/` — currently `cto-toolkit/`, `productivity/`, `coding/`, and `devops/`. Each skill lives in its own `<skill-name>/` directory inside a category and is defined by a single `SKILL.md` file with YAML frontmatter (`name`, `description`, optional `metadata`) followed by the instructions the agent should follow when the skill triggers.
+Skills are organized into **category directories** under `skills/` — currently `cto-toolkit/`, `productivity/`, `coding/`, `delivery-pipeline/`, and `devops/`. Each skill lives in its own `<skill-name>/` directory inside a category and is defined by a single `SKILL.md` file with YAML frontmatter (`name`, `description`, optional `metadata`) followed by the instructions the agent should follow when the skill triggers.
 
 The category directories **mirror the groupings in `skills.sh.json`** — that file remains the source of truth for how skills are grouped and ordered on the skills.sh page; the folders just make the same taxonomy visible when browsing the repo. Keep the two in sync: a skill's directory should sit under the category whose grouping lists it. Note that nothing tooling-side enforces this — the skills.sh CLI and the `--skill` flag resolve skills by their frontmatter `name`, not their path, so the category folder is purely organizational.
 
@@ -97,7 +104,7 @@ The category directories **mirror the groupings in `skills.sh.json`** — that f
 
 Each skill is a directory under a category in `skills/` containing a single `SKILL.md`: YAML frontmatter followed by the Markdown instructions the agent follows when the skill triggers.
 
-1. **Pick a category** under `skills/` (`cto-toolkit/`, `productivity/`, `coding/`, or `devops/`) — or add a new one if none fit, and create a matching grouping in `skills.sh.json` (step 6). **Create the file** `skills/<category>/<skill-name>/SKILL.md`. Use a short, hyphenated `<skill-name>` (e.g. `codebase-audit`); it must match the `name` in the frontmatter.
+1. **Pick a category** under `skills/` (`cto-toolkit/`, `productivity/`, `coding/`, `delivery-pipeline/`, or `devops/`) — or add a new one if none fit, and create a matching grouping in `skills.sh.json` (step 6). **Create the file** `skills/<category>/<skill-name>/SKILL.md`. Use a short, hyphenated `<skill-name>` (e.g. `codebase-audit`); it must match the `name` in the frontmatter.
 2. **Write the frontmatter.** `name` and `description` are required; `metadata` is optional but recommended:
 
    ```yaml

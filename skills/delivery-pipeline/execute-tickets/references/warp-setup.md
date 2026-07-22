@@ -111,7 +111,7 @@ for W in alice bob carol dave eve frank gordon hank isaac justin; do
     --name "execute-tickets-$W" \
     --cron "*/10 * * * *" \
     --environment "$ENV_ID" \
-    --prompt "Run this exact command and report its exit code and output: skills/coding/execute-tickets/scripts/execute-tickets.sh --worker $W --plan <plan-slug> --once"
+    --prompt "Run this exact command and report its exit code and output: skills/delivery-pipeline/execute-tickets/scripts/execute-tickets.sh --worker $W --plan <plan-slug> --once"
 done
 ```
 

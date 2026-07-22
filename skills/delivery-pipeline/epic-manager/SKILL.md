@@ -229,7 +229,7 @@ held with a "waiting on #N, #M to finish" comment rather than executed.
 ### 1. Dry-run first
 
 ```bash
-skills/coding/epic-manager/scripts/epic-manager.sh \
+skills/delivery-pipeline/epic-manager/scripts/epic-manager.sh \
   --plan <plan-slug> \
   --dry-run
 ```
@@ -242,7 +242,7 @@ epic and the ticket state the way you expect before going live.
 ### 2. Run on cron (`--once` per firing)
 
 ```bash
-skills/coding/epic-manager/scripts/epic-manager.sh \
+skills/delivery-pipeline/epic-manager/scripts/epic-manager.sh \
   --plan <plan-slug> --repo <owner/repo> --once
 ```
 

@@ -31,7 +31,13 @@
         "codex-review",
         "ship-ready-pr-loop",
         "optimize-agents-md",
-        "git-merge-origin-main",
+        "git-merge-origin-main"
+      ]
+    },
+    {
+      "title": "Delivery pipeline",
+      "description": "Turn a plan into a live GitHub backlog and drive it to done: file complexity/priority-tagged tickets from a spec+plan, execute them with concurrent workers through review and CI, and supervise the epic end-to-end to a mergeable PR.",
+      "skills": [
         "plan-to-tickets",
         "execute-tickets",
         "epic-manager"

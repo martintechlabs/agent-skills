@@ -202,7 +202,7 @@ Missing or invalid `model-tier` on a ticket → `needs-human` (no silent fallbac
 ### Scaffold with Claude defaults
 
 ```bash
-skills/coding/execute-tickets/scripts/init-agents.sh
+skills/delivery-pipeline/execute-tickets/scripts/init-agents.sh
 # optional: --repo-root <path>  --force  --dry-run
 ```
 
@@ -258,7 +258,7 @@ reviewer both need to read them.
 If `.execute-tickets/agents.yml` is missing:
 
 ```bash
-skills/coding/execute-tickets/scripts/init-agents.sh
+skills/delivery-pipeline/execute-tickets/scripts/init-agents.sh
 ```
 
 Edit the four tier commands (Claude defaults ship in the template; replace with
@@ -275,7 +275,7 @@ For a one-off process that ignores YAML, pass `--agent-cmd` instead.
 ### 3. Dry-run one worker first
 
 ```bash
-skills/coding/execute-tickets/scripts/execute-tickets.sh \
+skills/delivery-pipeline/execute-tickets/scripts/execute-tickets.sh \
   --worker alice --plan <plan-slug> \
   --dry-run --once
 ```
@@ -290,7 +290,7 @@ going live.
 
 ```bash
 for W in alice bob carol dave eve frank gordon hank isaac justin; do
-  skills/coding/execute-tickets/scripts/execute-tickets.sh \
+  skills/delivery-pipeline/execute-tickets/scripts/execute-tickets.sh \
     --worker "$W" --plan <plan-slug> \
     > "logs/executor-${W}.log" 2>&1 &
 done
