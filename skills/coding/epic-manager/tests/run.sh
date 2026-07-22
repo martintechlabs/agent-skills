@@ -185,3 +185,55 @@ test_checklist_malformed() {
   rm -rf "$d"
 }
 test_checklist_malformed
+
+# ---- Task 6 tests: epic PR creation + final review ----
+
+setup_drained_epic() {
+  local d="$1"
+  make_repo "$d" test-plan
+  local epic_body="<!-- plan-to-tickets:epic:docs/superpowers/plans/test-plan.md -->"
+  local epic; epic="$(issue_json 100 'Epic' "$epic_body" '[]')"
+  local t101; t101="$(issue_json 101 'T1' '<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->' '[]')"
+  seed_state "$d/state" "[$epic,$t101]"
+  jq '.issues["101"].state = "closed"' "$d/state" > "$d/state.tmp" && mv "$d/state.tmp" "$d/state"
+}
+
+test_epic_pr_opens() {
+  local d; d="$(mktemp -d)"
+  setup_drained_epic "$d"
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" FAKE_GH_LOG="$d/gh.log" \
+    FAKE_CODEX_REVIEW_JSON='{"findings":[],"overall_correctness":"patch is correct","overall_explanation":"ok","overall_confidence_score":0.9}' \
+    -- --plan test-plan --once
+  assert_file_contains "$d/gh.log" "pr create" "opened an epic PR"
+  assert_file_contains "$d/gh.log" "--base main" "PR targets main"
+  assert_file_contains "$d/gh.log" "--head epic" "PR head is the epic branch"
+  rm -rf "$d"
+}
+test_epic_pr_opens
+
+test_epic_pr_idempotent() {
+  local d; d="$(mktemp -d)"
+  setup_drained_epic "$d"
+  # Pre-seed an open PR epic->main.
+  jq '.prs["1"] = {number:1,title:"Epic",body:"",base:"main",head:"epic",headRefOid:"sha-1",statusCheckRollup:[],merged:false,state:"open",comments:[]} | .next_pr=2' \
+    "$d/state" > "$d/state.tmp" && mv "$d/state.tmp" "$d/state"
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" FAKE_GH_LOG="$d/gh.log" \
+    FAKE_CODEX_REVIEW_JSON='{"findings":[],"overall_correctness":"patch is correct","overall_explanation":"ok","overall_confidence_score":0.9}' \
+    -- --plan test-plan --once
+  local create_count; create_count="$(grep -c 'pr create' "$d/gh.log" 2>/dev/null || true)"
+  assert_eq "$create_count" "0" "does not create a duplicate epic PR"
+  rm -rf "$d"
+}
+test_epic_pr_idempotent
+
+test_final_review_posts_findings() {
+  local d; d="$(mktemp -d)"
+  setup_drained_epic "$d"
+  local blocking='{"findings":[{"title":"Integration gap","body":"X and Y not wired","confidence_score":0.9,"priority":0,"code_location":{"absolute_file_path":"a","line_range":{"start":1,"end":2}}}],"overall_correctness":"patch is incorrect","overall_explanation":"gap","overall_confidence_score":0.9}'
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" FAKE_GH_LOG="$d/gh.log" \
+    FAKE_CODEX_REVIEW_JSON="$blocking" -- --plan test-plan --once
+  assert_file_contains "$d/gh.log" "Integration gap" "final review finding posted"
+  assert_file_contains "$d/gh.log" "review-blocked" "blocking finding flagged loudly"
+  rm -rf "$d"
+}
+test_final_review_posts_findings

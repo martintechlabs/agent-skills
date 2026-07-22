@@ -259,7 +259,17 @@ run_one_cycle() {
     rm -rf "$tmpdir"
     return 0   # failure already posted + labeled; not an error exit
   fi
-  # Epic PR + final review + commands implemented in later tasks.
+  local pr_number
+  pr_number="$(open_or_find_epic_pr)" || { log "Failed to open/find epic PR."; release_lock; rm -rf "$tmpdir"; return 1; }
+  vlog "epic PR: #$pr_number"
+  local review_json="$tmpdir/final-review.json"
+  if run_final_review "$pr_number" "$review_json" "$tmpdir"; then
+    post_final_review_comment "$pr_number" "$review_json"
+  else
+    log "Final review failed; posting a note."
+    gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "⚠️ Final integration review failed to run. Review the PR manually: #$pr_number" >/dev/null 2>&1 || true
+  fi
+  # Command parsing implemented in Task 7.
   release_lock
   rm -rf "$tmpdir"
   return 0
@@ -475,6 +485,104 @@ post_checklist_failure() {
   } > "$body_file"
   gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body-file "$body_file" >/dev/null 2>&1 || true
   gh issue edit "$EPIC_NUMBER" --repo "$REPO" --add-label "needs-human" --add-label "checklist-failed" >/dev/null 2>&1 || true
+  rm -f "$body_file"
+}
+
+open_or_find_epic_pr() {
+  # Idempotent: return the number of an existing open epic PR, or create one.
+  local existing
+  existing="$(gh pr list --repo "$REPO" --state open --base main --head "$SOURCE_BRANCH" \
+              --json number -q '.[0].number' 2>/dev/null || true)"
+  # "null" or empty means no existing PR.
+  if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+    vlog "epic PR #$existing already open; reusing."
+    printf '%s' "$existing"
+    return 0
+  fi
+  local body_file; body_file="$(mktemp)"
+  {
+    echo "## Epic: $PLAN_SLUG"
+    echo
+    echo "This PR collects all ticket work merged into \`$SOURCE_BRANCH\` by execute-tickets."
+    echo
+    echo "### Reviewer model"
+    echo
+    echo "\`$(reviewer_model)\` ran the final integration review (see comment below)."
+    echo
+    echo "### Tickets in this epic"
+    echo
+    echo "See the epic issue #$EPIC_NUMBER for the full audit trail."
+    echo
+    echo "Closes #$EPIC_NUMBER"
+  } > "$body_file"
+  local url
+  url="$(gh pr create --repo "$REPO" --base main --head "$SOURCE_BRANCH" \
+          --title "Epic: $PLAN_SLUG" --body-file "$body_file" 2>/dev/null)" || return 1
+  basename "$url"
+  rm -f "$body_file"
+}
+
+run_final_review() {
+  local pr="$1" review_json="$2" tmpdir="$3"
+  local head_sha diff_file prompt_composed
+  head_sha="$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q .headRefOid 2>/dev/null || echo "")"
+  diff_file="$tmpdir/epic.diff"
+  gh pr diff "$pr" --repo "$REPO" > "$diff_file" 2>/dev/null || true
+  prompt_composed="$tmpdir/review-prompt.md"
+  {
+    cat "$FINAL_REVIEW_PROMPT"
+    echo
+    echo "## Spec file: $SPEC_FILE"
+    echo "## Plan file: $PLAN_FILE"
+    echo
+    echo "## Full epic diff (PR #$pr, head $head_sha)"
+    echo
+    echo '```diff'
+    cat "$diff_file"
+    echo '```'
+  } > "$prompt_composed"
+  local cmd
+  cmd="$(render_cmd "$REVIEWER_CMD" \
+    final_review_schema "$FINAL_REVIEW_SCHEMA" \
+    final_review_output "$review_json" \
+    final_review_prompt_composed "$prompt_composed")"
+  vlog "reviewer cmd: $cmd"
+  ( bash -c "$cmd" ) || return 1
+  [ -s "$review_json" ] || return 1
+  jq -e . "$review_json" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+post_final_review_comment() {
+  local pr="$1" review_json="$2"
+  local verdict conf explanation findings_count blocking_findings blocking_count body_file
+  verdict="$(jq -r '.overall_correctness // "unknown"' "$review_json" 2>/dev/null || echo unknown)"
+  conf="$(jq -r '.overall_confidence_score // "unknown"' "$review_json" 2>/dev/null || echo unknown)"
+  explanation="$(jq -r '.overall_explanation // ""' "$review_json" 2>/dev/null || true)"
+  findings_count="$(jq '(.findings // []) | length' "$review_json" 2>/dev/null || echo 0)"
+  blocking_findings="$(jq --argjson maxp "$BLOCK_PRIORITY_MAX" '[.findings[] | select(.priority <= $maxp)]' "$review_json" 2>/dev/null || echo '[]')"
+  blocking_count="$(jq 'length' <<<"$blocking_findings" 2>/dev/null || echo 0)"
+  body_file="$(mktemp)"
+  {
+    if [ "$blocking_count" -gt 0 ]; then
+      echo "### 🛑 review-blocked — final integration review found $blocking_count blocking finding(s)"
+    else
+      echo "### ✅ Final integration review"
+    fi
+    echo
+    echo "**Verdict**: $verdict (confidence $conf)"
+    echo "**Findings**: $findings_count ($blocking_count blocking)"
+    echo
+    [ -n "$explanation" ] && echo "> $explanation"
+    if [ "$findings_count" -gt 0 ]; then
+      echo
+      jq -r '.findings[] | "- P\(.priority) [conf \(.confidence_score)] **\(.title)** — \(.body)"' "$review_json" 2>/dev/null || true
+    fi
+    echo
+    echo "This review is advisory. Merge with \`ship it\`, file changes with \`rework:\`, or \`abandon\`."
+  } > "$body_file"
+  gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body-file "$body_file" >/dev/null 2>&1 || true
+  gh pr comment "$pr" --repo "$REPO" --body "Final review: $verdict ($findings_count findings, $blocking_count blocking). See epic #$EPIC_NUMBER for detail." >/dev/null 2>&1 || true
   rm -f "$body_file"
 }
 
