@@ -3,7 +3,7 @@ name: execute-tickets
 description: >-
   Pick up a plan-to-tickets backlog on GitHub, drive each ready ticket through a
   coding agent + codex code review + CI verification loop, then merge the PR back
-  to the plan's epic branch. Runs as up to 4 concurrent worker processes per
+  to the plan's epic branch. Runs as up to 10 concurrent worker processes per
   repo; each worker claims tickets via a per-slot lock label, sub-branches from
   the epic branch, invokes a user-supplied `--agent-cmd`, runs `codex exec`
   against the PR with a vendored review schema + prompt, blocks merge on codex
@@ -12,10 +12,10 @@ description: >-
   backlog and wants tickets executed end-to-end (agent -> review -> merge), when
   they ask to run/dispatch/execute a ticket backlog, or when they want the codex
   review loop wired to a ticket queue. Never coordinates across plans or repos,
-  never merges the epic itself, and hard-caps at 4 workers per repo.
+  never merges the epic itself, and hard-caps at 10 workers per repo.
 metadata:
   author: stephen-martin
-  version: "0.4.0"
+  version: "0.5.0"
 ---
 
 # Execute a plan-to-tickets backlog end-to-end
@@ -27,10 +27,11 @@ from the epic branch, invoke a user-supplied coding agent, open a PR, wait for
 CI, run codex code review, feed blocking findings back to the agent, and merge
 once the review is clean and CI is green.
 
-Designed to run as up to **4 concurrent worker processes per repo**, each with
-a distinct `--worker` slot ID (`1..4`) that becomes its lock label (`lock:N`).
-The 4-slot cap is a hard limit — beyond that the label mutex stops being a
-useful mental model.
+Designed to run as up to **10 concurrent worker processes per repo**, each
+with a distinct `--worker` name (`alice`, `bob`, `carol`, `dave`, `eve`,
+`frank`, `gordon`, `hank`, `isaac`, `justin`) that becomes its lock label
+(`lock:<name>`). The 10-slot cap is a hard limit — beyond that the label
+mutex stops being a useful mental model.
 
 This skill never merges the epic PR itself, never retries a `needs-human`
 ticket automatically, and never coordinates across plans or repos.
@@ -78,11 +79,11 @@ error, which is a real signal that the plan's decomposition was too coarse.
 
 For each ticket picked up:
 
-1. **Claim** — add `lock:N` label, verify no other `lock:*` label is present.
+1. **Claim** — add `lock:<name>` label, verify no other `lock:*` label is present.
    If a race is detected, release and pick another.
 2. **Worktree** — `git worktree add --detach <path> origin/<source_branch>`,
    then `git switch -c ticket/<n>-<slug>`. Worktree path includes the worker ID
-   so 4 workers never collide on disk.
+   so all 10 workers never collide on disk.
 3. **Agent, iteration 1** — invoke `--agent-cmd` with all substitution tokens.
    Agent commits on the ticket branch. If it forgot to push, executor pushes.
 4. **Open PR** — `gh pr create --base <source_branch> --head <branch> \
@@ -228,7 +229,7 @@ Compose one shell command that:
 
 ```bash
 skills/coding/execute-tickets/scripts/execute-tickets.sh \
-  --worker 1 --plan <plan-slug> \
+  --worker alice --plan <plan-slug> \
   --agent-cmd '<your command>' \
   --dry-run --once
 ```
@@ -238,10 +239,10 @@ the fully-rendered agent + reviewer commands. Nothing is claimed, no worktree
 is created, no agent or codex call is made. Fix wrong tokens or manifests
 before going live.
 
-### 4. Launch up to 4 workers
+### 4. Launch up to 10 workers
 
 ```bash
-for W in 1 2 3 4; do
+for W in alice bob carol dave eve frank gordon hank isaac justin; do
   skills/coding/execute-tickets/scripts/execute-tickets.sh \
     --worker "$W" --plan <plan-slug> \
     --agent-cmd '<your command>' \
@@ -250,12 +251,15 @@ done
 wait
 ```
 
+(Only launch as many of the 10 names as you actually want running — the
+list is a cap, not a requirement to always use all 10.)
+
 Each worker loops: pick highest-priority ready ticket → claim → run the per-ticket
 loop above → release the lock (on merge) or set `needs-human` (on failure). If
 no ticket is ready (all locked, all blocked by open dependencies, or backlog
 empty), the worker sleeps `--poll` seconds (default 30) and tries again.
 `--once` runs a single pick + full ticket loop and exits — useful for cron.
-See `WARP.md` in this directory for running the 4-worker pattern as separate
+See `WARP.md` in this directory for running the 10-worker pattern as separate
 Warp scheduled agents instead of a long-running daemon.
 
 A ticket is "ready" when: (a) its body carries this plan's ticket marker, (b)
@@ -265,8 +269,9 @@ closed. The executor explicitly closes a ticket's issue on merge (step 8 of
 the per-ticket loop), which unblocks dependents on the next poll — no
 scheduler needed.
 
-Do not run more than 4 workers against the same repo without extending the
-lock label set. The script hard-caps `--worker` at 4 by design.
+Do not run more than 10 workers against the same repo without extending the
+`WORKER_NAMES` list in the script. The script hard-caps `--worker` at these
+10 names by design.
 
 ### 5. Handle `needs-human` tickets
 
@@ -306,7 +311,7 @@ ticket output.
 
 | Flag | Effect |
 |--|--|
-| `--worker <N>` | Worker slot ID, 1..4 (required). Becomes lock label `lock:N`. |
+| `--worker <name>` | Worker identity, case-insensitive (required). One of: alice, bob, carol, dave, eve, frank, gordon, hank, isaac, justin. Becomes lock label `lock:<name>`. |
 | `--plan <slug>` | Plan slug: basename of `docs/superpowers/tickets/<slug>.md` (required). |
 | `--agent-cmd <cmd>` | Shell command to run per ticket, with `{token}` substitutions (required). |
 | `--repo <owner/repo>` | Target repo (default: current repo via `gh repo view`). |
@@ -329,6 +334,6 @@ ticket output.
 - **Retry `needs-human` tickets.** All failures require human triage.
 - **Map model tiers to concrete models.** That's `--agent-cmd`'s job.
 - **Coordinate across plans or repos.** One invocation, one plan, one repo.
-- **Scale past 4 workers per repo.** The 4-slot lock label set is the cap.
+- **Scale past 10 workers per repo.** The 10-name lock label set is the cap.
 - **Auto-merge PRs before codex says the patch is correct.** `overall_correctness`
   is a hard gate, even without matching high-priority findings.
