@@ -14,15 +14,19 @@ REVIEWER_CMD=""
 FINAL_REVIEW_SCHEMA=""
 FINAL_REVIEW_PROMPT=""
 BLOCK_PRIORITY_MAX=1
+AUTO_REWORK_PRIORITY_MAX=2
 POLL_SECONDS=300
 STALE_LOCK_THRESHOLD=3600
+MAX_AUTO_REWORK_ROUNDS=5
 ONCE=false
 DRY_RUN=false
 VERBOSE=true
+HUMAN_ACTED_THIS_CYCLE=false
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOCK_LABEL="lock:manager"
+LOCK_ACQUIRED_AT=""
 MANIFEST_FILE=""
 SOURCE_BRANCH=""
 SPEC_FILE=""
@@ -47,7 +51,14 @@ Optional:
   --reviewer-cmd <cmd>         Final-review codex command (default: vendored).
   --final-review-schema <path> Override final-review schema (default: vendored).
   --final-review-prompt <path> Override final-review prompt (default: vendored).
-  --block-priority-max <N>     Findings at/ below this priority flagged as blocking. Default: 1.
+  --block-priority-max <N>     Findings at/ below this priority get the loud review-blocked
+                                banner (still advisory -- never gates `ship it`). Default: 1.
+  --auto-rework-priority-max <N> Findings at/below this priority trigger an auto-rework round
+                                (broader than --block-priority-max by default, so minor findings
+                                get fixed too, not just merge-blocking ones). Default: 2.
+  --max-auto-rework-rounds <N> Auto-file a rework ticket from qualifying final-review findings,
+                                up to N rounds, before escalating to needs-human. 0 disables
+                                auto-rework (old advisory-only behavior). Default: 5.
   --poll <seconds>             Sleep between cycles in loop mode. Default: 300.
   --stale-lock-threshold <sec> Force-claim lock:manager after this staleness. Default: 3600.
   --once                       Run one cycle, then exit (cron mode).
@@ -56,7 +67,7 @@ Optional:
   --help                       Show this help.
 
 Human commands (posted as comments on the epic issue, first line = trigger):
-  ship it / #shipit / 🚀 / lgtm / merge it   -> merge the epic PR (guards + CI re-verify)
+  ship it / shipit / #shipit / 🚀 / lgtm / merge it -> merge the epic PR (guards + CI re-verify)
   rework [#N]: <description>                  -> file a new ticket; codex picks metadata
   abandon                                     -> close epic PR + close epic issue (not planned)
 EOF
@@ -88,6 +99,8 @@ parse_args() {
       --final-review-schema) req_val "$@"; FINAL_REVIEW_SCHEMA="$2"; shift 2 ;;
       --final-review-prompt) req_val "$@"; FINAL_REVIEW_PROMPT="$2"; shift 2 ;;
       --block-priority-max) req_val "$@"; BLOCK_PRIORITY_MAX="$2"; shift 2 ;;
+      --auto-rework-priority-max) req_val "$@"; AUTO_REWORK_PRIORITY_MAX="$2"; shift 2 ;;
+      --max-auto-rework-rounds) req_val "$@"; MAX_AUTO_REWORK_ROUNDS="$2"; shift 2 ;;
       --poll) req_val "$@"; POLL_SECONDS="$2"; shift 2 ;;
       --stale-lock-threshold) req_val "$@"; STALE_LOCK_THRESHOLD="$2"; shift 2 ;;
       --once) ONCE=true; shift ;;
@@ -126,13 +139,37 @@ preflight() {
 ensure_labels() {
   local existing
   existing="$(gh label list --repo "$REPO" --json name -q '.[].name' 2>/dev/null || true)"
-  grep -qxF "lock:manager" <<<"$existing" && return 0
-  grep -qxF "needs-human" <<<"$existing" && return 0
   [ "$DRY_RUN" = true ] && return 0
   grep -qxF "lock:manager" <<<"$existing" || \
     gh label create "lock:manager" --repo "$REPO" --color "5319e7" --force >/dev/null 2>&1 || true
   grep -qxF "needs-human" <<<"$existing" || \
     gh label create "needs-human" --repo "$REPO" --color "d93f0b" --force >/dev/null 2>&1 || true
+  grep -qxF "auto-rework-exhausted" <<<"$existing" || \
+    gh label create "auto-rework-exhausted" --repo "$REPO" --color "b60205" --force >/dev/null 2>&1 || true
+}
+
+# Same color scheme as plan-to-tickets/scripts/create-tickets.sh's label_color().
+rework_label_color() {
+  case "$1" in
+    complexity:small) echo "0e8a16" ;;
+    complexity:medium) echo "fbca04" ;;
+    complexity:large) echo "b60205" ;;
+    priority:p1) echo "b60205" ;;
+    priority:p2) echo "d93f0b" ;;
+    priority:p3) echo "c5def5" ;;
+    model-tier:lite) echo "bfd4f2" ;;
+    model-tier:efficient) echo "1d76db" ;;
+    model-tier:standard) echo "0052cc" ;;
+    model-tier:flagship) echo "5319e7" ;;
+    *) echo "ededed" ;;
+  esac
+}
+
+ensure_rework_label() {
+  local name="$1" existing
+  existing="$(gh label list --repo "$REPO" --json name -q '.[].name' 2>/dev/null || true)"
+  grep -qxF "$name" <<<"$existing" && return 0
+  gh label create "$name" --repo "$REPO" --color "$(rework_label_color "$name")" --force >/dev/null 2>&1 || true
 }
 
 load_manifest() {
@@ -181,15 +218,17 @@ find_epic_issue() {
 # force-claimed past --stale-lock-threshold via the timestamp on the
 # lock-acquired comment marker.
 acquire_lock() {
-  # Returns 0 if acquired, 1 otherwise.
+  # Returns 0 if acquired, 1 otherwise. Does not post a comment on its own --
+  # the lock-acquired marker rides along on the next post_progress_comment
+  # call instead, so a human reading the thread gets one comment that both
+  # confirms the lock and says what the manager is about to do, rather than a
+  # bare "lock acquired" with no stated intent.
   gh issue edit "$EPIC_NUMBER" --repo "$REPO" --add-label "$LOCK_LABEL" >/dev/null 2>&1 || return 1
   local labels has_ours
   labels="$(gh issue view "$EPIC_NUMBER" --repo "$REPO" --json labels -q '[.labels[].name]' 2>/dev/null || echo '[]')"
   has_ours="$(jq --arg L "$LOCK_LABEL" 'index($L) != null' <<<"$labels")"
   [ "$has_ours" = "true" ] || return 1
-  # Record when we acquired, for stale detection by a later firing.
-  gh issue comment "$EPIC_NUMBER" --repo "$REPO" \
-    --body "<!-- manager:lock-acquired:$(date -u +%FT%TZ) -->" >/dev/null 2>&1 || true
+  LOCK_ACQUIRED_AT="$(date -u +%FT%TZ)"
   return 0
 }
 
@@ -250,7 +289,6 @@ run_one_cycle() {
   fi
   local state; state="$(reconcile_state)"
   vlog "reconciled: ready=$(jq -r '.ready|length' <<<"$state") in_progress=$(jq -r '.in_progress|length' <<<"$state") needs_human=$(jq -r '.needs_human|length' <<<"$state") closed=$(jq -r '.closed|length' <<<"$state")"
-  post_progress_comment "$state"
   local ready_count in_progress_count
   ready_count="$(jq '.ready | length' <<<"$state")"
   in_progress_count="$(jq '.in_progress | length' <<<"$state")"
@@ -258,6 +296,7 @@ run_one_cycle() {
   local pr_number=""
   if [ "$ready_count" -gt 0 ] || [ "$in_progress_count" -gt 0 ]; then
     vlog "executors still working (ready=$ready_count in_progress=$in_progress_count); parsing commands + exiting."
+    post_progress_comment "$state" "→ executors still working ($ready_count ready, $in_progress_count in progress) — nothing for the manager to do yet, checking back next cycle."
     # Parse commands every cycle so the human gets feedback even mid-execution.
     parse_and_handle_commands "" "$state" "$tmpdir"
     release_lock
@@ -265,6 +304,7 @@ run_one_cycle() {
     return 0
   fi
   vlog "backlog drained; proceeding to checklist gate."
+  post_progress_comment "$state" "→ backlog drained — running the pre-PR checklist, then opening/updating the epic PR and running the final integration review."
   if ! run_checklist "$tmpdir"; then
     release_lock
     rm -rf "$tmpdir"
@@ -280,7 +320,19 @@ run_one_cycle() {
     gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "⚠️ Final integration review failed to run. Review the PR manually: #$pr_number" >/dev/null 2>&1 || true
   fi
   # Parse + handle human commands (idempotent: skip already-processed comment ids).
+  HUMAN_ACTED_THIS_CYCLE=false
   parse_and_handle_commands "$pr_number" "$state" "$tmpdir"
+  # If the review found anything worth fixing (not just merge-blocking
+  # severity -- see AUTO_REWORK_PRIORITY_MAX) and no human command fired this
+  # cycle, try to self-heal via an automatic rework round rather than sitting
+  # idle waiting for a human to notice, or worse, shipping with known findings
+  # still open. Never overrides an explicit human command posted in this same
+  # cycle -- that always takes precedence.
+  if [ "$HUMAN_ACTED_THIS_CYCLE" != "true" ] && [ -s "$review_json" ]; then
+    local auto_rework_count
+    auto_rework_count="$(jq --argjson maxp "$AUTO_REWORK_PRIORITY_MAX" '[.findings[]? | select(.priority <= $maxp)] | length' "$review_json" 2>/dev/null || echo 0)"
+    [ "$auto_rework_count" -gt 0 ] && maybe_auto_rework "$review_json" "$tmpdir"
+  fi
   release_lock
   rm -rf "$tmpdir"
   return 0
@@ -292,8 +344,11 @@ reconcile_state() {
   local raw
   raw="$(gh issue list --repo "$REPO" --state all --limit 500 \
           --json number,title,body,labels,state 2>/dev/null || echo '[]')"
+  # `gh issue list --json state` returns "OPEN"/"CLOSED" (uppercase) -- compare
+  # case-insensitively so this doesn't silently stop matching on a gh version
+  # that changes casing again.
   jq --arg pfx "$TICKET_MARKER_PREFIX" '
-    map(select((.body // "") | contains($pfx)))
+    map(select((.body // "") | contains($pfx)) | .state |= ascii_downcase)
     | {
         ready:       [ .[] | select(.state == "open" and ((.labels//[])|map(.name)|any(startswith("lock:"))|not) and ((.labels//[])|map(.name)|index("needs-human")|not)) | .number ],
         in_progress: [ .[] | select(.state == "open" and ((.labels//[])|map(.name)|any(startswith("lock:")))) | .number ],
@@ -303,8 +358,13 @@ reconcile_state() {
   ' <<<"$raw"
 }
 
+# next_action is a plain-language statement of what this cycle is about to do
+# (or just did before this posts, for the checklist/PR/review branch -- see
+# call site). Combined with the lock-acquired marker so a human reading the
+# thread gets one comment that both confirms the lock and says what it's for,
+# instead of a bare "lock acquired" with no stated intent.
 post_progress_comment() {
-  local state="$1"
+  local state="$1" next_action="$2"
   local body_file; body_file="$(mktemp)"
   local ready_count in_progress_count needs_human_count closed_count
   ready_count="$(jq '.ready | length' <<<"$state")"
@@ -312,6 +372,8 @@ post_progress_comment() {
   needs_human_count="$(jq '.needs_human | length' <<<"$state")"
   closed_count="$(jq '.closed | length' <<<"$state")"
   {
+    echo "🔒 lock:manager acquired"
+    echo
     echo "### 📊 Plan progress"
     echo
     echo "- **Closed**: $closed_count"
@@ -327,6 +389,12 @@ post_progress_comment() {
       echo
       echo "⚠️ Needs human: $(jq -r '.needs_human | join(", ")' <<<"$state")"
     fi
+    if [ -n "$next_action" ]; then
+      echo
+      echo "$next_action"
+    fi
+    echo
+    echo "<!-- manager:lock-acquired:$LOCK_ACQUIRED_AT -->"
   } > "$body_file"
   gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body-file "$body_file" >/dev/null 2>&1 || true
   rm -f "$body_file"
@@ -606,7 +674,8 @@ detect_approval_reset() {
   if [ -n "$approved_sha" ] && [ "$approved_sha" != "$current_sha" ]; then
     gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "⚠️ diff changed since \`ship it\` (approved $approved_sha, now $current_sha). Please re-review and re-post \`ship it\`." >/dev/null 2>&1 || true
     # Update the marker to the current SHA so the next ship-it can merge.
-    gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "<!-- manager:ship-it-approved:$current_sha -->" >/dev/null 2>&1 || true
+    gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "🔁 approval reset — tracking new head $current_sha
+<!-- manager:ship-it-approved:$current_sha -->" >/dev/null 2>&1 || true
     return 0  # reset detected
   fi
   return 1  # no reset
@@ -619,28 +688,42 @@ parse_and_handle_commands() {
   local comments
   comments="$(gh issue view "$EPIC_NUMBER" --repo "$REPO" --json comments -q '.comments' 2>/dev/null || echo '[]')"
   [ "$(jq 'length' <<<"$comments" 2>/dev/null || echo 0)" -eq 0 ] && return 0
-  # Idempotency: skip comments already processed (tracked by a manager:processed marker).
+  # Idempotency: skip comments already processed. Every manager:processed marker
+  # only lists the ids that round newly saw -- union ALL such markers ever
+  # posted, not just the latest one, or ids from earlier rounds silently
+  # reappear as "unprocessed" and get reprocessed (rework comments included,
+  # which files a duplicate ticket every cycle).
   local processed
-  processed="$(jq -r '[.[] | select(.body | test("<!-- manager:processed:")) | (.body | capture("<!-- manager:processed:(?<ids>[0-9,]+) -->").ids)] | last // ""' <<<"$comments" 2>/dev/null || echo "")"
+  processed="$(jq -r '
+    [.[] | select(.body | test("<!-- manager:processed:")) | (.body | capture("<!-- manager:processed:(?<ids>[0-9,]+) -->").ids)]
+    | map(split(",")) | add // []
+    | join(",")
+  ' <<<"$comments" 2>/dev/null || echo "")"
   local new_ids=""
   while IFS= read -r cmd_obj; do
     local cid body first_line lower
-    cid="$(jq -r '.databaseId // 0' <<<"$cmd_obj")"
-    # Skip already-processed.
-    case " $processed " in *" $cid "*) continue ;; esac
+    cid="$(jq -r '(.url // "") | (capture("#issuecomment-(?<n>[0-9]+)") // {n:"0"}).n' <<<"$cmd_obj")"
+    # Skip already-processed (processed is comma-joined; compare as space-delimited tokens).
+    case " ${processed//,/ } " in *" $cid "*) continue ;; esac
     body="$(jq -r '.body' <<<"$cmd_obj")"
-    first_line="$(head -1 <<<"$body")"
+    first_line="$(head -1 <<<"$body" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     lower="$(to_lower "$first_line")"
     new_ids+="$cid,"
     vlog "command from comment #$cid: $first_line"
     case "$lower" in
-      ship\ it|"#shipit"|🚀|lgtm|merge\ it) handle_ship_it "$pr" "$state" ;;
-      rework*) handle_rework "$body" "$tmpdir" ;;
-      abandon) handle_abandon "$pr" ;;
+      ship\ it|shipit|"#shipit"|🚀|lgtm|merge\ it) HUMAN_ACTED_THIS_CYCLE=true; handle_ship_it "$pr" "$state" ;;
+      rework*) HUMAN_ACTED_THIS_CYCLE=true; handle_rework "$body" "$tmpdir" ;;
+      abandon) HUMAN_ACTED_THIS_CYCLE=true; handle_abandon "$pr" ;;
       *) vlog "  (not a recognized command; ignoring)" ;;
     esac
   done < <(jq -c '.[]' <<<"$comments" 2>/dev/null)
-  [ -n "$new_ids" ] && gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "<!-- manager:processed:${new_ids%,} -->" >/dev/null 2>&1 || true
+  # "above" would misleadingly imply spatial adjacency in the thread -- this
+  # count includes any comment that wasn't yet covered by a prior processed
+  # marker, which can include older comments posted by a step that runs after
+  # this function in the same cycle (e.g. an auto-rework filing notice), not
+  # just the ones immediately preceding this comment.
+  [ -n "$new_ids" ] && gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "✅ caught up on $(tr ',' ' ' <<<"${new_ids%,}" | wc -w | tr -d ' ') previously-unprocessed comment(s) (not necessarily all directly above -- some may be from earlier in the thread, posted by a step that runs after this check)
+<!-- manager:processed:${new_ids%,} -->" >/dev/null 2>&1 || true
 }
 
 handle_ship_it() {
@@ -675,7 +758,8 @@ handle_ship_it() {
   fi
   # Record the approved SHA (so a later diff change is detected).
   local cur_sha; cur_sha="$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q .headRefOid 2>/dev/null || echo unknown)"
-  gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "<!-- manager:ship-it-approved:$cur_sha -->" >/dev/null 2>&1 || true
+  gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "✅ ship it approved at $cur_sha
+<!-- manager:ship-it-approved:$cur_sha -->" >/dev/null 2>&1 || true
   # Merge.
   if gh pr merge "$pr" --repo "$REPO" --squash --delete-branch --auto >/dev/null 2>&1 \
      || gh pr merge "$pr" --repo "$REPO" --squash --delete-branch >/dev/null 2>&1; then
@@ -685,6 +769,118 @@ handle_ship_it() {
     gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "⚠️ ship it: merge failed on PR #$pr. Needs human." >/dev/null 2>&1 || true
     gh issue edit "$EPIC_NUMBER" --repo "$REPO" --add-label "needs-human" >/dev/null 2>&1 || true
   fi
+}
+
+# Shared by handle_rework (human-triggered) and maybe_auto_rework (findings-triggered).
+# mode is "human" or "auto:<round>/<max>" -- selects title prefix + comment phrasing only.
+# The most recent final-review comment on the epic issue, if any -- almost
+# always what a rework request (especially a terse human one like "please fix
+# those 2 issues") is actually responding to. Feeding it to codex lets the
+# expanded ticket body resolve vague references instead of parroting them.
+fetch_recent_review_context() {
+  gh issue view "$EPIC_NUMBER" --repo "$REPO" --json comments -q '
+    [.comments[] | select(.body | test("^### (🛑 review-blocked|✅ Final integration review)"))] | last // {} | .body // ""
+  ' 2>/dev/null || echo ""
+}
+
+file_rework_ticket() {
+  local desc="$1" ref="$2" marker_suffix="$3" tmpdir="$4" mode="$5"
+  # Codex expands the request into a self-contained ticket body and picks metadata.
+  local meta_json meta_prompt meta_schema cmd review_context
+  meta_json="$tmpdir/metadata-$marker_suffix.json"
+  meta_prompt="$tmpdir/metadata-prompt-$marker_suffix.md"
+  review_context="$(fetch_recent_review_context)"
+  {
+    cat "$SKILL_DIR/references/metadata-guess-prompt.md"
+    echo
+    echo "## Rework request (raw, possibly terse/vague)"
+    echo
+    echo "$desc"
+    if [ -n "$review_context" ]; then
+      echo
+      echo "## Recent context: most recent final integration review comment on the epic"
+      echo
+      echo "$review_context"
+    fi
+  } > "$meta_prompt"
+  meta_schema="$SKILL_DIR/references/metadata-guess-schema.json"
+  cmd="$(render_cmd "$REVIEWER_CMD" \
+    final_review_schema "$meta_schema" \
+    final_review_output "$meta_json" \
+    final_review_prompt_composed "$meta_prompt")"
+  ( bash -c "$cmd" ) || true
+  local priority complexity model_tier reasoning expanded_description guessed_title
+  priority="$(jq -r '.priority // "p1"' "$meta_json" 2>/dev/null || echo p1)"
+  complexity="$(jq -r '.complexity // "medium"' "$meta_json" 2>/dev/null || echo medium)"
+  model_tier="$(jq -r '.model_tier // "standard"' "$meta_json" 2>/dev/null || echo standard)"
+  reasoning="$(jq -r '.reasoning // ""' "$meta_json" 2>/dev/null || echo "")"
+  expanded_description="$(jq -r '.expanded_description // ""' "$meta_json" 2>/dev/null || echo "")"
+  guessed_title="$(jq -r '.title // ""' "$meta_json" 2>/dev/null || echo "")"
+  # gh issue create's --label rejects any label that doesn't already exist in
+  # the repo. plan-to-tickets only pre-creates labels its own decomposition
+  # actually used, so a codex-picked tier/complexity/priority absent from that
+  # set (e.g. model-tier:flagship on a repo whose real tickets never needed
+  # it) would otherwise fail issue creation silently. Ensure all three exist
+  # first, same color scheme as plan-to-tickets/scripts/create-tickets.sh.
+  ensure_rework_label "complexity:$complexity"
+  ensure_rework_label "priority:$priority"
+  ensure_rework_label "model-tier:$model_tier"
+  # File the new ticket. The executor's only view of this ticket is its body --
+  # it never sees this comment thread or the review -- so a vague raw request
+  # is not enough on its own; expanded_description is what makes it actionable.
+  local body_file; body_file="$(mktemp)"
+  local marker="<!-- plan-to-tickets:ticket:$PLAN_FILE:$marker_suffix -->"
+  local title_prefix="Rework"
+  [ "$mode" = "human" ] || title_prefix="Auto-rework"
+  # GitHub hard-rejects issue creation past 256 chars and titles can't contain
+  # newlines. desc itself is safe for human requests (a short comment line) but
+  # can be a multi-paragraph findings dump for auto-rework, so prefer codex's
+  # short title and always defensively collapse+truncate whatever's used,
+  # regardless of source.
+  local title_body="$guessed_title"
+  [ -n "$title_body" ] || title_body="$desc"
+  title_body="$(tr '\n' ' ' <<<"$title_body" | cut -c1-180)"
+  {
+    echo "## Rework request (as posted)"
+    echo
+    echo "$desc"
+    if [ -n "$expanded_description" ]; then
+      echo
+      echo "## What to do"
+      echo
+      echo "$expanded_description"
+    fi
+    [ -n "$ref" ] && echo && echo "Refines #$ref"
+    [ "$mode" = "human" ] || { echo; echo "_Filed automatically by epic-manager ($mode) from final integration review findings._"; }
+    echo
+    echo "$marker"
+  } > "$body_file"
+  local url create_err
+  create_err="$(mktemp)"
+  url="$(gh issue create --repo "$REPO" \
+          --title "$title_prefix: $title_body" \
+          --body-file "$body_file" \
+          --label "complexity:$complexity" --label "priority:$priority" --label "model-tier:$model_tier" 2>"$create_err")"
+  if [ -z "$url" ]; then
+    log "file_rework_ticket: gh issue create failed: $(cat "$create_err")"
+    local retry_hint="Please retry the \`rework:\` comment."
+    [ "$mode" = "human" ] || retry_hint="Will retry next cycle."
+    gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "⚠️ Failed to file a ticket from rework request \"$desc\": \`gh issue create\` errored ($(cat "$create_err" | tr '\n' ' ')). $retry_hint" >/dev/null 2>&1 || true
+    rm -f "$body_file" "$create_err"
+    return 1
+  fi
+  rm -f "$create_err"
+  local new_n; new_n="$(basename "$url")"
+  rm -f "$body_file"
+  local filed_note="Filed #$new_n from rework request: $desc"
+  [ "$mode" = "human" ] || filed_note="🔁 auto-filed #$new_n ($mode) from final integration review findings"
+  gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "$filed_note
+
+Codex picked: \`priority:$priority\`, \`complexity:$complexity\`, \`model-tier:$model_tier\`.
+$reasoning
+
+If this touches security or large refactors, consider \`model-tier:flagship\` / \`complexity:large\`; edit #$new_n's labels to retune before an executor picks it up." >/dev/null 2>&1 || true
+  return 0
 }
 
 handle_rework() {
@@ -699,52 +895,50 @@ handle_rework() {
   else
     return 0
   fi
-  # Codex picks metadata.
-  local meta_json meta_prompt meta_schema cmd
-  meta_json="$tmpdir/metadata.json"
-  meta_prompt="$tmpdir/metadata-prompt.md"
-  {
-    cat "$SKILL_DIR/references/metadata-guess-prompt.md"
-    echo
-    echo "## Rework description"
-    echo
-    echo "$desc"
-  } > "$meta_prompt"
-  meta_schema="$SKILL_DIR/references/metadata-guess-schema.json"
-  cmd="$(render_cmd "$REVIEWER_CMD" \
-    final_review_schema "$meta_schema" \
-    final_review_output "$meta_json" \
-    final_review_prompt_composed "$meta_prompt")"
-  ( bash -c "$cmd" ) || true
-  local priority complexity model_tier reasoning
-  priority="$(jq -r '.priority // "p1"' "$meta_json" 2>/dev/null || echo p1)"
-  complexity="$(jq -r '.complexity // "medium"' "$meta_json" 2>/dev/null || echo medium)"
-  model_tier="$(jq -r '.model_tier // "standard"' "$meta_json" 2>/dev/null || echo standard)"
-  reasoning="$(jq -r '.reasoning // ""' "$meta_json" 2>/dev/null || echo "")"
-  # File the new ticket.
-  local body_file; body_file="$(mktemp)"
-  local marker="<!-- plan-to-tickets:ticket:$PLAN_FILE:rework-$(date +%s) -->"
-  {
-    echo "## Rework request"
-    echo
-    echo "$desc"
-    [ -n "$ref" ] && echo && echo "Refines #$ref"
-    echo
-    echo "$marker"
-  } > "$body_file"
-  local url
-  url="$(gh issue create --repo "$REPO" \
-          --title "Rework: $desc" \
-          --body-file "$body_file" \
-          --label "complexity:$complexity" --label "priority:$priority" --label "model-tier:$model_tier" 2>/dev/null)" || return 1
-  local new_n; new_n="$(basename "$url")"
-  rm -f "$body_file"
-  gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "Filed #$new_n from rework request: $desc
+  file_rework_ticket "$desc" "$ref" "rework-$(date +%s)" "$tmpdir" "human"
+}
 
-Codex picked: \`priority:$priority\`, \`complexity:$complexity\`, \`model-tier:$model_tier\`.
-$reasoning
+# Counts prior auto-filed rework tickets for this plan (any state) by marker,
+# so the round cap survives across separate --once cron firings.
+count_auto_rework_rounds() {
+  local raw needle
+  raw="$(gh issue list --repo "$REPO" --state all --limit 500 --json body 2>/dev/null || echo '[]')"
+  needle="${TICKET_MARKER_PREFIX}auto-rework-"
+  jq --arg needle "$needle" '[.[] | select((.body // "") | contains($needle))] | length' <<<"$raw" 2>/dev/null || echo 0
+}
 
-If this touches security or large refactors, consider \`model-tier:flagship\` / \`complexity:large\`; edit #$new_n's labels to retune before an executor picks it up." >/dev/null 2>&1 || true
+synthesize_rework_desc_from_review() {
+  local review_json="$1"
+  jq -r --argjson maxp "$AUTO_REWORK_PRIORITY_MAX" '
+    (.overall_explanation // "") as $expl
+    | ([.findings[]? | select(.priority <= $maxp) | "- **\(.title)**: \(.body)"] | join("\n")) as $findings
+    | "Final integration review found issues worth fixing before shipping:\n\n" + $findings
+      + (if ($expl | length) > 0 then "\n\nOverall assessment: " + $expl else "" end)
+  ' "$review_json" 2>/dev/null
+}
+
+# Called when the final review finds anything at/below AUTO_REWORK_PRIORITY_MAX
+# and no human command fired this cycle. Files an automatic rework ticket from
+# the review's own findings, capped at MAX_AUTO_REWORK_ROUNDS total rounds for
+# this plan before escalating to a human -- the same "don't retry forever,
+# hand off after N" shape execute-tickets already uses for --max-iterations on
+# a single ticket. Deliberately broader than the review-blocked/BLOCK_PRIORITY_MAX
+# banner threshold: the goal is to reach `ship it` with as few open findings as
+# possible, not just to clear the ones severe enough to loudly flag.
+maybe_auto_rework() {
+  local review_json="$1" tmpdir="$2"
+  [ "$MAX_AUTO_REWORK_ROUNDS" -gt 0 ] || return 0
+  local round; round="$(count_auto_rework_rounds)"
+  if [ "$round" -ge "$MAX_AUTO_REWORK_ROUNDS" ]; then
+    gh issue edit "$EPIC_NUMBER" --repo "$REPO" --add-label "needs-human" --add-label "auto-rework-exhausted" >/dev/null 2>&1 || true
+    gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "### 🚧 auto-rework exhausted ($round/$MAX_AUTO_REWORK_ROUNDS rounds)
+
+The final integration review still finds blocking issues after $round automatic rework round(s). Escalating to a human -- review the findings above and either post \`rework: <description>\` yourself, or \`abandon\`." >/dev/null 2>&1 || true
+    return 0
+  fi
+  local desc; desc="$(synthesize_rework_desc_from_review "$review_json")"
+  [ -n "$desc" ] || return 0
+  file_rework_ticket "$desc" "" "auto-rework-$((round+1))-$(date +%s)" "$tmpdir" "auto:$((round+1))/$MAX_AUTO_REWORK_ROUNDS"
 }
 
 handle_abandon() {

@@ -71,7 +71,7 @@ A command is a comment whose **first line** is a recognized trigger phrase
 
 | Human comment (first line) | Manager action |
 |--|--|
-| `ship it` / `#shipit` / 🚀 / `lgtm` / `merge it` | Guard (no open rework tickets, no in-progress tickets) → re-verify CI green → merge epic PR (`--squash --delete-branch --auto`) → confirm with merge SHA |
+| `ship it` / `shipit` / `#shipit` / 🚀 / `lgtm` / `merge it` | Guard (no open rework tickets, no in-progress tickets) → re-verify CI green → merge epic PR (`--squash --delete-branch --auto`) → confirm with merge SHA |
 | `rework [#N]: <description>` | Codex picks metadata (priority/complexity/model-tier) → file a new ticket with the plan marker + "Refines #N" if referenced → post filing comment with reasoning + retune hints |
 | `abandon` | Close epic PR → close epic issue as "not planned" → final summary comment |
 | *(other comments)* | Ignored — free-form discussion |
@@ -181,6 +181,35 @@ per-ticket review could catch.
 - The manager never prevents merge based on the final review. It surfaces
   findings; the human acts on them.
 
+## Auto-rework loop
+
+The final review being merely advisory doesn't mean the manager sits idle on
+findings. If no human posts `ship it` / `rework:` / `abandon` in the same
+cycle the review runs, and the review found anything at or below
+`--auto-rework-priority-max` (default `2` — broader than the `review-blocked`
+banner's `--block-priority-max`, default `1`, so minor findings get addressed
+too, not just merge-blocking ones), the manager automatically files a rework
+ticket from the review's own findings and waits for an executor to pick it up.
+
+- The auto-filed ticket body is **not** a raw dump of the findings — codex
+  expands them into a self-contained ticket (restated intent, concrete plan,
+  files to touch, done criteria) using the same `expanded_description`
+  pipeline as a human's `rework:` comment, so the executor has something
+  actually actionable regardless of who triggered it.
+- Capped at `--max-auto-rework-rounds` (default `5`, counted by prior
+  auto-filed rework tickets for this plan — survives across cron firings).
+  After the cap, the manager sets `needs-human` + `auto-rework-exhausted` and
+  stops trying — the same "retry N times, then hand off" shape
+  `execute-tickets` already uses for a single ticket's review-fix loop.
+  `--max-auto-rework-rounds 0` disables auto-rework entirely (old
+  advisory-only behavior: findings post, nothing auto-files).
+- An explicit human command in the same cycle always wins — auto-rework never
+  fires on top of a `rework:`/`ship it`/`abandon` the manager just processed.
+- This does **not** change the ship-it gate itself: `ship it` still isn't
+  blocked by open findings structurally. The loop exists so that, in the
+  common case, the findings are already gone by the time a human looks —
+  fewer things for the human's `ship it` to be a judgment call about.
+
 ## Approval-reset invariant
 
 Any merge into the epic branch **after** a `ship it` invalidates that
@@ -251,10 +280,13 @@ gh issue list --repo <owner/repo> --label needs-human --state open
 ```
 
 The manager sets `needs-human` on the **epic issue** when: the checklist fails,
-the final review finds blocking issues (informational — you can still ship),
-the merge fails, or there are `needs-human` tickets blocking the plan. The
-comment body explains which. Fix the issue, remove `needs-human` (and
-`checklist-failed` if present), and the next firing re-checks.
+the auto-rework loop exhausts `--max-auto-rework-rounds` still finding
+qualifying issues (also gets `auto-rework-exhausted`), the merge fails, or
+there are `needs-human` tickets blocking the plan. A blocking final review on
+its own is informational — you can still ship — and does not set
+`needs-human` by itself. The comment body explains which. Fix the issue,
+remove `needs-human` (and `checklist-failed` / `auto-rework-exhausted` if
+present), and the next firing re-checks.
 
 ## Flags (`scripts/epic-manager.sh`)
 
@@ -266,7 +298,9 @@ comment body explains which. Fix the issue, remove `needs-human` (and
 | `--reviewer-cmd <cmd>` | Final-review codex command (default: vendored). |
 | `--final-review-schema <path>` | Override final-review schema (default: vendored). |
 | `--final-review-prompt <path>` | Override final-review prompt (default: vendored). |
-| `--block-priority-max <N>` | Findings at/ below this priority flagged as blocking. Default: 1. |
+| `--block-priority-max <N>` | Findings at/below this priority get the loud `review-blocked` banner (still advisory). Default: 1. |
+| `--auto-rework-priority-max <N>` | Findings at/below this priority trigger an auto-rework round. Default: 2. |
+| `--max-auto-rework-rounds <N>` | Auto-rework rounds before escalating to `needs-human` + `auto-rework-exhausted`. `0` disables auto-rework. Default: 5. |
 | `--poll <seconds>` | Sleep between cycles in loop mode. Default: 300. |
 | `--stale-lock-threshold <seconds>` | Force-claim `lock:manager` after this staleness. Default: 3600. |
 | `--once` | Run one cycle, then exit (cron mode). |
