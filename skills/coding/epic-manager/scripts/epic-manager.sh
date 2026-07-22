@@ -225,15 +225,96 @@ run_one_cycle() {
   fi
   if [ "$DRY_RUN" = true ]; then
     log "[dry-run] would acquire lock:manager and run a cycle"
+    local state; state="$(reconcile_state)"
+    vlog "reconciled: ready=$(jq -r '.ready|length' <<<"$state") in_progress=$(jq -r '.in_progress|length' <<<"$state") needs_human=$(jq -r '.needs_human|length' <<<"$state") closed=$(jq -r '.closed|length' <<<"$state")"
+    local ready_count in_progress_count
+    ready_count="$(jq '.ready | length' <<<"$state")"
+    in_progress_count="$(jq '.in_progress | length' <<<"$state")"
+    if [ "$ready_count" -gt 0 ] || [ "$in_progress_count" -gt 0 ]; then
+      vlog "executors still working; would post progress + exit"
+    else
+      vlog "backlog drained; would proceed to checklist gate"
+    fi
     return 0
   fi
   if ! acquire_lock; then
     log "Failed to acquire lock:manager; exiting."
     return 1
   fi
-  # Body implemented in later tasks (reconcile, checklist, epic PR, commands).
+  local state; state="$(reconcile_state)"
+  vlog "reconciled: ready=$(jq -r '.ready|length' <<<"$state") in_progress=$(jq -r '.in_progress|length' <<<"$state") needs_human=$(jq -r '.needs_human|length' <<<"$state") closed=$(jq -r '.closed|length' <<<"$state")"
+  post_progress_comment "$state"
+  local ready_count in_progress_count
+  ready_count="$(jq '.ready | length' <<<"$state")"
+  in_progress_count="$(jq '.in_progress | length' <<<"$state")"
+  if [ "$ready_count" -gt 0 ] || [ "$in_progress_count" -gt 0 ]; then
+    vlog "executors still working (ready=$ready_count in_progress=$in_progress_count); exiting."
+    release_lock
+    return 0
+  fi
+  vlog "backlog drained; proceeding to checklist gate."
+  # Checklist gate + epic PR + final review + commands implemented in later tasks.
   release_lock
   return 0
+}
+
+reconcile_state() {
+  # Group all ticket issues carrying this plan's marker by lifecycle state.
+  # Prints JSON: {ready:[n], in_progress:[n], needs_human:[n], closed:[n]}
+  local raw
+  raw="$(gh issue list --repo "$REPO" --state all --limit 500 \
+          --json number,title,body,labels,state 2>/dev/null || echo '[]')"
+  jq --arg pfx "$TICKET_MARKER_PREFIX" '
+    map(select((.body // "") | contains($pfx)))
+    | {
+        ready:       [ .[] | select(.state == "open" and ((.labels//[])|map(.name)|any(startswith("lock:"))|not) and ((.labels//[])|map(.name)|index("needs-human")|not)) | .number ],
+        in_progress: [ .[] | select(.state == "open" and ((.labels//[])|map(.name)|any(startswith("lock:")))) | .number ],
+        needs_human: [ .[] | select(.state == "open" and ((.labels//[])|map(.name)|index("needs-human"))) | .number ],
+        closed:      [ .[] | select(.state == "closed") | .number ]
+      }
+  ' <<<"$raw"
+}
+
+post_progress_comment() {
+  local state="$1"
+  local body_file; body_file="$(mktemp)"
+  local ready_count in_progress_count needs_human_count closed_count
+  ready_count="$(jq '.ready | length' <<<"$state")"
+  in_progress_count="$(jq '.in_progress | length' <<<"$state")"
+  needs_human_count="$(jq '.needs_human | length' <<<"$state")"
+  closed_count="$(jq '.closed | length' <<<"$state")"
+  {
+    echo "### 📊 Plan progress"
+    echo
+    echo "- **Closed**: $closed_count"
+    echo "- **In progress**: $in_progress_count"
+    echo "- **Ready (waiting for an executor)**: $ready_count"
+    echo "- **Needs human**: $needs_human_count"
+    if [ "$in_progress_count" -gt 0 ]; then
+      echo
+      echo "In progress:"
+      worker_names_for_issues "$state" 'in_progress' | sed 's/^/- /'
+    fi
+    if [ "$needs_human_count" -gt 0 ]; then
+      echo
+      echo "⚠️ Needs human: $(jq -r '.needs_human | join(", ")' <<<"$state")"
+    fi
+  } > "$body_file"
+  gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body-file "$body_file" >/dev/null 2>&1 || true
+  rm -f "$body_file"
+}
+
+# worker_names_for_issues <state_json> <key> -> prints "#N (alice)" lines
+# Reads each issue's lock:<name> label to name the worker.
+worker_names_for_issues() {
+  local state="$1" key="$2" nums n labels worker
+  nums="$(jq -r --arg k "$key" '.[$k][]' <<<"$state")"
+  for n in $nums; do
+    labels="$(gh issue view "$n" --repo "$REPO" --json labels -q '[.labels[].name]' 2>/dev/null || echo '[]')"
+    worker="$(jq -r '.[] | select(startswith("lock:")) | sub("^lock:";"")' <<<"$labels" | head -1)"
+    [ -n "$worker" ] && worker=" ($worker)" || worker=""
+    echo "#$n$worker"
+  done
 }
 
 # Helper: shell-quote a value for safe interpolation into a rendered command.

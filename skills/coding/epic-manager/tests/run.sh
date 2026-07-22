@@ -83,3 +83,37 @@ test_no_epic_issue_errors() {
   rm -rf "$d"
 }
 test_no_epic_issue_errors
+
+# ---- Task 4 tests: reconciliation + progress ----
+
+test_reconcile_in_progress_exits_early() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" test-plan
+  epic_body="<!-- plan-to-tickets:epic:docs/superpowers/plans/test-plan.md -->"
+  epic="$(issue_json 100 'Epic' "$epic_body" '[]')"
+  t101="$(issue_json 101 'T1' "<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->" '["lock:alice","complexity:small"]')"
+  t102="$(issue_json 102 'T2' "<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:002-b -->" '["complexity:small"]')"
+  t103="$(issue_json 103 'T3' "<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:003-c -->" '[]')"
+  seed_state "$d/state" "[$epic,$t101,$t102,$t103]"
+  jq '.issues["103"].state = "closed"' "$d/state" > "$d/state.tmp" && mv "$d/state.tmp" "$d/state"
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" FAKE_GH_LOG="$d/gh.log" -- --plan test-plan --once
+  assert_contains "$ERR" "in_progress" "detected in-progress ticket"
+  # The worker name lands in the progress comment body, which fake-gh logs.
+  assert_contains "$(cat "$d/gh.log")" "alice" "progress names the worker (alice)"
+  rm -rf "$d"
+}
+test_reconcile_in_progress_exits_early
+
+test_reconcile_drained_proceeds() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" test-plan
+  epic_body="<!-- plan-to-tickets:epic:docs/superpowers/plans/test-plan.md -->"
+  epic="$(issue_json 100 'Epic' "$epic_body" '[]')"
+  t101="$(issue_json 101 'T1' "<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->" '[]')"
+  seed_state "$d/state" "[$epic,$t101]"
+  jq '.issues["101"].state = "closed"' "$d/state" > "$d/state.tmp" && mv "$d/state.tmp" "$d/state"
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" -- --plan test-plan --dry-run
+  assert_contains "$ERR" "drained" "detected drained backlog"
+  rm -rf "$d"
+}
+test_reconcile_drained_proceeds
