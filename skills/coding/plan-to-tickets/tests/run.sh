@@ -432,7 +432,7 @@ test_manifest_skipped_on_dry_run
 
 test_skill_documents_metadata_contract() {
   local skill; skill="$(cat "$HERE/../SKILL.md")"
-  assert_contains "$skill" 'version: "0.2.0"' "skill version reflects the breaking schema change"
+  assert_contains "$skill" 'version: "0.3.0"' "skill version reflects concurrency size-gate procedure"
   assert_contains "$skill" 'git branch --show-current' "skill resolves the source branch explicitly"
   assert_contains "$skill" 'detached HEAD' "skill documents detached-HEAD handling"
   assert_contains "$skill" '"source_branch"' "skill schema requires source_branch"

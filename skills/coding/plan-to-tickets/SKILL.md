@@ -10,7 +10,7 @@ description: >-
   once the backlog exists on GitHub.
 metadata:
   author: stephen-martin
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # Turn a plan into a GitHub ticket backlog
@@ -57,6 +57,16 @@ detached HEAD, ask the user for the source branch — never emit `HEAD` or guess
 
 ### 2. Decompose plan Tasks into tickets
 
+**Objectives while building the ticket graph:**
+
+1. **Maximize concurrency** — Prefer splits along file/component seams so
+   independent tickets share no modify set and carry no false dependency edges.
+2. **Minimize merge conflicts** — Tickets that would both modify the same path
+   are not parallel-safe; serialize them with a hard dependency.
+3. **Keep tickets right-sized** — Existing merge-tiny / split-oversized /
+   small|medium rules stay in force. Concurrency is not a reason to keep
+   oversized tickets or invent `large`/`hard` complexity labels.
+
 For each Task, compute a raw signal:
 
 - **File count** touched (`Create`/`Modify`/`Test` paths under `Files:`).
@@ -67,11 +77,14 @@ For each Task, compute a raw signal:
 Classify each raw Task as tiny / right-sized / oversized, then:
 
 1. **Merge** adjacent tiny Tasks that touch the same file/component and have no
-   independent shippable value into one ticket. Never merge across unrelated
-   components merely to reduce ticket count.
-2. **Split** oversized Tasks along natural seams — the `Files:` boundary or independently
-   testable step groups. Repeat until every resulting unit fits the complexity bound
-   below.
+   independent shippable value into one ticket. Prefer merging adjacent tinies that
+   touch the **same** file (they would only serialize anyway). Never merge across
+   unrelated components merely to reduce ticket count or to force a prettier
+   parallel graph.
+2. **Split** oversized Tasks along natural seams — the `Files:` boundary or
+   independently testable step groups. Prefer the `Files:` boundary when both
+   resulting tickets stay ≤ medium and no longer share a modify set. Repeat until
+   every resulting unit fits the complexity bound below.
 3. **Classify final complexity**:
    - **small** — 1-2 files, fully spec'd/mechanical, no cross-cutting judgment.
    - **medium** — 3+ files, or integration/judgment across existing code, but still one
@@ -89,13 +102,26 @@ Classify each raw Task as tiny / right-sized / oversized, then:
 5. **Assign a model tier**: cross complexity × task-nature against
    `references/model-tiers.md` to get the `model-tier:<tier>` label. Never name a
    specific model or vendor.
-6. **Compute dependencies**: ticket B depends on ticket A when B's steps read/modify a
-   file A creates, or the plan's own ordering makes B build on A's output. Tickets with
-   no file/content overlap and no ordering requirement are independent — no dependency
-   edge between them.
-7. **Compute priority**: `p1` for tickets on the critical path or blocking multiple
-   others, `p2` for normal work, `p3` for optional/polish/cleanup work the plan or spec
-   calls out as such.
+6. **Compute dependencies** — ticket B depends on ticket A **only** when at least
+   one of the following is true:
+   - B’s steps **read or modify a file A creates**, or
+   - B’s steps **modify a file A also modifies** (same-file co-edit → hard serialize), or
+   - B’s steps **clearly consume a named output** A produces (API, type, symbol,
+     config key, or equivalent named in both scopes).
+
+   **Not** a dependency: plan list order alone; vague relatedness without a
+   file/named-output edge; shared **read** of a pre-existing file that neither ticket
+   creates and that does not couple their edits.
+
+   When same-file co-edit requires serialization, order among the shared-file set
+   follows **plan order** (the ticket whose scope appears earlier in the plan is the
+   dependency of the later one). Never leave two tickets independent if they both
+   modify the same path.
+7. **Compute priority**:
+   - **p1** — on the critical path (longest chain of hard deps) **or** blocks
+     multiple other tickets
+   - **p2** — normal parallelizable work
+   - **p3** — optional/polish/cleanup work the plan or spec calls out as such
 
 ### 3. Build the ticket-plan JSON
 
@@ -126,9 +152,31 @@ or rewrites them. `tickets` **must** be in dependency order: every
 `depends_on_slugs` entry must name a slug that appears *earlier* in the array. `repo`
 is optional (the script falls back to the current repo).
 
-### 4. Check for existing similar issues
+### 4. Size gate when ticket count > 20
 
-The script's own idempotency (step 6) only recognizes issues *this skill created itself*
+After decomposition and after the ticket-plan JSON exists, count the tickets.
+
+- If `len(tickets) ≤ 20`, skip this gate and continue to step 5.
+- If `len(tickets) > 20` (exactly 20 does **not** trip), **stop** and ask the user
+  **before** any `gh issue list`, `--dry-run`, or filing:
+
+  > This plan decomposes into **N** tickets (over 20). Proceed with N, or
+  > re-merge/split toward fewer?
+
+User outcomes:
+
+- **Proceed with N** → continue to step 5 (overlap check → dry-run preview → file).
+- **Re-merge / re-split** → revise the ticket graph and ticket-plan JSON; re-count;
+  if still `> 20`, run this gate again.
+- **Other guidance** (cap, merge specific pairs, etc.) → apply it; re-gate if still
+  `> 20`.
+
+Do **not** silently re-merge tickets to force ≤20. This gate is agent-enforced
+procedure only — the script does not enforce it.
+
+### 5. Check for existing similar issues
+
+The script's own idempotency (step 7) only recognizes issues *this skill created itself*
 — it finds them by a hidden marker comment. It has no way to notice a manually-filed
 issue, an issue from an unrelated plan, or a leftover from an earlier, differently
 decomposed run of this same plan. Before previewing, check whether anything already
@@ -146,14 +194,14 @@ Flag anything you're not sure about rather than silently deciding either way, e.
 > ⚠️ possible existing duplicate: candidate ticket "Add API endpoint for user records"
 > may overlap with existing #142 "Implement REST API for user records".
 
-Carry any flags into the preview in step 5 and have the human resolve each one
+Carry any flags into the preview in step 6 and have the human resolve each one
 explicitly: drop the candidate ticket and depend on/reference the existing issue
 instead, keep both because they're actually different pieces of work, or link them as
 related. **Never auto-skip or auto-merge a candidate based on this check alone** — it
 surfaces a decision for the human, it doesn't make one. This check only applies to
 tickets; the epic itself is already covered by its own marker-based lookup.
 
-### 5. Preview and confirm before filing anything
+### 6. Preview and confirm before filing anything
 
 Filing GitHub issues is a visible, shared-state action. Run the script in `--dry-run`
 mode against the ticket-plan JSON:
@@ -166,12 +214,15 @@ This both validates the JSON (invalid JSON, missing fields, or an out-of-order
 dependency all fail here with a clear error) and confirms exactly what would be created
 or updated. Render a human-readable table from the ticket-plan JSON itself — ticket
 title, complexity, task nature, model tier, priority, dependencies, and any possible-
-duplicate flag from step 4 — for the whole backlog (epic + every ticket), and ask the
-user to confirm. If they request changes (re-bucket a ticket, change a tier, change
-priority, drop a flagged duplicate), edit the ticket-plan JSON and re-run `--dry-run`
-before proceeding. **Do not run the script for real until the user confirms.**
+duplicate flag from step 5 — for the whole backlog (epic + every ticket), and ask the
+user to confirm. Optionally include a one-line concurrency summary (e.g. count of
+independent roots and critical-path length) so over-serialization is visible — no JSON
+schema change required for that summary. If they request changes (re-bucket a ticket,
+change a tier, change priority, drop a flagged duplicate), edit the ticket-plan JSON
+and re-run `--dry-run` before proceeding. **Do not run the script for real until the
+user confirms.**
 
-### 6. File the backlog
+### 7. File the backlog
 
 Once confirmed, run without `--dry-run`:
 
