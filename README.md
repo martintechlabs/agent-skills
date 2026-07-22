@@ -63,6 +63,8 @@ Skills the coding agent reaches for while working.
 | [`optimize-agents-md`](skills/coding/optimize-agents-md/SKILL.md) | Audits and patches a repo's AGENTS.md for a fast, safe SDLC — reinforcing TDD, brainstorming, verification, and subagent dispatch — generating one from scratch only if none exists, and keeps CLAUDE.md as a one-line pointer to it. |
 | [`git-merge-origin-main`](skills/coding/git-merge-origin-main/SKILL.md) | Safely merges the latest `origin/main` into the current non-main branch, with hard stops for dirty working trees, in-progress Git operations, detached HEAD, and conflicts. |
 | [`plan-to-tickets`](skills/coding/plan-to-tickets/SKILL.md) | Turns a superpowers spec + implementation plan into a GitHub backlog — an epic issue plus complexity/model-tier/priority/dependency-tagged ticket sub-issues for independent workers to pick up. Idempotent, with a `--dry-run` preview gate before anything is filed. |
+| [`execute-tickets`](skills/coding/execute-tickets/SKILL.md) | Picks up a plan-to-tickets backlog, drives each ready ticket through agent + codex review + CI verification, and merges the PR back to the plan's epic branch. Runs as up to 10 named concurrent workers (`alice`–`justin`) with per-slot `lock:<name>` labels. |
+| [`epic-manager`](skills/coding/epic-manager/SKILL.md) | Supervises a plan-to-tickets epic end-to-end: tracks executor progress, gates the epic→`main` PR behind a per-project hybrid checklist (run: shell + judge: codex), runs a final integration review, and obeys human commands (`ship it` / `rework:` / `abandon`) posted as comments on the epic issue. Singleton, cron-friendly, communicates through GitHub state only. |
 
 ### DevOps
 

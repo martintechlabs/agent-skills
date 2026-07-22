@@ -597,6 +597,21 @@ post_final_review_comment() {
   rm -f "$body_file"
 }
 
+detect_approval_reset() {
+  local pr="$1"
+  local current_sha approved_sha comments
+  current_sha="$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q .headRefOid 2>/dev/null || echo "")"
+  comments="$(gh issue view "$EPIC_NUMBER" --repo "$REPO" --json comments -q '.comments' 2>/dev/null || echo '[]')"
+  approved_sha="$(jq -r '[.[] | select(.body // "" | test("<!-- manager:ship-it-approved:")) | (.body | capture("<!-- manager:ship-it-approved:(?<sha>[^>]+) -->").sha)] | last // ""' <<<"$comments" 2>/dev/null || echo "")"
+  if [ -n "$approved_sha" ] && [ "$approved_sha" != "$current_sha" ]; then
+    gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "⚠️ diff changed since \`ship it\` (approved $approved_sha, now $current_sha). Please re-review and re-post \`ship it\`." >/dev/null 2>&1 || true
+    # Update the marker to the current SHA so the next ship-it can merge.
+    gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "<!-- manager:ship-it-approved:$current_sha -->" >/dev/null 2>&1 || true
+    return 0  # reset detected
+  fi
+  return 1  # no reset
+}
+
 to_lower() { tr '[:upper:]' '[:lower:]' <<<"$1"; }
 
 parse_and_handle_commands() {
@@ -654,6 +669,13 @@ handle_ship_it() {
     gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "⚠️ ship it held: $failing CI check(s) failing. Fix and re-post \`ship it\`." >/dev/null 2>&1 || true
     return 0
   fi
+  # Approval-reset: if the epic diff changed since the last ship-it approval, don't merge.
+  if detect_approval_reset "$pr"; then
+    return 0
+  fi
+  # Record the approved SHA (so a later diff change is detected).
+  local cur_sha; cur_sha="$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q .headRefOid 2>/dev/null || echo unknown)"
+  gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body "<!-- manager:ship-it-approved:$cur_sha -->" >/dev/null 2>&1 || true
   # Merge.
   if gh pr merge "$pr" --repo "$REPO" --squash --delete-branch --auto >/dev/null 2>&1 \
      || gh pr merge "$pr" --repo "$REPO" --squash --delete-branch >/dev/null 2>&1; then

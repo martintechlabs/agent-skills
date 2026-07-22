@@ -299,3 +299,20 @@ test_abandon_closes_pr_and_issue() {
   rm -rf "$d"
 }
 test_abandon_closes_pr_and_issue
+
+# ---- Task 8 tests: approval-reset invariant ----
+
+test_approval_reset_after_epic_merge() {
+  local d; d="$(mktemp -d)"
+  setup_drained_epic "$d"
+  # Epic PR at sha-1; ship it was recorded against sha-1; then head advanced to sha-2.
+  jq '.prs["1"] = {number:1,title:"Epic",body:"",base:"main",head:"epic",headRefOid:"sha-2",statusCheckRollup:[],merged:false,state:"open",comments:[]} | .next_pr=2 | .issues["100"].comments=[{databaseId:1,body:"ship it",createdAt:"2026-07-22T10:00:00Z"},{databaseId:2,body:"<!-- manager:ship-it-approved:sha-1 -->",createdAt:"2026-07-22T10:01:00Z"}]' \
+    "$d/state" > "$d/state.tmp" && mv "$d/state.tmp" "$d/state"
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" FAKE_GH_LOG="$d/gh.log" \
+    FAKE_CODEX_REVIEW_JSON='{"findings":[],"overall_correctness":"patch is correct","overall_explanation":"ok","overall_confidence_score":0.9}' \
+    -- --plan test-plan --once
+  assert_file_contains "$d/gh.log" "diff changed" "approval reset detected"
+  assert_not_contains "$(grep 'PR_MERGE' "$d/gh.log" 2>/dev/null || echo '')" "PR_MERGE" "no merge on stale ship it"
+  rm -rf "$d"
+}
+test_approval_reset_after_epic_merge
