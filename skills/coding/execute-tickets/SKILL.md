@@ -5,17 +5,18 @@ description: >-
   coding agent + codex code review + CI verification loop, then merge the PR back
   to the plan's epic branch. Runs as up to 10 concurrent worker processes per
   repo; each worker claims tickets via a per-slot lock label, sub-branches from
-  the epic branch, invokes a user-supplied `--agent-cmd`, runs `codex exec`
-  against the PR with a vendored review schema + prompt, blocks merge on codex
-  priority 0-1 findings and red CI checks, and feeds blocking findings back to
-  the agent for up to N iterations. Use when the user has a filed plan-to-tickets
-  backlog and wants tickets executed end-to-end (agent -> review -> merge), when
-  they ask to run/dispatch/execute a ticket backlog, or when they want the codex
-  review loop wired to a ticket queue. Never coordinates across plans or repos,
-  never merges the epic itself, and hard-caps at 10 workers per repo.
+  the epic branch, invokes per-tier commands from `.execute-tickets/agents.yml`
+  (or optional `--agent-cmd` override), runs `codex exec` against the PR with a
+  vendored review schema + prompt, blocks merge on codex priority 0-1 findings
+  and red CI checks, and feeds blocking findings back to the agent for up to N
+  iterations. Use when the user has a filed plan-to-tickets backlog and wants
+  tickets executed end-to-end (agent -> review -> merge), when they ask to
+  run/dispatch/execute a ticket backlog, or when they want the codex review loop
+  wired to a ticket queue. Never coordinates across plans or repos, never merges
+  the epic itself, and hard-caps at 10 workers per repo.
 metadata:
   author: stephen-martin
-  version: "0.5.0"
+  version: "0.6.0"
 ---
 
 # Execute a plan-to-tickets backlog end-to-end
@@ -23,7 +24,8 @@ metadata:
 Pick up the epic + ticket sub-issues filed by `plan-to-tickets` and drive each
 ready ticket all the way to a merged PR on the plan's epic branch. The bundled
 `scripts/execute-tickets.sh` does the mechanical work: claim a ticket, sub-branch
-from the epic branch, invoke a user-supplied coding agent, open a PR, wait for
+from the epic branch, invoke a coding agent (from `.execute-tickets/agents.yml`
+by model tier, or a process-wide `--agent-cmd` override), open a PR, wait for
 CI, run codex code review, feed blocking findings back to the agent, and merge
 once the review is clean and CI is green.
 
@@ -42,12 +44,14 @@ ticket automatically, and never coordinates across plans or repos.
   and the manifest `docs/superpowers/tickets/<plan-slug>.md` is committed to the
   repo (its YAML front matter carries `source_branch`, `spec_file`, `plan_file`).
 - The target is a **GitHub** repo, `gh`, `git`, `jq`, and `codex` are on PATH,
-  and `gh auth status` is green.
+  and `gh auth status` is green. When not passing `--agent-cmd`, **`yq`**
+  (mikefarah v4) is also required to load `.execute-tickets/agents.yml`.
 - Branch protection on the epic branch permits `gh pr merge` (or auto-merge is
   enabled). If the epic branch is protected against direct merges by the user
   running the executor, ticket merges will fail and land on `needs-human`.
-- The user has a coding agent CLI they want invoked per ticket. This skill does
-  not choose or ship an agent — the caller supplies `--agent-cmd`.
+- Prefer repo-local `.execute-tickets/agents.yml` (scaffold with
+  `scripts/init-agents.sh`) mapping each model tier to a shell command.
+  Pass `--agent-cmd` only to override that file for the whole worker process.
 
 If no plan slug is named, use the most recently modified manifest under
 `docs/superpowers/tickets/` and confirm it with the user before proceeding. If
@@ -84,8 +88,10 @@ For each ticket picked up:
 2. **Worktree** — `git worktree add --detach <path> origin/<source_branch>`,
    then `git switch -c ticket/<n>-<slug>`. Worktree path includes the worker ID
    so all 10 workers never collide on disk.
-3. **Agent, iteration 1** — invoke `--agent-cmd` with all substitution tokens.
-   Agent commits on the ticket branch. If it forgot to push, executor pushes.
+3. **Agent, iteration 1** — resolve the agent command (`--agent-cmd` override, or
+   the ticket's `model-tier` entry in `agents.yml`) and invoke it with all
+   substitution tokens. Agent commits on the ticket branch. If it forgot to
+   push, executor pushes.
 4. **Open PR** — `gh pr create --base <source_branch> --head <branch> \
    --body "Ticket: #<n>"`. Not `Closes #<n>`: GitHub only honors closing
    keywords when the PR targets the repo's *default* branch, and this PR
@@ -112,9 +118,9 @@ For each ticket picked up:
    itself; this is what lets dependents unblock (see "ready" below). Release
    the lock.
 9. **Red path** — assemble a feedback bundle (blocking findings + failing check
-   names + verdict explanation) into a file, re-invoke `--agent-cmd` with
-   `{review_feedback}` pointing at that file and `{iteration}` incremented.
-   Agent pushes new commits. Loop back to step 5.
+   names + verdict explanation) into a file, re-invoke the same resolved agent
+   command with `{review_feedback}` pointing at that file and `{iteration}`
+   incremented. Agent pushes new commits. Loop back to step 5.
 10. **Iteration cap** — if the loop hits `--max-iterations` (default 5), remove
     the lock, add `needs-human`, comment the last feedback bundle on the
     issue, move on to the next ticket.
@@ -168,10 +174,47 @@ when you need a different codex model, an org-hosted proxy, or a bespoke
 reviewer entirely. Available tokens: `{review_schema}` `{review_prompt_composed}`
 `{review_output}` `{pr_number}` `{branch}` `{worktree}` `{head_sha}`.
 
-## Agent command
+## Agent commands
 
-`--agent-cmd` is a shell command run from inside the ticket worktree. Tokens
-(each shell-quoted independently, safe to interpolate anywhere):
+Day-to-day routing lives in the **target repo** at
+`.execute-tickets/agents.yml` (sibling to any `.execute-tickets/checklist.yml`
+owned elsewhere — this skill never edits checklist files). Keys are model
+tiers from `plan-to-tickets`; values are full shell commands:
+
+| Key | Intent |
+|--|--|
+| `lite` | Docs/copy/config-only |
+| `efficient` | Small, fully-spec'd mechanical code |
+| `standard` | Everyday multi-file integration |
+| `flagship` | Hardest judgment / architecture-adjacent |
+
+**Selection:**
+
+| Situation | Command used |
+|--|--|
+| `--agent-cmd` passed | That command for **every** ticket this process runs |
+| No `--agent-cmd` | Ticket's `model-tier` entry from `agents.yml` |
+
+When the flag is omitted, preflight requires the file to exist, `yq` on PATH,
+and all four keys non-empty. Partial files fail before any ticket is claimed.
+Missing or invalid `model-tier` on a ticket → `needs-human` (no silent fallback).
+
+### Scaffold with Claude defaults
+
+```bash
+skills/coding/execute-tickets/scripts/init-agents.sh
+# optional: --repo-root <path>  --force  --dry-run
+```
+
+Copies `references/agents.example.yml` to `.execute-tickets/agents.yml`. Refuses
+to overwrite without `--force`. Edit model flags for your org before launching
+workers. See `plan-to-tickets`'s `references/model-tiers.md` for the tier
+vocabulary.
+
+### Tokens
+
+Each command (YAML or `--agent-cmd`) is run from inside the ticket worktree.
+Tokens (each shell-quoted independently, safe to interpolate anywhere):
 
 | token | value |
 |--|--|
@@ -196,10 +239,8 @@ Rules the agent must follow:
   findings + failing checks listed there. Do not re-open unrelated design
   questions mid-review-loop.
 
-Ticket-level model routing (tier → concrete model) is the agent command's
-job, not the executor's — the `{model_tier}` token carries the tier through,
-and `--agent-cmd` decides what to do with it. See `plan-to-tickets`'s
-`references/model-tiers.md` for the tier vocabulary.
+Ticket-level model routing is primarily `agents.yml` (tier → command). Use
+`--agent-cmd` only as a process-wide override for debugging or one-off runs.
 
 ## Procedure
 
@@ -212,32 +253,38 @@ without touching anything). Do not proceed if the manifest references a plan
 or spec file that is not committed on `source_branch`: the agent and the
 reviewer both need to read them.
 
-### 2. Choose the agent invocation
+### 2. Configure agent commands
 
-Compose one shell command that:
+If `.execute-tickets/agents.yml` is missing:
 
-- Runs from inside the ticket worktree (executor `cd`s there before invoking).
-- Reads the ticket body from `{issue_body}` (a path — not inline text, because
-  ticket bodies contain characters that break shell escaping).
-- Consumes `{spec_file}` and `{plan_file}` as repo-relative paths.
-- Uses `{model_tier}` to pick a specific model.
-- Handles the `{review_feedback}` retry case: when `{iteration}` is `>=2` and
-  `{review_feedback}` is non-empty, read that file and fix only what it lists.
-- Commits its changes onto `{branch}`. Does not open a PR.
+```bash
+skills/coding/execute-tickets/scripts/init-agents.sh
+```
+
+Edit the four tier commands (Claude defaults ship in the template; replace with
+pi/codex/etc. as needed). Each command must:
+
+- Run from inside the ticket worktree (executor `cd`s there before invoking).
+- Read the ticket body from `{issue_body}` (a path — not inline text).
+- Consume `{spec_file}` and `{plan_file}` as repo-relative paths.
+- Handle `{review_feedback}` when `{iteration}` is `>=2`.
+- Commit onto `{branch}` and not open a PR.
+
+For a one-off process that ignores YAML, pass `--agent-cmd` instead.
 
 ### 3. Dry-run one worker first
 
 ```bash
 skills/coding/execute-tickets/scripts/execute-tickets.sh \
   --worker alice --plan <plan-slug> \
-  --agent-cmd '<your command>' \
   --dry-run --once
 ```
 
-Prints the ticket the executor would pick, worktree path, branch name, and
-the fully-rendered agent + reviewer commands. Nothing is claimed, no worktree
-is created, no agent or codex call is made. Fix wrong tokens or manifests
-before going live.
+Prints the ticket the executor would pick, agent **source**
+(`agents.yml#<tier>` or `--agent-cmd`), worktree path, branch name, and the
+fully-rendered agent + reviewer commands. Nothing is claimed, no worktree is
+created, no agent or codex call is made. Fix wrong tokens or manifests before
+going live.
 
 ### 4. Launch up to 10 workers
 
@@ -245,8 +292,7 @@ before going live.
 for W in alice bob carol dave eve frank gordon hank isaac justin; do
   skills/coding/execute-tickets/scripts/execute-tickets.sh \
     --worker "$W" --plan <plan-slug> \
-    --agent-cmd '<your command>' \
-    > "logs/executor-w${W}.log" 2>&1 &
+    > "logs/executor-${W}.log" 2>&1 &
 done
 wait
 ```
@@ -313,7 +359,7 @@ ticket output.
 |--|--|
 | `--worker <name>` | Worker identity, case-insensitive (required). One of: alice, bob, carol, dave, eve, frank, gordon, hank, isaac, justin. Becomes lock label `lock:<name>`. |
 | `--plan <slug>` | Plan slug: basename of `docs/superpowers/tickets/<slug>.md` (required). |
-| `--agent-cmd <cmd>` | Shell command to run per ticket, with `{token}` substitutions (required). |
+| `--agent-cmd <cmd>` | Optional process-wide agent command (overrides `agents.yml`). Required only if no valid `.execute-tickets/agents.yml` is present. |
 | `--repo <owner/repo>` | Target repo (default: current repo via `gh repo view`). |
 | `--reviewer-cmd <cmd>` | Codex review command (default: `codex exec ... --sandbox read-only`). |
 | `--review-schema <path>` | Override review output schema (default: vendored). |
@@ -332,7 +378,8 @@ ticket output.
 
 - **Merge the epic PR** (or anything to `main`). Stops at the epic branch.
 - **Retry `needs-human` tickets.** All failures require human triage.
-- **Map model tiers to concrete models.** That's `--agent-cmd`'s job.
+- **Invent model IDs for you over time.** `init-agents.sh` ships a Claude
+  snapshot; projects own edits to `agents.yml`.
 - **Coordinate across plans or repos.** One invocation, one plan, one repo.
 - **Scale past 10 workers per repo.** The 10-name lock label set is the cap.
 - **Auto-merge PRs before codex says the patch is correct.** `overall_correctness`

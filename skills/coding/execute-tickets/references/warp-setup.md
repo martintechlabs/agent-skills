@@ -50,6 +50,7 @@ oz environment create \
   --repo <owner/repo> \
   --setup-command "apt-get update && apt-get install -y git jq curl" \
   --setup-command "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg && echo 'deb [signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main' > /etc/apt/sources.list.d/github-cli.list && apt-get update && apt-get install -y gh" \
+  --setup-command "curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq" \
   --setup-command "git checkout <epic-branch>" \
   --description "execute-tickets workers for <plan-slug>"
 ```
@@ -58,10 +59,14 @@ Notes:
 
 - **The base image must be glibc-based** (Debian/Ubuntu or similar) — Warp
   environments do not support Alpine/musl images.
-- Install whatever your `--agent-cmd` and `--reviewer-cmd` actually invoke
-  too (a coding-agent CLI, `codex`, etc.) — add more `--setup-command` flags
-  per tool, following each tool's own install instructions. The commands
-  above only cover `git`, `jq`, and `gh`.
+- Install **`yq` (mikefarah)** when workers load `.execute-tickets/agents.yml`
+  (no `--agent-cmd`). Also install whatever each tier command and
+  `--reviewer-cmd` invoke (Claude Code / pi / codex / etc.) — add more
+  `--setup-command` flags per tool. The commands above cover `git`, `jq`,
+  `gh`, and `yq`.
+- Prefer committing `.execute-tickets/agents.yml` (scaffold with
+  `scripts/init-agents.sh` in the target repo) so scheduled agents need no
+  `--agent-cmd` in the prompt.
 - The `git checkout <epic-branch>` setup command is required:
   `load_manifest` reads `docs/superpowers/tickets/<plan-slug>.md` from
   whatever's checked out locally, and that file only exists on the epic
@@ -106,9 +111,13 @@ for W in alice bob carol dave eve frank gordon hank isaac justin; do
     --name "execute-tickets-$W" \
     --cron "*/10 * * * *" \
     --environment "$ENV_ID" \
-    --prompt "Run this exact command and report its exit code and output: skills/coding/execute-tickets/scripts/execute-tickets.sh --worker $W --plan <plan-slug> --agent-cmd '<your command>' --once"
+    --prompt "Run this exact command and report its exit code and output: skills/coding/execute-tickets/scripts/execute-tickets.sh --worker $W --plan <plan-slug> --once"
 done
 ```
+
+When `.execute-tickets/agents.yml` is committed on the epic branch, omit
+`--agent-cmd` as above. Pass `--agent-cmd '...'` only as a process-wide
+override (debugging, or when you intentionally skip repo config).
 
 Only create as many of the 10 names as you actually want running — this is
 a cap, not a requirement to always use all 10. Don't create a single
