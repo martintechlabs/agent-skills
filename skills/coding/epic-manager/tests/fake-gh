@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+# Fake `gh` for epic-manager.sh tests. Stateful: the manager reads comments,
+# lists closed issues, opens/finds/closes PRs, and files new issues, so this
+# shim keeps a shared JSON store that mutates the way the real GitHub API would.
+#
+# Extended from execute-tickets/tests/fake-gh with: issue create (with counter),
+# issue list --state all|closed, issue view --json comments/body/state/number,
+# issue comment stores comments in state, pr list, pr close.
+#
+# Required:
+#   FAKE_GH_STATE          Path to a JSON file with shape:
+#                            {"issues": {"<n>": {"number":n,"title":..,"body":..,
+#                                                 "labels":[...],"assignees":[...],
+#                                                 "state":"open"|"closed",
+#                                                 "comments":[{"databaseId":..,"body":..,"createdAt":..}]},
+#                             "prs": {"<n>": {"number":n,"title":..,"body":..,"base":..,"head":..,
+#                                             "headRefOid":..,"statusCheckRollup":[..],"merged":bool,
+#                                             "state":"open"|"closed"|"merged","comments":[..]}},
+#                             "next_pr": N, "next_issue": N}
+#
+# Optional:
+#   FAKE_GH_LOG            Every invocation's argv (space-joined) appended here.
+#   FAKE_GH_AUTH_FAIL       "true" makes `gh auth status` fail.
+#   FAKE_GH_NAME_WITH_OWNER default: octo/repo
+#   FAKE_GH_LABELS          newline-separated existing label names (default: empty)
+#   FAKE_GH_PR_CREATE_FAIL  "true" makes `gh pr create` fail.
+#   FAKE_GH_MERGE_AUTO_FAIL "true" makes the `--auto` merge attempt fail.
+#   FAKE_GH_MERGE_SYNC_FAIL "true" makes the non-auto merge attempt fail.
+#   FAKE_GH_HEAD_SHA        headRefOid returned for any PR (default: sha-<n>).
+#   FAKE_GH_CHECKS_JSON     statusCheckRollup array content (default: []).
+set -uo pipefail
+
+STATE="${FAKE_GH_STATE:?FAKE_GH_STATE must be set}"
+[ -n "${FAKE_GH_LOG:-}" ] && printf '%s\n' "$*" >>"$FAKE_GH_LOG"
+
+jread() { jq "$@" "$STATE"; }
+jwrite() {
+  local f; f="$(mktemp)"
+  jq "$@" "$STATE" > "$f" && mv "$f" "$STATE"
+}
+
+find_flag_value() {
+  local want="$1"; shift
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "$want" ]; then printf '%s' "${2:-}"; return 0; fi
+    shift
+  done
+  return 1
+}
+
+has_flag() {
+  local want="$1"; shift
+  while [ $# -gt 0 ]; do
+    [ "$1" = "$want" ] && return 0
+    shift
+  done
+  return 1
+}
+
+case "$1" in
+  auth)
+    [ "${FAKE_GH_AUTH_FAIL:-false}" = true ] && exit 1
+    exit 0 ;;
+
+  repo)
+    printf '%s\n' "${FAKE_GH_NAME_WITH_OWNER:-octo/repo}"
+    exit 0 ;;
+
+  label)
+    case "$2" in
+      list) printf '%s\n' "${FAKE_GH_LABELS:-}" ;;
+      create) exit 0 ;;
+      *) exit 0 ;;
+    esac
+    exit 0 ;;
+
+  issue)
+    sub="$2"
+    case "$sub" in
+      list)
+        state_filter="$(find_flag_value --state "$@" || echo open)"
+        local_q="$(find_flag_value -q "$@" || true)"
+        # Project issues matching the state filter. Labels -> [{name:.}] (gh's shape).
+        base="$(jread --arg s "$state_filter" '
+          [ .issues | to_entries[]
+            | .value
+            | select(.state as $st |
+                ($s == "all") or ($s == "open" and $st == "open") or ($s == "closed" and $st == "closed"))
+            | .labels = [(.labels // [])[] | {name: .}] ]')"
+        if [ -n "$local_q" ]; then jq -c "$local_q" <<<"$base"
+        else jq -c '.' <<<"$base"; fi
+        exit 0 ;;
+      view)
+        n="$3"
+        local_q="$(find_flag_value -q "$@" || true)"
+        json_fields="$(find_flag_value --json "$@" || true)"
+        # Build the projection for the requested --json fields.
+        pr_obj="$(jread --arg n "$n" '.issues[$n] // {}')"
+        if [ -n "$json_fields" ]; then
+          # Project only the requested fields. Labels -> [{name:.}] for gh compat.
+          pr_obj="$(jq -c --arg fields "$json_fields" '
+            . as $o
+            | ($fields | split(",")) as $fl
+            | reduce $fl[] as $f ({}; .[$f] = ($o[$f]))
+            | if .labels then .labels = [(.labels // [])[] | {name: .}] else . end
+            | if .comments then . else . end' <<<"$pr_obj")"
+        fi
+        if [ -n "$local_q" ]; then jq -r "$local_q" <<<"$pr_obj"
+        else jq -c '.' <<<"$pr_obj"; fi
+        exit 0 ;;
+      create)
+        title="$(find_flag_value --title "$@" || echo "")"
+        body="$(find_flag_value --body "$@" || true)"
+        body_file="$(find_flag_value --body-file "$@" || true)"
+        [ -n "$body_file" ] && body="$(cat "$body_file" 2>/dev/null || echo "")"
+        # Collect --label values.
+        labels='[]'
+        _rest=("${@:3}")
+        _i=0
+        while [ "$_i" -lt "${#_rest[@]}" ]; do
+          if [ "${_rest[$_i]}" = "--label" ] && [ "$((_i+1))" -lt "${#_rest[@]}" ]; then
+            labels="$(jq -c --arg l "${_rest[$((_i+1))]}" '. + [$l]' <<<"$labels")"
+            _i=$((_i+2))
+          else
+            _i=$((_i+1))
+          fi
+        done
+        n="$(jread -r '.next_issue // 200')"
+        [ -n "${FAKE_GH_LOG:-}" ] && printf 'BODY_CONTENT(#%s): %s\n' "$n" "$body" >>"$FAKE_GH_LOG"
+        jwrite --argjson n "$n" --arg title "$title" --arg body "$body" --argjson labels "$labels" \
+          '.issues[$n|tostring] = {number:$n, title:$title, body:$body, labels:$labels, assignees:[], state:"open", comments:[]}
+           | .next_issue = ($n + 1)'
+        printf 'https://github.com/%s/issues/%s\n' "${FAKE_GH_NAME_WITH_OWNER:-octo/repo}" "$n"
+        exit 0 ;;
+      edit)
+        n="$3"; shift 3
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --add-label)
+              jwrite --arg n "$n" --arg l "$2" \
+                '.issues[$n].labels = ((.issues[$n].labels // []) + [$l] | unique)'
+              shift 2 ;;
+            --remove-label)
+              jwrite --arg n "$n" --arg l "$2" \
+                '.issues[$n].labels = ((.issues[$n].labels // []) - [$l])'
+              shift 2 ;;
+            --add-assignee)
+              jwrite --arg n "$n" --arg a "$2" \
+                '.issues[$n].assignees = ((.issues[$n].assignees // []) + [$a] | unique)'
+              shift 2 ;;
+            --repo) shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        exit 0 ;;
+      close)
+        n="$3"
+        jwrite --arg n "$n" '.issues[$n].state = "closed"'
+        exit 0 ;;
+      comment)
+        n="$3"; shift 3
+        body="$(find_flag_value --body "$@" || true)"
+        body_file="$(find_flag_value --body-file "$@" || true)"
+        [ -n "$body_file" ] && body="$(cat "$body_file" 2>/dev/null || echo "")"
+        cid="$(jread --arg n "$n" -r '[.issues[$n].comments[].databaseId // 0] | max + 1')" 2>/dev/null || cid=1
+        ts="$(date -u +%FT%TZ)"
+        jwrite --arg n "$n" --argjson cid "$cid" --arg body "$body" --arg ts "$ts" \
+          '.issues[$n].comments = ((.issues[$n].comments // []) + [{databaseId:$cid, body:$body, createdAt:$ts}])'
+        [ -n "${FAKE_GH_LOG:-}" ] && printf 'BODY_CONTENT(#%s): %s\n' "$n" "$body" >>"$FAKE_GH_LOG"
+        exit 0 ;;
+      *) exit 0 ;;
+    esac
+    ;;
+
+  pr)
+    sub="$2"
+    case "$sub" in
+      create)
+        [ "${FAKE_GH_PR_CREATE_FAIL:-false}" = true ] && exit 1
+        title="$(find_flag_value --title "$@" || echo "")"
+        body="$(find_flag_value --body "$@" || true)"
+        body_file="$(find_flag_value --body-file "$@" || true)"
+        [ -n "$body_file" ] && body="$(cat "$body_file" 2>/dev/null || echo "")"
+        base="$(find_flag_value --base "$@" || echo "")"
+        head="$(find_flag_value --head "$@" || echo "")"
+        n="$(jread -r '.next_pr')"
+        sha="${FAKE_GH_HEAD_SHA:-sha-$n}"
+        checks="${FAKE_GH_CHECKS_JSON:-[]}"
+        jwrite --argjson n "$n" --arg title "$title" --arg body "$body" \
+               --arg base "$base" --arg head "$head" --arg sha "$sha" --argjson checks "$checks" \
+          '.prs[$n|tostring] = {number:$n, title:$title, body:$body, base:$base, head:$head,
+                                 headRefOid:$sha, statusCheckRollup:$checks, merged:false,
+                                 state:"open", comments:[]}
+           | .next_pr = ($n + 1)'
+        [ -n "${FAKE_GH_LOG:-}" ] && printf 'PR_CREATE(#%s): base=%s head=%s\n' "$n" "$base" "$head" >>"$FAKE_GH_LOG"
+        printf 'https://github.com/%s/pull/%s\n' "${FAKE_GH_NAME_WITH_OWNER:-octo/repo}" "$n"
+        exit 0 ;;
+      list)
+        state_filter="$(find_flag_value --state "$@" || echo open)"
+        base_filter="$(find_flag_value --base "$@" || true)"
+        head_filter="$(find_flag_value --head "$@" || true)"
+        local_q="$(find_flag_value -q "$@" || true)"
+        json_fields="$(find_flag_value --json "$@" || true)"
+        rows="$(jread --arg s "$state_filter" --arg b "$base_filter" --arg h "$head_filter" '
+          [ .prs | to_entries[]
+            | .value
+            | select((.state as $st | ($s == "all") or ($s == $st))
+                     and ($b == "" or .base == $b)
+                     and ($h == "" or .head == $h)) ]')"
+        if [ -n "$json_fields" ] && [ -z "$local_q" ]; then
+          rows="$(jq -c --arg fields "$json_fields" '
+            map(. as $o | ($fields | split(",")) as $fl | reduce $fl[] as $f ({}; .[$f] = $o[$f]))' <<<"$rows")"
+        fi
+        if [ -n "$local_q" ]; then jq -c "$local_q" <<<"$rows"
+        else jq -c '.' <<<"$rows"; fi
+        exit 0 ;;
+      view)
+        n="$3"
+        local_q="$(find_flag_value -q "$@" || true)"
+        json_fields="$(find_flag_value --json "$@" || true)"
+        pr_obj="$(jread --arg n "$n" '.prs[$n] // {}')"
+        if [ -n "$json_fields" ]; then
+          pr_obj="$(jq -c --arg fields "$json_fields" '
+            . as $o | ($fields | split(",")) as $fl | reduce $fl[] as $f ({}; .[$f] = $o[$f])' <<<"$pr_obj")"
+        fi
+        if [ -n "$local_q" ]; then jq -r "$local_q" <<<"$pr_obj"
+        else jq -c '.' <<<"$pr_obj"; fi
+        exit 0 ;;
+      diff)
+        printf '%s\n' "${FAKE_GH_PR_DIFF:-diff --git a/file.txt b/file.txt
++placeholder change}"
+        exit 0 ;;
+      checks)
+        exit 0 ;;
+      comment)
+        n="$3"; shift 3
+        body="$(find_flag_value --body "$@" || true)"
+        [ -n "${FAKE_GH_LOG:-}" ] && printf 'PR_COMMENT(#%s): %s\n' "$n" "$body" >>"$FAKE_GH_LOG"
+        exit 0 ;;
+      close)
+        n="$3"
+        jwrite --arg n "$n" '.prs[$n].state = "closed"'
+        [ -n "${FAKE_GH_LOG:-}" ] && printf 'PR_CLOSE(#%s)\n' "$n" >>"$FAKE_GH_LOG"
+        exit 0 ;;
+      merge)
+        n="$3"
+        if has_flag --auto "$@"; then
+          [ "${FAKE_GH_MERGE_AUTO_FAIL:-false}" = true ] && exit 1
+        else
+          [ "${FAKE_GH_MERGE_SYNC_FAIL:-false}" = true ] && exit 1
+        fi
+        jwrite --arg n "$n" '.prs[$n].merged = true | .prs[$n].state = "merged"'
+        [ -n "${FAKE_GH_LOG:-}" ] && printf 'PR_MERGE(#%s)\n' "$n" >>"$FAKE_GH_LOG"
+        exit 0 ;;
+      *) exit 0 ;;
+    esac
+    ;;
+
+  *) exit 0 ;;
+esac

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Fake `codex` for execute-tickets.sh tests. The default --reviewer-cmd is:
+#   codex exec --model ... --output-schema <schema> -o <out> --sandbox read-only - < <prompt>
+# This shim ignores the schema/model/sandbox flags and just writes a canned
+# review JSON fixture to the path following `-o`, so build_feedback_bundle's
+# every branch (clean / P0 blocking / low-confidence / patch-is-incorrect) can
+# be driven deterministically without a real model call.
+#
+# Optional:
+#   FAKE_CODEX_LOG          Every invocation's argv (space-joined) appended here.
+#   FAKE_CODEX_FAIL         "true" makes codex exit 1 without writing output.
+#   FAKE_CODEX_NO_OUTPUT    "true" makes codex exit 0 but write nothing (tests
+#                           run_reviewer's "produced no output" guard).
+#   FAKE_CODEX_REVIEW_JSON  Review JSON content to write every call. Default: a
+#                           clean review (empty findings, "patch is correct").
+#   FAKE_CODEX_RESPONSES_DIR  Directory of numbered fixtures (1.json, 2.json,
+#                           ...) to return one-per-call in order, for tests that
+#                           need the verdict to change across review iterations
+#                           (e.g. blocking on iteration 1, clean on iteration 2).
+#                           Calls beyond the last numbered file repeat it.
+#                           Takes precedence over FAKE_CODEX_REVIEW_JSON.
+set -uo pipefail
+
+[ -n "${FAKE_CODEX_LOG:-}" ] && printf '%s\n' "$*" >>"$FAKE_CODEX_LOG"
+cat >/dev/null || true   # drain the composed-prompt stdin so `<file` redirection is tidy
+
+[ "${FAKE_CODEX_FAIL:-false}" = true ] && exit 1
+
+out=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-o" ]; then out="$2"; break; fi
+  shift
+done
+[ -n "$out" ] || { echo "fake-codex: no -o output path found in args" >&2; exit 1; }
+
+[ "${FAKE_CODEX_NO_OUTPUT:-false}" = true ] && exit 0
+
+if [ -n "${FAKE_CODEX_RESPONSES_DIR:-}" ]; then
+  counter_file="$FAKE_CODEX_RESPONSES_DIR/.call-count"
+  n=0
+  [ -f "$counter_file" ] && n="$(cat "$counter_file")"
+  n=$((n + 1))
+  echo "$n" > "$counter_file"
+  last="$(find "$FAKE_CODEX_RESPONSES_DIR" -name '[0-9]*.json' | sed -E 's#.*/([0-9]+)\.json#\1#' | sort -n | tail -1)"
+  use="$n"
+  [ "$use" -gt "$last" ] && use="$last"
+  cp "$FAKE_CODEX_RESPONSES_DIR/$use.json" "$out"
+  exit 0
+fi
+
+default_clean='{"findings":[],"overall_correctness":"patch is correct","overall_explanation":"looks good","overall_confidence_score":0.9}'
+printf '%s' "${FAKE_CODEX_REVIEW_JSON:-$default_clean}" > "$out"
+exit 0
