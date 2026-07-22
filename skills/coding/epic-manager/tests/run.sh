@@ -117,3 +117,71 @@ test_reconcile_drained_proceeds() {
   rm -rf "$d"
 }
 test_reconcile_drained_proceeds
+
+# ---- Task 5 tests: hybrid checklist gate ----
+
+write_checklist() {
+  mkdir -p "$1/.execute-tickets"
+  cat > "$1/.execute-tickets/checklist.yml" <<EOF
+pre_pr_checks:
+  - name: CHANGELOG updated
+    type: run
+    command: "test -f CHANGELOG.md"
+  - name: Public API documented
+    type: judge
+    instruction: "Every new public function has documentation."
+EOF
+}
+
+test_checklist_no_file_skips_gate() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" test-plan
+  epic_body="<!-- plan-to-tickets:epic:docs/superpowers/plans/test-plan.md -->"
+  epic="$(issue_json 100 'Epic' "$epic_body" '[]')"
+  t101="$(issue_json 101 'T1' "<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->" '[]')"
+  seed_state "$d/state" "[$epic,$t101]"
+  jq '.issues["101"].state = "closed"' "$d/state" > "$d/state.tmp" && mv "$d/state.tmp" "$d/state"
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" -- --plan test-plan --dry-run
+  assert_contains "$ERR" "checklist: skipped" "absent checklist skips the gate"
+  rm -rf "$d"
+}
+test_checklist_no_file_skips_gate
+
+test_checklist_run_fail_blocks() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" test-plan
+  write_checklist "$d/work"
+  git -C "$d/work" add -A && git -C "$d/work" commit -q -m "add checklist" && git -C "$d/work" push -q origin epic
+  epic_body="<!-- plan-to-tickets:epic:docs/superpowers/plans/test-plan.md -->"
+  epic="$(issue_json 100 'Epic' "$epic_body" '[]')"
+  t101="$(issue_json 101 'T1' "<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->" '[]')"
+  seed_state "$d/state" "[$epic,$t101]"
+  jq '.issues["101"].state = "closed"' "$d/state" > "$d/state.tmp" && mv "$d/state.tmp" "$d/state"
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" FAKE_GH_LOG="$d/gh.log" \
+    FAKE_CODEX_REVIEW_JSON='{"passed":true,"reasoning":"ok","confidence":0.9}' \
+    -- --plan test-plan --once
+  assert_contains "$ERR" "checklist: FAIL" "checklist fails when a run: item fails"
+  assert_contains "$(cat "$d/gh.log")" "needs-human" "sets needs-human on the epic"
+  assert_contains "$(cat "$d/gh.log")" "checklist-failed" "sets checklist-failed on the epic"
+  assert_contains "$(cat "$d/gh.log")" "CHANGELOG updated" "failure comment names the failed item"
+  rm -rf "$d"
+}
+test_checklist_run_fail_blocks
+
+test_checklist_malformed() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" test-plan
+  mkdir -p "$d/work/.execute-tickets"
+  printf 'pre_pr_checks:\n  - name: bad\n    type: unknown\n    command: x\n' > "$d/work/.execute-tickets/checklist.yml"
+  git -C "$d/work" add -A && git -C "$d/work" commit -q -m "bad checklist" && git -C "$d/work" push -q origin epic
+  epic_body="<!-- plan-to-tickets:epic:docs/superpowers/plans/test-plan.md -->"
+  epic="$(issue_json 100 'Epic' "$epic_body" '[]')"
+  t101="$(issue_json 101 'T1' "<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->" '[]')"
+  seed_state "$d/state" "[$epic,$t101]"
+  jq '.issues["101"].state = "closed"' "$d/state" > "$d/state.tmp" && mv "$d/state.tmp" "$d/state"
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" FAKE_GH_LOG="$d/gh.log" -- --plan test-plan --once
+  assert_contains "$ERR" "checklist: MALFORMED" "malformed checklist is a hard failure"
+  assert_contains "$(cat "$d/gh.log")" "needs-human" "malformed checklist sets needs-human"
+  rm -rf "$d"
+}
+test_checklist_malformed

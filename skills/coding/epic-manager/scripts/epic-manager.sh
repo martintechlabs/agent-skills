@@ -253,8 +253,15 @@ run_one_cycle() {
     return 0
   fi
   vlog "backlog drained; proceeding to checklist gate."
-  # Checklist gate + epic PR + final review + commands implemented in later tasks.
+  local tmpdir; tmpdir="$(mktemp -d)"
+  if ! run_checklist "$tmpdir"; then
+    release_lock
+    rm -rf "$tmpdir"
+    return 0   # failure already posted + labeled; not an error exit
+  fi
+  # Epic PR + final review + commands implemented in later tasks.
   release_lock
+  rm -rf "$tmpdir"
   return 0
 }
 
@@ -338,6 +345,137 @@ reviewer_model() {
   else
     echo "(set by --reviewer-cmd)"
   fi
+}
+
+# run_checklist <tmpdir> -> returns 0 if all pass (or no checklist file), 1 on fail/malformed.
+run_checklist() {
+  local tmpdir="$1"
+  local root checklist_path
+  root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  checklist_path="$root/$CHECKLIST_FILE"
+  if [ ! -f "$checklist_path" ]; then
+    vlog "checklist: skipped (no file at $checklist_path)"
+    return 0
+  fi
+  if ! yq -e '.pre_pr_checks' "$checklist_path" >/dev/null 2>&1; then
+    post_checklist_failure "MALFORMED" "Checklist file $checklist_path is not valid: missing top-level 'pre_pr_checks' array."
+    return 1
+  fi
+  local count name type results_file
+  count="$(yq -r '.pre_pr_checks | length' "$checklist_path")"
+  results_file="$tmpdir/checklist-results.json"
+  echo '[]' > "$results_file"
+  local i=0
+  while [ "$i" -lt "$count" ]; do
+    name="$(yq -r ".pre_pr_checks[$i].name // \"\"" "$checklist_path")"
+    type="$(yq -r ".pre_pr_checks[$i].type // \"\"" "$checklist_path")"
+    case "$type" in
+      run)
+        local cmd
+        cmd="$(yq -r ".pre_pr_checks[$i].command // \"\"" "$checklist_path")"
+        if [ -z "$cmd" ]; then
+          post_checklist_failure "MALFORMED" "Checklist item '$name' (type: run) is missing 'command'."
+          return 1
+        fi
+        if ! eval_run_item "$name" "$cmd" "$results_file"; then
+          post_checklist_failure "FAIL" "$results_file"
+          return 1
+        fi
+        ;;
+      judge)
+        local instr
+        instr="$(yq -r ".pre_pr_checks[$i].instruction // \"\"" "$checklist_path")"
+        if [ -z "$instr" ]; then
+          post_checklist_failure "MALFORMED" "Checklist item '$name' (type: judge) is missing 'instruction'."
+          return 1
+        fi
+        if ! eval_judge_item "$name" "$instr" "$results_file" "$tmpdir"; then
+          post_checklist_failure "FAIL" "$results_file"
+          return 1
+        fi
+        ;;
+      *)
+        post_checklist_failure "MALFORMED" "Checklist item '$name' has unknown type '$type' (expected 'run' or 'judge')."
+        return 1
+        ;;
+    esac
+    i=$((i + 1))
+  done
+  vlog "checklist: PASS (all $count items passed)"
+  return 0
+}
+
+eval_run_item() {
+  local name="$1" cmd="$2" results_file="$3"
+  local out rc
+  out="$(bash -c "$cmd" 2>&1)" && rc=0 || rc=$?
+  local tmp_item; tmp_item="$(mktemp)"
+  if [ "$rc" -eq 0 ]; then
+    jq -n -c --arg n "$name" --argjson passed true --arg cmd "$cmd" \
+      '{name:$n, type:"run", passed:$passed, command:$cmd}' > "$tmp_item"
+    jq -c --slurpfile item "$tmp_item" '. + $item' "$results_file" > "$results_file.tmp" && mv "$results_file.tmp" "$results_file"
+    rm -f "$tmp_item"; return 0
+  fi
+  jq -n -c --arg n "$name" --argjson passed false --arg cmd "$cmd" --arg out "$out" \
+    '{name:$n, type:"run", passed:$passed, command:$cmd, output:$out}' > "$tmp_item"
+  jq -c --slurpfile item "$tmp_item" '. + $item' "$results_file" > "$results_file.tmp" && mv "$results_file.tmp" "$results_file"
+  rm -f "$tmp_item"; return 1
+}
+
+eval_judge_item() {
+  local name="$1" instr="$2" results_file="$3" tmpdir="$4"
+  local out_json judge_schema prompt_file
+  out_json="$tmpdir/judge-$name.json"
+  judge_schema="$tmpdir/judge-schema.json"
+  printf '%s\n' '{"type":"object","additionalProperties":false,"required":["passed","reasoning","confidence"],"properties":{"passed":{"type":"boolean"},"reasoning":{"type":"string","minLength":1},"confidence":{"type":"number","minimum":0,"maximum":1}}}' > "$judge_schema"
+  prompt_file="$tmpdir/judge-prompt.md"
+  {
+    cat "$SKILL_DIR/references/metadata-guess-prompt.md"
+    echo
+    echo "## Judgment instruction"
+    echo
+    echo "$instr"
+  } > "$prompt_file"
+  local cmd
+  cmd="$(render_cmd "$REVIEWER_CMD" \
+    final_review_schema "$judge_schema" \
+    final_review_output "$out_json" \
+    final_review_prompt_composed "$prompt_file")"
+  ( bash -c "$cmd" ) || { rm -f "$out_json"; return 1; }
+  local passed reasoning
+  passed="$(jq -r '.passed // false' "$out_json" 2>/dev/null || echo false)"
+  reasoning="$(jq -r '.reasoning // "unknown"' "$out_json" 2>/dev/null || echo unknown)"
+  local tmp_item; tmp_item="$(mktemp)"
+  if [ "$passed" = "true" ]; then
+    jq -n -c --arg n "$name" --argjson passed true --arg instr "$instr" --arg r "$reasoning" \
+      '{name:$n, type:"judge", passed:$passed, instruction:$instr, reasoning:$r}' > "$tmp_item"
+    jq -c --slurpfile item "$tmp_item" '. + $item' "$results_file" > "$results_file.tmp" && mv "$results_file.tmp" "$results_file"
+    rm -f "$tmp_item" "$out_json"; return 0
+  fi
+  jq -n -c --arg n "$name" --argjson passed false --arg instr "$instr" --arg r "$reasoning" \
+    '{name:$n, type:"judge", passed:$passed, instruction:$instr, reasoning:$r}' > "$tmp_item"
+  jq -c --slurpfile item "$tmp_item" '. + $item' "$results_file" > "$results_file.tmp" && mv "$results_file.tmp" "$results_file"
+  rm -f "$tmp_item" "$out_json"; return 1
+}
+
+post_checklist_failure() {
+  local kind="$1" detail="$2"
+  log "checklist: $kind"
+  local body_file; body_file="$(mktemp)"
+  {
+    echo "### ❌ Checklist $kind"
+    echo
+    if [ "$kind" = "MALFORMED" ]; then
+      echo "$detail"
+    else
+      echo "The following pre-PR checks failed. Fix them, then remove \`needs-human\` and \`checklist-failed\` to re-run."
+      echo
+      jq -r '.[] | "- **\(.name)** (\(.type)): " + (if .type == "run" then "command `" + .command + "` failed:\n  " + (.output // "") else "instruction: " + .instruction + "\n  codex reasoning: " + (.reasoning // "") end)' "$detail" 2>/dev/null
+    fi
+  } > "$body_file"
+  gh issue comment "$EPIC_NUMBER" --repo "$REPO" --body-file "$body_file" >/dev/null 2>&1 || true
+  gh issue edit "$EPIC_NUMBER" --repo "$REPO" --add-label "needs-human" --add-label "checklist-failed" >/dev/null 2>&1 || true
+  rm -f "$body_file"
 }
 
 log() { printf '[%s manager] %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
