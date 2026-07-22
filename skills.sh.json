@@ -32,7 +32,9 @@
         "ship-ready-pr-loop",
         "optimize-agents-md",
         "git-merge-origin-main",
-        "plan-to-tickets"
+        "plan-to-tickets",
+        "execute-tickets",
+        "epic-manager"
       ]
     },
     {

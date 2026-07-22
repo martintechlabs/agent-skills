@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Minimal mikefarah-compatible yq for tests: yq -r '.key // ""' file
+set -euo pipefail
+if [ "${1:-}" = "-r" ] && [ $# -eq 3 ]; then
+  expr="$2"
+  file="$3"
+  # Support '.lite // ""' and '.lite'
+  key="$(printf '%s' "$expr" | sed -E 's/^\.([a-zA-Z0-9_]+).*/\1/')"
+  [ -f "$file" ] || exit 1
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$file" "$key" <<'PY'
+import re
+import sys
+
+path, key = sys.argv[1], sys.argv[2]
+text = open(path, encoding="utf-8").read()
+lines = text.splitlines()
+i = 0
+n = len(lines)
+while i < n:
+    line = lines[i]
+    if re.match(rf"^{re.escape(key)}:\s*$", line) or re.match(
+        rf"^{re.escape(key)}:\s*>\s*$", line
+    ) or re.match(rf"^{re.escape(key)}:\s*\|\s*$", line):
+        i += 1
+        parts = []
+        while i < n and (
+            lines[i].startswith("  ")
+            or lines[i].startswith("\t")
+            or lines[i].strip() == ""
+        ):
+            parts.append(lines[i].strip())
+            i += 1
+        print(" ".join(p for p in parts if p))
+        sys.exit(0)
+    m = re.match(rf"^{re.escape(key)}:\s*(.*)$", line)
+    if m:
+        val = m.group(1).strip()
+        if (val.startswith('"') and val.endswith('"')) or (
+            val.startswith("'") and val.endswith("'")
+        ):
+            val = val[1:-1]
+            val = val.replace('\\"', '"').replace("\\\\", "\\")
+        print(val)
+        sys.exit(0)
+    i += 1
+print("")
+PY
+    exit 0
+  fi
+  val="$(grep -E "^${key}:" "$file" | head -1 | sed -E "s/^${key}:[[:space:]]*//" | sed -E 's/^["'\'']//; s/["'\'']$//')"
+  printf '%s\n' "$val"
+  exit 0
+fi
+echo "fake-yq: unsupported invocation: $*" >&2
+exit 2

@@ -1,0 +1,13 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["title", "expanded_description", "priority", "complexity", "model_tier", "reasoning"],
+  "properties": {
+    "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "expanded_description": { "type": "string", "minLength": 1 },
+    "priority": { "type": "string", "enum": ["p1", "p2", "p3"] },
+    "complexity": { "type": "string", "enum": ["small", "medium", "large"] },
+    "model_tier": { "type": "string", "enum": ["lite", "efficient", "standard", "flagship"] },
+    "reasoning": { "type": "string", "minLength": 1 }
+  }
+}
