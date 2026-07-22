@@ -75,6 +75,7 @@ bindir_for() {
   mkdir -p "$dir/bin"
   cp "$HERE/fake-gh" "$dir/bin/gh"; chmod +x "$dir/bin/gh"
   cp "$HERE/fake-codex" "$dir/bin/codex"; chmod +x "$dir/bin/codex"
+  cp "$HERE/fake-yq" "$dir/bin/yq"; chmod +x "$dir/bin/yq"
   printf '%s' "$dir/bin"
 }
 

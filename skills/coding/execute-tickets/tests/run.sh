@@ -447,3 +447,138 @@ test_init_agents_preserves_existing_checklist() {
 }
 
 test_init_agents_preserves_existing_checklist
+
+# --- agents.yml routing: --agent-cmd optional; all four tiers required at load;
+# per-ticket model-tier selects the command; flag override wins.
+
+test_missing_agent_cmd_and_agents_yml_fails_preflight() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json"
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Ticket A", body:"Body A\n\n<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->",
+     labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --plan plan1 --once
+  assert_eq "$RC" "1" "missing agents.yml without --agent-cmd exits 1"
+  assert_contains "$ERR" "agents.yml" "error names agents.yml"
+  rm -rf "$d"
+}
+
+test_missing_agent_cmd_and_agents_yml_fails_preflight
+
+test_agents_yml_missing_tier_fails_preflight() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  mkdir -p "$d/work/.execute-tickets"
+  # only three keys
+  cat > "$d/work/.execute-tickets/agents.yml" <<'YML'
+lite: "echo lite"
+efficient: "echo efficient"
+standard: "echo standard"
+YML
+  local state="$d/state.json"
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Ticket A", body:"Body A\n\n<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->",
+     labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --plan plan1 --once
+  assert_eq "$RC" "1" "partial agents.yml exits 1"
+  assert_contains "$ERR" "flagship" "error names the missing tier"
+  rm -rf "$d"
+}
+
+test_agents_yml_missing_tier_fails_preflight
+
+test_agents_yml_routes_by_model_tier() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  write_agents_yml "$d/work" \
+    'echo lite > agent-tier.txt && git add -A && git commit -q -m lite' \
+    'echo efficient > agent-tier.txt && git add -A && git commit -q -m efficient' \
+    'echo standard > agent-tier.txt && git add -A && git commit -q -m standard' \
+    'echo flagship > agent-tier.txt && git add -A && git commit -q -m flagship'
+  local state="$d/state.json" log="$d/gh.log"
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Ticket A", body:"Body A\n\n<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->",
+     labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" FAKE_GH_LOG="$log" \
+    -- --worker alice --plan plan1 --once
+  assert_eq "$RC" "0" "YAML-routed green path exits 0"
+  jqok "$(cat "$state")" '.issues["101"].state == "closed"' "ticket closed after YAML-routed run"
+  assert_contains "$(cat "$log")" "agents.yml#efficient" "audit trail records agents.yml#efficient source"
+  rm -rf "$d"
+}
+
+test_agents_yml_routes_by_model_tier
+
+test_agent_cmd_override_wins_over_agents_yml() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  write_agents_yml "$d/work" \
+    'echo yml-lite > agent-tier.txt && git add -A && git commit -q -m y' \
+    'echo yml-efficient > agent-tier.txt && git add -A && git commit -q -m y' \
+    'echo yml-standard > agent-tier.txt && git add -A && git commit -q -m y' \
+    'echo yml-flagship > agent-tier.txt && git add -A && git commit -q -m y'
+  local state="$d/state.json" log="$d/gh.log"
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Ticket A", body:"Body A\n\n<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->",
+     labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" FAKE_GH_LOG="$log" \
+    -- --worker alice --plan plan1 --agent-cmd "$DEFAULT_AGENT_CMD" --once
+  assert_eq "$RC" "0" "override path exits 0"
+  assert_contains "$(cat "$log")" "--agent-cmd" "audit trail records --agent-cmd source"
+  assert_not_contains "$(cat "$log")" "agents.yml#efficient" "YAML tier not used when flag set"
+  rm -rf "$d"
+}
+
+test_agent_cmd_override_wins_over_agents_yml
+
+test_invalid_model_tier_needs_human() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  write_agents_yml "$d/work"
+  local state="$d/state.json" log="$d/gh.log"
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Ticket A", body:"Body A\n\n<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->",
+     labels:["priority:p1","complexity:small","model-tier:turbo"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" FAKE_GH_LOG="$log" \
+    -- --worker alice --plan plan1 --once
+  assert_eq "$RC" "0" "worker exits 0 after needs-human (once mode still exits 0)"
+  jqok "$(cat "$state")" '(.issues["101"].labels | index("needs-human")) != null' "invalid tier gets needs-human"
+  assert_contains "$(cat "$log")" "model-tier" "needs-human reason mentions model-tier"
+  rm -rf "$d"
+}
+
+test_invalid_model_tier_needs_human
+
+test_dry_run_reports_agent_source_from_yml() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  write_agents_yml "$d/work" \
+    'echo lite' 'echo efficient-cmd' 'echo standard' 'echo flagship'
+  local state="$d/state.json"
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Ticket A", body:"Body A\n\n<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->",
+     labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --plan plan1 --dry-run --once
+  assert_eq "$RC" "0" "dry-run with agents.yml exits 0"
+  assert_contains "$ERR" "agent source:      agents.yml#efficient" "dry-run shows YAML source"
+  assert_contains "$ERR" "efficient-cmd" "dry-run shows resolved efficient command"
+  rm -rf "$d"
+}
+
+test_dry_run_reports_agent_source_from_yml

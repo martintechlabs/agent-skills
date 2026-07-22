@@ -12,7 +12,12 @@ set -euo pipefail
 WORKER=""
 PLAN_SLUG=""
 REPO=""
-AGENT_CMD=""
+AGENT_CMD=""   # optional global override; when empty, load agents.yml
+AGENT_CMD_LITE=""
+AGENT_CMD_EFFICIENT=""
+AGENT_CMD_STANDARD=""
+AGENT_CMD_FLAGSHIP=""
+AGENTS_YML_PATH=""
 REVIEWER_CMD_DEFAULT='codex exec --model "${CODEX_MODEL:-gpt-5-codex}" --output-schema {review_schema} -o {review_output} --sandbox read-only - < {review_prompt_composed}'
 REVIEWER_CMD=""
 REVIEW_SCHEMA=""
@@ -48,15 +53,18 @@ usage() {
 execute-tickets.sh -- dispatch plan-to-tickets issues through agent + codex review + merge.
 
 Usage:
-  execute-tickets.sh --worker <name> --plan <plan-slug> --agent-cmd <cmd> [flags]
+  execute-tickets.sh --worker <name> --plan <plan-slug> [--agent-cmd <cmd>] [flags]
 
 Required flags:
   --worker <name>       Worker identity (case-insensitive), one of:
                           alice bob carol dave eve frank gordon hank isaac justin
                         Distinct per concurrent process.
   --plan <slug>         Plan slug: basename of docs/superpowers/tickets/<slug>.md.
-  --agent-cmd <cmd>     Shell command to run the coding agent. Runs from inside the
-                        ticket worktree. Token substitutions (each shell-quoted):
+  --agent-cmd <cmd>     Optional. If set, used for every ticket (overrides agents.yml).
+                        If omitted, load <repo>/.execute-tickets/agents.yml (all four
+                        model-tier keys required: lite efficient standard flagship).
+                        Scaffold with scripts/init-agents.sh. Runs from the ticket
+                        worktree. Token substitutions (each shell-quoted):
                           {issue_number} {issue_title} {issue_body}
                           {spec_file} {plan_file}
                           {model_tier} {complexity} {priority}
@@ -151,7 +159,7 @@ parse_args() {
   WORKER="${WORKER,,}"
   is_valid_worker_name "$WORKER" || die 2 "--worker must be one of: ${WORKER_NAMES[*]} (got: $WORKER)"
   [ -n "$PLAN_SLUG" ] || die 2 "Missing --plan <slug>"
-  [ -n "$AGENT_CMD" ] || die 2 "Missing --agent-cmd <cmd>"
+  # AGENT_CMD optional: validated in preflight against agents.yml when empty
   case "$MERGE_METHOD" in --squash|--rebase|--merge) ;; *) die 2 "--merge-method must be --squash|--rebase|--merge" ;; esac
   LOCK_LABEL="lock:$WORKER"
   [ -n "$REVIEWER_CMD" ] || REVIEWER_CMD="$REVIEWER_CMD_DEFAULT"
@@ -170,6 +178,56 @@ is_valid_worker_name() {
   return 1
 }
 
+is_valid_model_tier() {
+  case "$1" in lite|efficient|standard|flagship) return 0 ;; *) return 1 ;; esac
+}
+
+load_agents_yml() {
+  local root file
+  root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  file="$root/.execute-tickets/agents.yml"
+  AGENTS_YML_PATH="$file"
+  [ -f "$file" ] || die 1 "Missing $file (run scripts/init-agents.sh or pass --agent-cmd)"
+  command -v yq >/dev/null 2>&1 || die 1 "yq is required to load agents.yml (mikefarah yq v4). Or pass --agent-cmd."
+  AGENT_CMD_LITE="$(yq -r '.lite // ""' "$file")"
+  AGENT_CMD_EFFICIENT="$(yq -r '.efficient // ""' "$file")"
+  AGENT_CMD_STANDARD="$(yq -r '.standard // ""' "$file")"
+  AGENT_CMD_FLAGSHIP="$(yq -r '.flagship // ""' "$file")"
+  local missing=()
+  [ -n "$AGENT_CMD_LITE" ] || missing+=(lite)
+  [ -n "$AGENT_CMD_EFFICIENT" ] || missing+=(efficient)
+  [ -n "$AGENT_CMD_STANDARD" ] || missing+=(standard)
+  [ -n "$AGENT_CMD_FLAGSHIP" ] || missing+=(flagship)
+  if [ "${#missing[@]}" -gt 0 ]; then
+    die 1 "agents.yml missing or empty keys: ${missing[*]} (file: $file)"
+  fi
+}
+
+# resolve_agent_cmd <tier> -> command string on stdout
+resolve_agent_cmd() {
+  local tier="$1"
+  if [ -n "$AGENT_CMD" ]; then
+    printf '%s' "$AGENT_CMD"
+    return 0
+  fi
+  case "$tier" in
+    lite) printf '%s' "$AGENT_CMD_LITE" ;;
+    efficient) printf '%s' "$AGENT_CMD_EFFICIENT" ;;
+    standard) printf '%s' "$AGENT_CMD_STANDARD" ;;
+    flagship) printf '%s' "$AGENT_CMD_FLAGSHIP" ;;
+    *) return 1 ;;
+  esac
+}
+
+agent_source_label() {
+  local tier="$1"
+  if [ -n "$AGENT_CMD" ]; then
+    printf '%s' "--agent-cmd"
+  else
+    printf 'agents.yml#%s' "$tier"
+  fi
+}
+
 preflight() {
   command -v gh >/dev/null 2>&1 || die 1 "gh is required."
   command -v jq >/dev/null 2>&1 || die 1 "jq is required."
@@ -182,6 +240,9 @@ preflight() {
     REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
   fi
   [ -n "$REPO" ] || die 1 "Could not determine target repo. Pass --repo."
+  if [ -z "$AGENT_CMD" ]; then
+    load_agents_yml
+  fi
   ensure_lock_labels
 }
 
@@ -395,9 +456,15 @@ run_ticket() (
 
   vlog "ticket #$n: $title"
   vlog "  agent model_tier=$tier  complexity=$complexity  priority=$priority"
+  vlog "  agent source: $(agent_source_label "$tier" 2>/dev/null || echo invalid-tier)"
   vlog "  reviewer model: $(reviewer_model)"
   vlog "  worktree: $worktree"
   vlog "  branch:   $branch"
+
+  if ! is_valid_model_tier "$tier"; then
+    flag_needs_human "$n" "missing or invalid model-tier label (got: ${tier:-empty}); expected lite|efficient|standard|flagship" ""
+    return 1
+  fi
 
   body_file="$(mktemp)"
   jq -r '.body' <<<"$candidate" > "$body_file"
@@ -524,8 +591,9 @@ cleanup_ticket_state() {
 invoke_agent() {
   local n="$1" title="$2" body_file="$3" tier="$4" complexity="$5" priority="$6"
   local worktree="$7" branch="$8" review_feedback="$9" iteration="${10}"
-  local cmd
-  cmd="$(render_cmd "$AGENT_CMD" \
+  local tmpl cmd
+  tmpl="$(resolve_agent_cmd "$tier")" || return 1
+  cmd="$(render_cmd "$tmpl" \
     issue_number "$n" \
     issue_title "$title" \
     issue_body "$body_file" \
@@ -538,7 +606,7 @@ invoke_agent() {
     branch "$branch" \
     review_feedback "$review_feedback" \
     iteration "$iteration")"
-  log "Agent (iter $iteration) for #$n: cd $worktree"
+  log "Agent (iter $iteration) for #$n via $(agent_source_label "$tier"): cd $worktree"
   vlog "agent cmd: $cmd"
   ( cd "$worktree" && bash -c "$cmd" )
 }
@@ -742,7 +810,7 @@ audit_comment() {
   body_file="$(mktemp)"
   {
     printf '### %s Iteration %s\n\n' "$emoji" "$iteration"
-    printf '**Agent**: model_tier=%s · PR #%s\n' "$tier" "$pr"
+    printf '**Agent**: %s · model_tier=%s · PR #%s\n' "$(agent_source_label "$tier")" "$tier" "$pr"
     printf '**Reviewer**: %s\n' "$(reviewer_model)"
     printf '**Verdict**: %s (confidence %s)\n' "$verdict" "$conf"
     printf '**Findings**: %s\n' "$findings_count"
@@ -809,8 +877,15 @@ dry_run_report() {
   worktree="$(dirname "$root")/wt-$(basename "$root")-w${WORKER}-i${n}"
   branch="ticket/${n}-$(slug_from_title "$title")"
 
-  local agent_cmd reviewer_cmd
-  agent_cmd="$(render_cmd "$AGENT_CMD" \
+  local agent_tmpl agent_cmd reviewer_cmd src
+  if ! is_valid_model_tier "$tier"; then
+    agent_tmpl="<invalid model-tier: ${tier:-empty}>"
+    src="invalid-tier"
+  else
+    agent_tmpl="$(resolve_agent_cmd "$tier")"
+    src="$(agent_source_label "$tier")"
+  fi
+  agent_cmd="$(render_cmd "$agent_tmpl" \
     issue_number "$n" issue_title "$title" issue_body "<tmpfile>" \
     spec_file "$SPEC_FILE" plan_file "$PLAN_FILE" \
     model_tier "$tier" complexity "$complexity" priority "$priority" \
@@ -836,6 +911,7 @@ DRY RUN (worker $WORKER):
   max iterations:    $MAX_ITERATIONS
   review schema:     $REVIEW_SCHEMA
   review prompt:     $REVIEW_PROMPT
+  agent source:      $src
   agent cmd:         $agent_cmd
   reviewer cmd:      $reviewer_cmd
   reviewer model:    $(reviewer_model)
