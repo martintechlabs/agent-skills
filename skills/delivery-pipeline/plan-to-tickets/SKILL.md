@@ -207,7 +207,7 @@ Filing GitHub issues is a visible, shared-state action. Run the script in `--dry
 mode against the ticket-plan JSON:
 
 ```bash
-skills/coding/plan-to-tickets/scripts/create-tickets.sh --input <ticket-plan.json> --dry-run
+skills/delivery-pipeline/plan-to-tickets/scripts/create-tickets.sh --input <ticket-plan.json> --dry-run
 ```
 
 This both validates the JSON (invalid JSON, missing fields, or an out-of-order
@@ -227,7 +227,7 @@ user confirms.**
 Once confirmed, run without `--dry-run`:
 
 ```bash
-skills/coding/plan-to-tickets/scripts/create-tickets.sh --input <ticket-plan.json>
+skills/delivery-pipeline/plan-to-tickets/scripts/create-tickets.sh --input <ticket-plan.json>
 ```
 
 Report the epic issue link, every ticket's issue link, and the path to the manifest the

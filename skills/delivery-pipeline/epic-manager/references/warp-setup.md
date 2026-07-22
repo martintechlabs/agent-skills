@@ -84,7 +84,7 @@ oz scheduled-agent create \
   --name "epic-manager-<plan-slug>" \
   --environment "epic-manager-<plan-slug>" \
   --schedule "*/5 * * * *" \
-  --prompt "Run the epic manager for <plan-slug>: bash skills/coding/epic-manager/scripts/epic-manager.sh --plan <plan-slug> --repo <owner/repo> --once"
+  --prompt "Run the epic manager for <plan-slug>: bash skills/delivery-pipeline/epic-manager/scripts/epic-manager.sh --plan <plan-slug> --repo <owner/repo> --once"
 ```
 
 The `--once` is non-negotiable: each firing runs one reconcile + act cycle and
