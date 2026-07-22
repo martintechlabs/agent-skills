@@ -14,7 +14,7 @@ session** — the container is torn down after the run and the next firing
 starts clean (see [Environments](https://docs.warp.dev/platform/environments/)).
 There is no persistent process between firings.
 
-That rules out the `while true` / 4-concurrent-worker daemon mode this skill's
+That rules out the `while true` / 10-concurrent-worker daemon mode this skill's
 `SKILL.md` describes for a long-running terminal or CI job. It does not rule
 out running this skill on Warp — `--once` exists specifically for this:
 
@@ -24,7 +24,7 @@ Each Warp firing should invoke:
 
 ```bash
 skills/coding/execute-tickets/scripts/execute-tickets.sh \
-  --worker <N> --plan <plan-slug> --agent-cmd '<your command>' --once
+  --worker <name> --plan <plan-slug> --agent-cmd '<your command>' --once
 ```
 
 Ticket state (lock labels, `needs-human`, closed issues) lives on GitHub, not
@@ -32,14 +32,15 @@ in the container, so it survives fine across ephemeral runs. This also means
 the "fetch the epic branch fresh per ticket" fix already in this script is a
 non-issue here: Warp clones the repo fresh on every firing anyway.
 
-## Emulating the 4 concurrent workers
+## Emulating the 10 concurrent workers
 
-The lock-label claiming (`lock:1..lock:4`) was built for independent,
-uncoordinated processes — that's exactly what separate scheduled agents are.
-Create up to 4 scheduled agents (one per `--worker` slot, 1–4), each with its
-own cron entry, each running the `--once` invocation above with its own
-`--worker N`. Don't create a single schedule and try to fan it out to 4
-concurrent runs some other way — the slot number is what makes claiming safe.
+The lock-label claiming (`lock:alice`..`lock:justin`) was built for
+independent, uncoordinated processes — that's exactly what separate
+scheduled agents are. Create up to 10 scheduled agents (one per `--worker`
+name), each with its own cron entry, each running the `--once` invocation
+above with its own `--worker <name>`. Don't create a single schedule and
+try to fan it out to several concurrent runs some other way — the name is
+what makes claiming safe.
 
 ## Environment requirements
 
