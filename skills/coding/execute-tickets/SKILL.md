@@ -259,7 +259,7 @@ loop above → release the lock (on merge) or set `needs-human` (on failure). If
 no ticket is ready (all locked, all blocked by open dependencies, or backlog
 empty), the worker sleeps `--poll` seconds (default 30) and tries again.
 `--once` runs a single pick + full ticket loop and exits — useful for cron.
-See `WARP.md` in this directory for running the 10-worker pattern as separate
+See `references/warp-setup.md` for running the 10-worker pattern as separate
 Warp scheduled agents instead of a long-running daemon.
 
 A ticket is "ready" when: (a) its body carries this plan's ticket marker, (b)
