@@ -681,3 +681,72 @@ test_repo_wide_ignores_issues_without_the_marker() {
   rm -rf "$d"
 }
 test_repo_wide_ignores_issues_without_the_marker
+
+# ---- Repo-wide discovery: Task 3 — per-candidate manifest resolution ----
+
+test_repo_wide_picks_globally_highest_priority_across_plans() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan-a docs/superpowers/plans/test-plan.md
+  # plan-b gets its own distinct source_branch ("epic-b", not "epic") --
+  # deliberately different from plan-a's, so a bug that resolved the WRONG
+  # plan's manifest (e.g. leaked plan-a's SOURCE_BRANCH via a stale global)
+  # would be caught by the source_branch assertion below, not just the slug.
+  add_second_manifest "$d/work" plan-b docs/superpowers/plans/plan-b.md epic-b
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json"
+  # Ticket 101 belongs to plan-a at p2; ticket 102 belongs to plan-b at p1.
+  # Repo-wide (no --plan) must pick #102 -- true cross-plan priority ranking,
+  # not "whichever plan happens to be scanned first."
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Plan A ticket", body:"<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->",
+     labels:["priority:p2","complexity:small","model-tier:efficient"], assignees:[], state:"open"},
+    {number:102, title:"Plan B ticket", body:"<!-- plan-to-tickets:ticket:docs/superpowers/plans/plan-b.md:001-a -->",
+     labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --agent-cmd echo --dry-run --once
+  assert_eq "$RC" "0" "repo-wide cross-plan dry-run exits 0"
+  assert_contains "$ERR" "#102" "picked the p1 ticket from plan-b, not the p2 ticket from plan-a"
+  assert_contains "$ERR" "plan:              plan-b" "dry-run report shows plan-b's own resolved slug"
+  assert_contains "$ERR" "source_branch:     epic-b" "resolved plan-b's own source_branch, not plan-a's ('epic')"
+  rm -rf "$d"
+}
+test_repo_wide_picks_globally_highest_priority_across_plans
+
+test_repo_wide_skips_candidate_with_missing_manifest() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan-a docs/superpowers/plans/test-plan.md
+  # Deliberately do NOT add a manifest for plan-missing -- ticket 101 references
+  # a plan whose manifest was never committed (simulates a stale/broken marker).
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json"
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Broken ticket", body:"<!-- plan-to-tickets:ticket:docs/superpowers/plans/plan-missing.md:001-a -->",
+     labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"},
+    {number:102, title:"Good ticket", body:"<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->",
+     labels:["priority:p2","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --agent-cmd echo --dry-run --once
+  assert_eq "$RC" "0" "repo-wide dry-run exits 0 despite one broken candidate"
+  assert_contains "$ERR" "Skipping #101" "logs a warning for the unresolvable candidate"
+  assert_contains "$ERR" "#102" "falls through to the next candidate and reports it"
+  rm -rf "$d"
+}
+test_repo_wide_skips_candidate_with_missing_manifest
+
+test_repo_wide_all_candidates_broken() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan-a docs/superpowers/plans/test-plan.md
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json"
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Broken ticket", body:"<!-- plan-to-tickets:ticket:docs/superpowers/plans/plan-missing.md:001-a -->",
+     labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --agent-cmd echo --once
+  assert_contains "$ERR" "No candidates resolved to a valid manifest" "clear message when every candidate is broken"
+  rm -rf "$d"
+}
+test_repo_wide_all_candidates_broken

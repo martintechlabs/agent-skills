@@ -316,41 +316,53 @@ load_manifest() {
 }
 
 run_one_cycle() {
-  # pick_candidate() now returns a JSON array (Task 3 adds the full
-  # skip-and-retry iteration over it for repo-wide mode) -- for now, just take
-  # the top-ranked candidate, same as the old single-object contract did.
-  local candidates candidate
+  local candidates total
   candidates="$(pick_candidate)"
-  if [ "$(jq 'length' <<<"$candidates")" -eq 0 ]; then
+  total="$(jq 'length' <<<"$candidates")"
+  if [ "$total" -eq 0 ]; then
     log "No ready tickets."
     return 1
   fi
-  candidate="$(jq -c '.[0]' <<<"$candidates")"
-  local n
-  n="$(jq -r '.number' <<<"$candidate")"
-  log "Candidate: #$n ($(jq -r '.title' <<<"$candidate"))"
-  if [ "$DRY_RUN" = true ]; then
-    dry_run_report "$candidate"
+  local i=0
+  while [ "$i" -lt "$total" ]; do
+    local candidate n
+    candidate="$(jq -c ".[$i]" <<<"$candidates")"
+    n="$(jq -r '.number' <<<"$candidate")"
+    if [ "$REPO_WIDE" = true ]; then
+      local slug
+      slug="$(slug_from_candidate_marker "$candidate")"
+      if [ -z "$slug" ] || ! load_manifest "$slug"; then
+        log "Skipping #$n: could not resolve manifest for its plan (marker slug: ${slug:-<unparseable>})."
+        i=$((i + 1))
+        continue
+      fi
+    fi
+    log "Candidate: #$n ($(jq -r '.title' <<<"$candidate"))"
+    if [ "$DRY_RUN" = true ]; then
+      dry_run_report "$candidate"
+      return 0
+    fi
+    if ! claim_ticket "$n"; then
+      log "Lost claim race on #$n; will retry."
+      return 1
+    fi
+    # Bare statement + explicit rc capture, not `if run_ticket ...; then` --
+    # run_ticket is a subshell with its own ERR trap for unexpected failures,
+    # and calling it as an if/&&/||/! test would suppress that trap for its
+    # entire execution (see main()'s comment for the underlying bash behavior).
+    set +e
+    run_ticket "$candidate"
+    local ticket_rc=$?
+    set -e
+    if [ "$ticket_rc" -eq 0 ]; then
+      log "Completed #$n."
+    else
+      log "Failed #$n; marked needs-human."
+    fi
     return 0
-  fi
-  if ! claim_ticket "$n"; then
-    log "Lost claim race on #$n; will retry."
-    return 1
-  fi
-  # Bare statement + explicit rc capture, not `if run_ticket ...; then` --
-  # run_ticket is a subshell with its own ERR trap for unexpected failures,
-  # and calling it as an if/&&/||/! test would suppress that trap for its
-  # entire execution (see main()'s comment for the underlying bash behavior).
-  set +e
-  run_ticket "$candidate"
-  local ticket_rc=$?
-  set -e
-  if [ "$ticket_rc" -eq 0 ]; then
-    log "Completed #$n."
-  else
-    log "Failed #$n; marked needs-human."
-  fi
-  return 0
+  done
+  log "No candidates resolved to a valid manifest."
+  return 1
 }
 
 pick_candidate() {
@@ -420,6 +432,22 @@ pick_candidate() {
     | map(select(.ready))
     | sort_by(._priority, ._complexity, .number)
   ' <<<"$ready"
+}
+
+# slug_from_candidate_marker <candidate_json> -> the plan slug embedded in the
+# candidate's own ticket marker, or empty if unparseable. Only meaningful in
+# repo-wide mode, where pick_candidate() matched on the generic marker prefix
+# and doesn't already know which plan this specific ticket belongs to.
+slug_from_candidate_marker() {
+  local candidate="$1" rest plan_file
+  rest="$(jq -r '
+    .body // ""
+    | capture("<!-- plan-to-tickets:ticket:(?<rest>[^\\n]+) -->"; "g").rest // empty
+  ' <<<"$candidate" 2>/dev/null)"
+  [ -n "$rest" ] || return 0
+  plan_file="${rest%:*}"
+  [ -n "$plan_file" ] || return 0
+  basename "$plan_file" .md | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}-//'
 }
 
 claim_ticket() {
