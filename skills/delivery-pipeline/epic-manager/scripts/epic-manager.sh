@@ -80,6 +80,11 @@ main() {
   if [ "$REPO_WIDE" != true ]; then
     load_manifest "$PLAN_SLUG" || die 1 "Manifest not found or malformed for plan '$PLAN_SLUG', or no epic issue found for it (run plan-to-tickets first)"
   fi
+  if [ "$REPO_WIDE" = true ]; then
+    local discovered
+    discovered="$(discover_open_epics)"
+    log "discovered epics (stalest first): $(jq -r '[.[] | "#\(.number)"] | join(" ")' <<<"$discovered")"
+  fi
   # --dry-run and --once both run a single cycle and exit. The loop mode is for
   # long-running terminals / CI; cron firings always pass --once (see WARP.md).
   if [ "$ONCE" = true ] || [ "$DRY_RUN" = true ]; then
@@ -239,6 +244,48 @@ find_epic_issue_by_marker() {
     --json number,body 2>/dev/null \
     | jq -r --arg marker "$marker" '.[] | select(.body // "" | contains($marker)) | .number' \
     | head -1
+}
+
+# discover_open_epics -> JSON array of {number, slug, last_visited}, sorted
+# stalest-first. "Last visited" reuses the existing lock-acquired comment
+# marker (see acquire_lock/detect_stale_lock) rather than inventing a new
+# marker format -- it's already posted on every successful cycle via
+# post_progress_comment, so staleness ranking needs no new local or GitHub
+# state, just a different read of what's already there. Never-visited epics
+# have last_visited="", which sorts before any ISO-8601 timestamp string.
+discover_open_epics() {
+  local raw epics_with_pf total
+  raw="$(gh issue list --repo "$REPO" --state open --limit 500 \
+          --json number,body 2>/dev/null || echo '[]')"
+  epics_with_pf="$(jq -c '
+    map(select(.body // "" | contains("<!-- plan-to-tickets:epic:")))
+    | map({
+        number,
+        plan_file: (.body | capture("<!-- plan-to-tickets:epic:(?<pf>[^\\n]+) -->"; "g").pf // empty)
+      })
+    | map(select(.plan_file != null and .plan_file != ""))
+  ' <<<"$raw")"
+  total="$(jq 'length' <<<"$epics_with_pf")"
+  if [ "$total" -eq 0 ]; then
+    echo '[]'
+    return 0
+  fi
+  local result="[]" i=0
+  while [ "$i" -lt "$total" ]; do
+    local n plan_file slug comments last_visited
+    n="$(jq -r ".[$i].number" <<<"$epics_with_pf")"
+    plan_file="$(jq -r ".[$i].plan_file" <<<"$epics_with_pf")"
+    slug="$(basename "$plan_file" .md | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}-//')"
+    comments="$(gh issue view "$n" --repo "$REPO" --json comments -q '.comments' 2>/dev/null || echo '[]')"
+    last_visited="$(jq -r '
+      [.[] | select(.body // "" | test("<!-- manager:lock-acquired:")) | (.body | capture("<!-- manager:lock-acquired:(?<ts>[^>]+) -->").ts)]
+      | last // ""
+    ' <<<"$comments" 2>/dev/null || echo "")"
+    result="$(jq --argjson n "$n" --arg slug "$slug" --arg lv "$last_visited" \
+      '. + [{number: $n, slug: $slug, last_visited: $lv}]' <<<"$result")"
+    i=$((i + 1))
+  done
+  jq 'sort_by(.last_visited)' <<<"$result"
 }
 
 # Singleton lock:manager. Acquired at cycle start, released at end. A firing
