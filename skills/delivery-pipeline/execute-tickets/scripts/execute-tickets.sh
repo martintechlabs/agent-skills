@@ -47,6 +47,7 @@ SOURCE_BRANCH=""
 SPEC_FILE=""
 PLAN_FILE=""
 TICKET_MARKER_PREFIX=""
+TICKET_MARKER_GENERIC_PREFIX="<!-- plan-to-tickets:ticket:"
 LOCK_LABEL=""
 
 usage() {
@@ -315,12 +316,16 @@ load_manifest() {
 }
 
 run_one_cycle() {
-  local candidate
-  candidate="$(pick_candidate)"
-  if [ -z "$candidate" ]; then
+  # pick_candidate() now returns a JSON array (Task 3 adds the full
+  # skip-and-retry iteration over it for repo-wide mode) -- for now, just take
+  # the top-ranked candidate, same as the old single-object contract did.
+  local candidates candidate
+  candidates="$(pick_candidate)"
+  if [ "$(jq 'length' <<<"$candidates")" -eq 0 ]; then
     log "No ready tickets."
     return 1
   fi
+  candidate="$(jq -c '.[0]' <<<"$candidates")"
   local n
   n="$(jq -r '.number' <<<"$candidate")"
   log "Candidate: #$n ($(jq -r '.title' <<<"$candidate"))"
@@ -349,10 +354,16 @@ run_one_cycle() {
 }
 
 pick_candidate() {
+  local pfx
+  if [ "$REPO_WIDE" = true ]; then
+    pfx="$TICKET_MARKER_GENERIC_PREFIX"
+  else
+    pfx="$TICKET_MARKER_PREFIX"
+  fi
   local raw ready dep_numbers closed_map
   raw="$(gh issue list --repo "$REPO" --state open --limit 200 \
           --json number,title,body,labels,assignees 2>/dev/null || echo '[]')"
-  ready="$(jq --arg pfx "$TICKET_MARKER_PREFIX" '
+  ready="$(jq --arg pfx "$pfx" '
     map(select(
       (.body // "" | contains($pfx))
       and ((.labels // []) | map(.name) | any(startswith("lock:")) | not)
@@ -360,7 +371,7 @@ pick_candidate() {
       and ((.assignees // []) | length == 0)
     ))
   ' <<<"$raw")"
-  [ "$(jq 'length' <<<"$ready")" -gt 0 ] || return 0
+  [ "$(jq 'length' <<<"$ready")" -gt 0 ] || { echo '[]'; return 0; }
 
   dep_numbers="$(jq -r '
     .[] | (.body // "")
@@ -408,7 +419,6 @@ pick_candidate() {
     )
     | map(select(.ready))
     | sort_by(._priority, ._complexity, .number)
-    | .[0] // empty
   ' <<<"$ready"
 }
 

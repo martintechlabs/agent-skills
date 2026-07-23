@@ -624,3 +624,60 @@ test_plan_given_manifest_missing_still_fatal() {
   rm -rf "$d"
 }
 test_plan_given_manifest_missing_still_fatal
+
+# ---- Repo-wide discovery: Task 2 — pick_candidate() repo-wide filter + array return ----
+
+test_pick_candidate_single_plan_still_works() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json"
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Ticket A", body:"Body A\n\n<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->",
+     labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --plan plan1 --agent-cmd echo --dry-run --once
+  assert_eq "$RC" "0" "single-plan dry-run still exits 0 after array-contract change"
+  assert_contains "$ERR" "#101" "still finds and reports the ticket"
+  rm -rf "$d"
+}
+test_pick_candidate_single_plan_still_works
+
+test_repo_wide_matches_generic_prefix() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json"
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Ticket A", body:"Body A\n\n<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->",
+     labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --agent-cmd echo --dry-run --once
+  assert_eq "$RC" "0" "repo-wide dry-run exits 0"
+  assert_contains "$ERR" "#101" "repo-wide mode finds the ticket via the generic marker prefix"
+  rm -rf "$d"
+}
+test_repo_wide_matches_generic_prefix
+
+# Proves the repo-wide filter actually discriminates on the marker rather than
+# matching every open issue -- TICKET_MARKER_PREFIX defaults to "", and jq's
+# `contains("")` is true for any string, so a naive unconditional use of that
+# global would silently pass every open issue through regardless of marker.
+test_repo_wide_ignores_issues_without_the_marker() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json"
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Unrelated issue", body:"Just a regular bug report, no plan-to-tickets marker at all.",
+     labels:["priority:p1"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --agent-cmd echo --once
+  assert_contains "$ERR" "No ready tickets" "a non-plan-to-tickets issue is never treated as a candidate"
+  assert_not_contains "$ERR" "Candidate: #101" "the unrelated issue was not picked"
+  rm -rf "$d"
+}
+test_repo_wide_ignores_issues_without_the_marker
