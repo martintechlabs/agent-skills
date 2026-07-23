@@ -352,26 +352,10 @@ test_em_plan_given_no_epic_still_fatal
 
 # ---- Repo-wide discovery: Task 6 — discover_open_epics() staleness ranking ----
 
-test_discover_never_visited_epic_sorts_first() {
-  local d; d="$(mktemp -d)"
-  make_repo "$d" plan-a
-  local bin; bin="$(bindir_for "$d")"
-  local epic_a epic_b
-  epic_a="$(issue_json 100 'Epic A' '<!-- plan-to-tickets:epic:docs/superpowers/plans/plan-a.md -->' '[]')"
-  epic_b="$(issue_json 200 'Epic B' '<!-- plan-to-tickets:epic:docs/superpowers/plans/plan-b.md -->' '[]')"
-  seed_state "$d/state" "[$epic_a,$epic_b]"
-  # Epic A has a prior visit marker; Epic B has never been visited.
-  jq '.issues["100"].comments = [{databaseId:1, body:"progress\n<!-- manager:lock-acquired:2026-01-01T00:00:00Z -->", createdAt:"2026-01-01T00:00:00Z"}]' \
-    "$d/state" > "$d/state.tmp" && mv "$d/state.tmp" "$d/state"
-  run_em "$d/work" "$bin" FAKE_GH_STATE="$d/state" -- --dry-run --once
-  assert_contains "$ERR" "discovered epics (stalest first): #200 #100" "never-visited epic B sorts before visited epic A"
-  rm -rf "$d"
-}
-test_discover_never_visited_epic_sorts_first
-
 test_discover_older_visit_sorts_first_among_visited() {
   local d; d="$(mktemp -d)"
-  make_repo "$d" plan-a
+  make_repo "$d" plan-a docs/superpowers/plans/plan-a.md
+  add_second_manifest_em "$d/work" plan-b docs/superpowers/plans/plan-b.md
   local bin; bin="$(bindir_for "$d")"
   local epic_a epic_b
   epic_a="$(issue_json 100 'Epic A' '<!-- plan-to-tickets:epic:docs/superpowers/plans/plan-a.md -->' '[]')"
@@ -381,22 +365,86 @@ test_discover_older_visit_sorts_first_among_visited() {
       | .issues["200"].comments = [{databaseId:2, body:"<!-- manager:lock-acquired:2026-01-01T00:00:00Z -->", createdAt:"2026-01-01T00:00:00Z"}]' \
     "$d/state" > "$d/state.tmp" && mv "$d/state.tmp" "$d/state"
   run_em "$d/work" "$bin" FAKE_GH_STATE="$d/state" -- --dry-run --once
-  assert_contains "$ERR" "discovered epics (stalest first): #200 #100" "epic B (older visit, Jan 1) sorts before epic A (newer visit, Jan 5)"
+  assert_contains "$ERR" "epic issue:    #200" "epic B (older visit, Jan 1) sorts before epic A (newer visit, Jan 5)"
   rm -rf "$d"
 }
 test_discover_older_visit_sorts_first_among_visited
 
 test_discover_ignores_non_epic_issues() {
   local d; d="$(mktemp -d)"
-  make_repo "$d" plan-a
+  make_repo "$d" plan-a docs/superpowers/plans/plan-a.md
   local bin; bin="$(bindir_for "$d")"
   local epic_a not_an_epic
   epic_a="$(issue_json 100 'Epic A' '<!-- plan-to-tickets:epic:docs/superpowers/plans/plan-a.md -->' '[]')"
   not_an_epic="$(issue_json 101 'A ticket' '<!-- plan-to-tickets:ticket:docs/superpowers/plans/plan-a.md:001-a -->' '[]')"
   seed_state "$d/state" "[$epic_a,$not_an_epic]"
   run_em "$d/work" "$bin" FAKE_GH_STATE="$d/state" -- --dry-run --once
-  assert_contains "$ERR" "discovered epics (stalest first): #100" "only the epic-marker issue is discovered"
-  assert_not_contains "$ERR" "#101" "the ticket issue is not mistaken for an epic"
+  assert_contains "$ERR" "epic issue:    #100" "the epic-marker issue resolves correctly"
+  assert_not_contains "$ERR" "Skipping discovered epic" "the ticket issue is not mistaken for an epic and doesn't trigger a skip"
   rm -rf "$d"
 }
 test_discover_ignores_non_epic_issues
+
+# ---- Repo-wide discovery: Task 7 — per-cycle epic resolution ----
+
+test_repo_wide_processes_stalest_epic() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan-a docs/superpowers/plans/plan-a.md
+  add_second_manifest_em "$d/work" plan-b docs/superpowers/plans/plan-b.md
+  local bin; bin="$(bindir_for "$d")"
+  local epic_a epic_b
+  epic_a="$(issue_json 100 'Epic A' '<!-- plan-to-tickets:epic:docs/superpowers/plans/plan-a.md -->' '[]')"
+  epic_b="$(issue_json 200 'Epic B' '<!-- plan-to-tickets:epic:docs/superpowers/plans/plan-b.md -->' '[]')"
+  seed_state "$d/state" "[$epic_a,$epic_b]"
+  # Epic A already visited; Epic B never visited -> B is stalest, must be chosen.
+  jq '.issues["100"].comments = [{databaseId:1, body:"<!-- manager:lock-acquired:2026-01-01T00:00:00Z -->", createdAt:"2026-01-01T00:00:00Z"}]' \
+    "$d/state" > "$d/state.tmp" && mv "$d/state.tmp" "$d/state"
+  run_em "$d/work" "$bin" FAKE_GH_STATE="$d/state" -- --dry-run --once
+  assert_eq "$RC" "0" "repo-wide dry-run exits 0"
+  assert_contains "$ERR" "epic issue:    #200" "resolved the stalest epic (B, #200), not epic A"
+  rm -rf "$d"
+}
+test_repo_wide_processes_stalest_epic
+
+test_repo_wide_skips_epic_with_missing_manifest() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan-a docs/superpowers/plans/plan-a.md
+  # No manifest committed for plan-missing -- epic 200's marker references a
+  # plan that was never filed with a manifest.
+  local bin; bin="$(bindir_for "$d")"
+  local epic_missing epic_a
+  epic_missing="$(issue_json 200 'Broken epic' '<!-- plan-to-tickets:epic:docs/superpowers/plans/plan-missing.md -->' '[]')"
+  epic_a="$(issue_json 100 'Epic A' '<!-- plan-to-tickets:epic:docs/superpowers/plans/plan-a.md -->' '[]')"
+  seed_state "$d/state" "[$epic_missing,$epic_a]"
+  # Both never-visited; #200 sorts first only by number-stability of jq's sort,
+  # which is not guaranteed -- assert on behavior (skip + fallthrough), not order.
+  run_em "$d/work" "$bin" FAKE_GH_STATE="$d/state" -- --dry-run --once
+  assert_eq "$RC" "0" "repo-wide dry-run exits 0 despite one broken epic"
+  assert_contains "$ERR" "epic issue:    #100" "fell through to the resolvable epic"
+  rm -rf "$d"
+}
+test_repo_wide_skips_epic_with_missing_manifest
+
+test_repo_wide_all_epics_broken() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan-a docs/superpowers/plans/plan-a.md
+  local bin; bin="$(bindir_for "$d")"
+  local epic_missing
+  epic_missing="$(issue_json 200 'Broken epic' '<!-- plan-to-tickets:epic:docs/superpowers/plans/plan-missing.md -->' '[]')"
+  seed_state "$d/state" "[$epic_missing]"
+  run_em "$d/work" "$bin" FAKE_GH_STATE="$d/state" -- --once
+  assert_contains "$ERR" "No discovered epics resolved to a valid manifest" "clear message when every discovered epic is broken"
+  rm -rf "$d"
+}
+test_repo_wide_all_epics_broken
+
+test_repo_wide_no_open_epics() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan-a docs/superpowers/plans/plan-a.md
+  local bin; bin="$(bindir_for "$d")"
+  seed_state "$d/state" "[]"
+  run_em "$d/work" "$bin" FAKE_GH_STATE="$d/state" -- --once
+  assert_contains "$ERR" "No open epics found" "clear message when nothing is discovered"
+  rm -rf "$d"
+}
+test_repo_wide_no_open_epics

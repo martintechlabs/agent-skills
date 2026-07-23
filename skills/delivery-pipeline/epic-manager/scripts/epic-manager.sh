@@ -80,11 +80,6 @@ main() {
   if [ "$REPO_WIDE" != true ]; then
     load_manifest "$PLAN_SLUG" || die 1 "Manifest not found or malformed for plan '$PLAN_SLUG', or no epic issue found for it (run plan-to-tickets first)"
   fi
-  if [ "$REPO_WIDE" = true ]; then
-    local discovered
-    discovered="$(discover_open_epics)"
-    log "discovered epics (stalest first): $(jq -r '[.[] | "#\(.number)"] | join(" ")' <<<"$discovered")"
-  fi
   # --dry-run and --once both run a single cycle and exit. The loop mode is for
   # long-running terminals / CI; cron firings always pass --once (see WARP.md).
   if [ "$ONCE" = true ] || [ "$DRY_RUN" = true ]; then
@@ -325,6 +320,30 @@ detect_stale_lock() {
 }
 
 run_one_cycle() {
+  if [ "$REPO_WIDE" = true ]; then
+    local candidates total
+    candidates="$(discover_open_epics)"
+    total="$(jq 'length' <<<"$candidates")"
+    if [ "$total" -eq 0 ]; then
+      log "No open epics found."
+      return 1
+    fi
+    local i=0 resolved=false
+    while [ "$i" -lt "$total" ]; do
+      local slug
+      slug="$(jq -r ".[$i].slug" <<<"$candidates")"
+      if load_manifest "$slug"; then
+        resolved=true
+        break
+      fi
+      log "Skipping discovered epic (slug: $slug): manifest/epic lookup failed."
+      i=$((i + 1))
+    done
+    if [ "$resolved" != true ]; then
+      log "No discovered epics resolved to a valid manifest."
+      return 1
+    fi
+  fi
   local labels held
   labels="$(gh issue view "$EPIC_NUMBER" --repo "$REPO" --json labels -q '[.labels[].name]' 2>/dev/null || echo '[]')"
   held="$(jq --arg L "$LOCK_LABEL" 'index($L) != null' <<<"$labels")"
