@@ -582,3 +582,45 @@ test_dry_run_reports_agent_source_from_yml() {
 }
 
 test_dry_run_reports_agent_source_from_yml
+
+# ---- Repo-wide discovery: Task 1 — --plan optional, load_manifest() parameterized ----
+
+test_plan_flag_now_optional() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json"
+  seed_state "$state" "[]"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --agent-cmd echo --once
+  assert_not_contains "$ERR" "Missing --plan" "--plan is no longer required"
+  rm -rf "$d"
+}
+test_plan_flag_now_optional
+
+test_repo_wide_no_manifest_loaded_at_startup() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json"
+  seed_state "$state" "[]"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --agent-cmd echo --once
+  assert_eq "$RC" "0" "repo-wide with no tickets exits 0 (once mode always exits 0)"
+  assert_not_contains "$ERR" "Manifest not found" "no manifest load is attempted at startup without --plan"
+  assert_contains "$ERR" "No ready tickets" "empty repo-wide backlog behaves like today's empty-backlog case, not an error"
+  rm -rf "$d"
+}
+test_repo_wide_no_manifest_loaded_at_startup
+
+test_plan_given_manifest_missing_still_fatal() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$d/state.json" \
+    -- --worker alice --plan does-not-exist --agent-cmd echo --once
+  assert_eq "$RC" "1" "missing manifest with --plan given still exits 1"
+  assert_contains "$ERR" "Manifest not found" "still reports the specific reason"
+  rm -rf "$d"
+}
+test_plan_given_manifest_missing_still_fatal

@@ -11,6 +11,7 @@ set -euo pipefail
 
 WORKER=""
 PLAN_SLUG=""
+REPO_WIDE=false   # true when --plan was omitted: discover across every open plan
 REPO=""
 AGENT_CMD=""   # optional global override; when empty, load agents.yml
 AGENT_CMD_LITE=""
@@ -107,7 +108,9 @@ EOF
 main() {
   parse_args "$@"
   preflight
-  load_manifest
+  if [ "$REPO_WIDE" != true ]; then
+    load_manifest "$PLAN_SLUG" || die 1 "Manifest not found or malformed for plan '$PLAN_SLUG' (run plan-to-tickets first)"
+  fi
   # run_one_cycle is called as a bare statement, never as the tested command
   # of an if/&&/||/! -- bash suppresses errexit (and ERR traps) for a
   # command's *entire* call tree in that position, which would silently
@@ -158,7 +161,9 @@ parse_args() {
   [ -n "$WORKER" ] || die 2 "Missing --worker <name>. Valid names: ${WORKER_NAMES[*]}"
   WORKER="${WORKER,,}"
   is_valid_worker_name "$WORKER" || die 2 "--worker must be one of: ${WORKER_NAMES[*]} (got: $WORKER)"
-  [ -n "$PLAN_SLUG" ] || die 2 "Missing --plan <slug>"
+  if [ -z "$PLAN_SLUG" ]; then
+    REPO_WIDE=true
+  fi
   # AGENT_CMD optional: validated in preflight against agents.yml when empty
   case "$MERGE_METHOD" in --squash|--rebase|--merge) ;; *) die 2 "--merge-method must be --squash|--rebase|--merge" ;; esac
   LOCK_LABEL="lock:$WORKER"
@@ -262,11 +267,21 @@ ensure_lock_labels() {
   fi
 }
 
+# load_manifest <slug> -- populates MANIFEST_FILE/SOURCE_BRANCH/SPEC_FILE/PLAN_FILE/
+# TICKET_MARKER_PREFIX/PLAN_SLUG for <slug>. Returns 1 (never dies) on a missing or
+# malformed manifest -- the caller decides whether that's fatal (--plan given) or a
+# skip-this-candidate signal (repo-wide mode). Globals are only assigned on full
+# success, so a failed call never leaves partial state behind.
 load_manifest() {
+  local slug="$1"
   local root
   root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-  MANIFEST_FILE="$root/docs/superpowers/tickets/$PLAN_SLUG.md"
-  [ -f "$MANIFEST_FILE" ] || die 1 "Manifest not found: $MANIFEST_FILE (run plan-to-tickets first)"
+  local manifest_file="$root/docs/superpowers/tickets/$slug.md"
+  if [ ! -f "$manifest_file" ]; then
+    log "Manifest not found: $manifest_file (run plan-to-tickets first)"
+    return 1
+  fi
+  local source_branch="" spec_file="" plan_file=""
   local in_fm=false key val line
   while IFS= read -r line; do
     if [ "$line" = "---" ]; then
@@ -276,20 +291,27 @@ load_manifest() {
     key="${line%%:*}"; val="${line#*:}"; val="${val# }"
     val="${val#\"}"; val="${val%\"}"
     case "$key" in
-      source_branch) SOURCE_BRANCH="$val" ;;
-      spec_file) SPEC_FILE="$val" ;;
-      plan_file) PLAN_FILE="$val" ;;
+      source_branch) source_branch="$val" ;;
+      spec_file) spec_file="$val" ;;
+      plan_file) plan_file="$val" ;;
     esac
-  done < "$MANIFEST_FILE"
-  [ -n "$SOURCE_BRANCH" ] || die 1 "Manifest missing source_branch: $MANIFEST_FILE"
-  [ -n "$SPEC_FILE" ] || die 1 "Manifest missing spec_file: $MANIFEST_FILE"
-  [ -n "$PLAN_FILE" ] || die 1 "Manifest missing plan_file: $MANIFEST_FILE"
+  done < "$manifest_file"
+  if [ -z "$source_branch" ] || [ -z "$spec_file" ] || [ -z "$plan_file" ]; then
+    log "Manifest missing source_branch/spec_file/plan_file: $manifest_file"
+    return 1
+  fi
+  PLAN_SLUG="$slug"
+  MANIFEST_FILE="$manifest_file"
+  SOURCE_BRANCH="$source_branch"
+  SPEC_FILE="$spec_file"
+  PLAN_FILE="$plan_file"
   TICKET_MARKER_PREFIX="<!-- plan-to-tickets:ticket:$PLAN_FILE:"
   vlog "manifest: $MANIFEST_FILE"
   vlog "  source_branch: $SOURCE_BRANCH"
   vlog "  spec_file:     $SPEC_FILE"
   vlog "  plan_file:     $PLAN_FILE"
   vlog "  reviewer model: $(reviewer_model)"
+  return 0
 }
 
 run_one_cycle() {
