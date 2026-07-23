@@ -394,7 +394,9 @@ ticket output.
 - **Retry `needs-human` tickets.** All failures require human triage.
 - **Invent model IDs for you over time.** `init-agents.sh` ships a Claude
   snapshot; projects own edits to `agents.yml`.
-- **Coordinate across plans or repos.** One invocation, one plan, one repo.
+- **Coordinate across repos.** One invocation, one repo — even in repo-wide
+  mode, which ranks tickets across multiple *plans* within that one repo,
+  never multiple repos at once.
 - **Scale past 10 workers per repo.** The 10-name lock label set is the cap.
 - **Auto-merge PRs before codex says the patch is correct.** `overall_correctness`
   is a hard gate, even without matching high-priority findings.

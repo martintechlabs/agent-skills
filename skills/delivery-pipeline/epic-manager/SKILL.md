@@ -5,15 +5,17 @@ description: >-
   epic->main PR behind a per-project hybrid checklist (run: shell + judge: codex),
   run a final integration review, and obey human commands (ship it / rework: /
   abandon) posted as comments on the epic issue. Singleton (lock:manager), runs
-  on cron or in a slow loop, one plan per invocation. Peer to execute-tickets;
-  communicates through GitHub state only. Use when execute-tickets has merged
-  ticket PRs into the epic branch and you want the epic shepherded to a
-  reviewable PR on main with a final review and human merge approval. Never
-  re-plans, assigns tickets, auto-merges without human approval, or touches
-  individual ticket issues (except filing new ones for rework:).
+  on cron or in a slow loop. Peer to execute-tickets; communicates through
+  GitHub state only. Use when execute-tickets has merged ticket PRs into the
+  epic branch and you want the epic shepherded to a reviewable PR on main with
+  a final review and human merge approval. Omit --plan for repo-wide mode,
+  processing one open epic per cycle, stalest-first -- ideal for a single
+  long-running manager process covering the whole repo. Never re-plans,
+  assigns tickets, auto-merges without human approval, or touches individual
+  ticket issues (except filing new ones for rework:).
 metadata:
   author: stephen-martin
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # Supervise a plan-to-tickets epic end-to-end
@@ -51,6 +53,16 @@ for that approval.
 
 If no epic issue with the marker exists, the manager stops and points at
 `plan-to-tickets` — it does not try to reconstruct the epic from ticket state.
+
+**Repo-wide mode.** Omit `--plan` entirely to have the manager discover every
+open epic and process one per cycle, stalest-first (ranked by each epic's own
+comment history — no new state, nothing to configure). A discovered epic whose
+manifest can't be resolved is skipped with a logged warning; the manager tries
+the next-stalest epic instead of dying. This is the mode a long-running manager
+process should use (e.g. deployed continuously via systemd, one instance for
+the whole repo) so new epics get supervised as soon as `plan-to-tickets` files
+them — no per-plan process to start. Use `--plan` to dedicate an invocation to
+one specific epic instead.
 
 ## The human↔manager interface
 
@@ -292,7 +304,7 @@ present), and the next firing re-checks.
 
 | Flag | Effect |
 |--|--|
-| `--plan <slug>` | Plan slug (required). Same as `execute-tickets`. |
+| `--plan <slug>` | Plan slug. Same as `execute-tickets`. Optional — omit for repo-wide mode (see below). |
 | `--repo <owner/repo>` | Target repo (default: current repo via `gh repo view`). |
 | `--checklist <path>` | Override checklist file (default: `.execute-tickets/checklist.yml`). |
 | `--reviewer-cmd <cmd>` | Final-review codex command (default: vendored). |
@@ -333,6 +345,8 @@ through GitHub state:
 - **Touch individual tickets.** The manager reads ticket state for progress
   and files new tickets for `rework:`, but never edits/closes/labels an
   existing ticket. Ticket lifecycle is the executor's job.
-- **Coordinate across plans or repos.** One invocation, one plan, one repo.
+- **Coordinate across repos.** One invocation, one repo — even in repo-wide
+  mode, which processes multiple *plans* within that one repo, one epic per
+  cycle, never multiple repos at once.
 - **Prevent merge based on the final review.** The final review is advisory.
   Blocking findings are loud, but the human decides.
