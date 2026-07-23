@@ -40,7 +40,8 @@
       "skills": [
         "plan-to-tickets",
         "execute-tickets",
-        "epic-manager"
+        "epic-manager",
+        "init-delivery-pipeline"
       ]
     },
     {
