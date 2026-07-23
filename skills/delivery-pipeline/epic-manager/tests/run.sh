@@ -24,16 +24,6 @@ test_help() {
 }
 test_help
 
-test_missing_plan_flag() {
-  local d; d="$(mktemp -d)"
-  make_repo "$d" test-plan
-  run_em "$d/work" "$(bindir_for "$d")" --
-  assert_eq "$RC" "2" "missing --plan exits 2"
-  assert_contains "$ERR" "Missing --plan" "clear error for missing --plan"
-  rm -rf "$d"
-}
-test_missing_plan_flag
-
 test_load_manifest() {
   local d; d="$(mktemp -d)"
   make_repo "$d" test-plan
@@ -316,3 +306,46 @@ test_approval_reset_after_epic_merge() {
   rm -rf "$d"
 }
 test_approval_reset_after_epic_merge
+
+# ---- Repo-wide discovery: Task 5 — --plan optional, load_manifest() parameterized ----
+
+test_em_plan_flag_now_optional() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" test-plan
+  seed_state "$d/state" "[]"
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" -- --once
+  assert_not_contains "$ERR" "Missing --plan" "--plan is no longer required"
+  rm -rf "$d"
+}
+test_em_plan_flag_now_optional
+
+test_em_repo_wide_no_manifest_loaded_at_startup() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" test-plan
+  seed_state "$d/state" "[]"
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" -- --once
+  assert_not_contains "$ERR" "Manifest not found" "no manifest load is attempted at startup without --plan"
+  rm -rf "$d"
+}
+test_em_repo_wide_no_manifest_loaded_at_startup
+
+test_em_plan_given_manifest_missing_still_fatal() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" test-plan
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" -- --plan does-not-exist --dry-run
+  assert_eq "$RC" "1" "missing manifest with --plan given still exits 1"
+  assert_contains "$ERR" "Manifest not found" "still reports the specific reason"
+  rm -rf "$d"
+}
+test_em_plan_given_manifest_missing_still_fatal
+
+test_em_plan_given_no_epic_still_fatal() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" test-plan
+  seed_state "$d/state" "[$(issue_json 100 'Not the epic' 'no marker here' '[]')]"
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" -- --plan test-plan --dry-run
+  assert_eq "$RC" "1" "missing epic issue with --plan given still exits 1"
+  assert_contains "$ERR" "No epic issue" "still reports the specific reason (regression pin -- must match this exact wording)"
+  rm -rf "$d"
+}
+test_em_plan_given_no_epic_still_fatal

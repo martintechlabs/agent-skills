@@ -7,6 +7,7 @@
 set -euo pipefail
 
 PLAN_SLUG=""
+REPO_WIDE=false   # true when --plan was omitted: discover across every open epic
 REPO=""
 CHECKLIST_FILE=""
 REVIEWER_CMD_DEFAULT='codex exec --model "${CODEX_MODEL:-gpt-5-codex}" --output-schema {final_review_schema} -o {final_review_output} --sandbox read-only - < {final_review_prompt_composed}'
@@ -76,7 +77,9 @@ EOF
 main() {
   parse_args "$@"
   preflight
-  load_manifest
+  if [ "$REPO_WIDE" != true ]; then
+    load_manifest "$PLAN_SLUG" || die 1 "Manifest not found or malformed for plan '$PLAN_SLUG', or no epic issue found for it (run plan-to-tickets first)"
+  fi
   # --dry-run and --once both run a single cycle and exit. The loop mode is for
   # long-running terminals / CI; cron firings always pass --once (see WARP.md).
   if [ "$ONCE" = true ] || [ "$DRY_RUN" = true ]; then
@@ -110,7 +113,9 @@ parse_args() {
       *) die 2 "Unknown flag: $1" ;;
     esac
   done
-  [ -n "$PLAN_SLUG" ] || die 2 "Missing --plan <slug>"
+  if [ -z "$PLAN_SLUG" ]; then
+    REPO_WIDE=true
+  fi
   [ -n "$REVIEWER_CMD" ] || REVIEWER_CMD="$REVIEWER_CMD_DEFAULT"
   [ -n "$FINAL_REVIEW_SCHEMA" ] || FINAL_REVIEW_SCHEMA="$SKILL_DIR/references/final-review-schema.json"
   [ -n "$FINAL_REVIEW_PROMPT" ] || FINAL_REVIEW_PROMPT="$SKILL_DIR/references/final-review-prompt.md"
@@ -172,11 +177,20 @@ ensure_rework_label() {
   gh label create "$name" --repo "$REPO" --color "$(rework_label_color "$name")" --force >/dev/null 2>&1 || true
 }
 
+# load_manifest <slug> -- populates MANIFEST_FILE/SOURCE_BRANCH/SPEC_FILE/PLAN_FILE/
+# EPIC_MARKER/TICKET_MARKER_PREFIX/EPIC_NUMBER/PLAN_SLUG for <slug>. Returns 1
+# (never dies) on a missing/malformed manifest or a missing epic issue -- the
+# caller decides whether that's fatal (--plan given) or a skip signal (repo-wide).
 load_manifest() {
+  local slug="$1"
   local root
   root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-  MANIFEST_FILE="$root/docs/superpowers/tickets/$PLAN_SLUG.md"
-  [ -f "$MANIFEST_FILE" ] || die 1 "Manifest not found: $MANIFEST_FILE (run plan-to-tickets first)"
+  local manifest_file="$root/docs/superpowers/tickets/$slug.md"
+  if [ ! -f "$manifest_file" ]; then
+    log "Manifest not found: $manifest_file (run plan-to-tickets first)"
+    return 1
+  fi
+  local source_branch="" spec_file="" plan_file=""
   local in_fm=false key val line
   while IFS= read -r line; do
     if [ "$line" = "---" ]; then
@@ -185,31 +199,45 @@ load_manifest() {
     [ "$in_fm" = true ] || continue
     key="${line%%:*}"; val="${line#*:}"; val="${val# }"; val="${val#\"}"; val="${val%\"}"
     case "$key" in
-      source_branch) SOURCE_BRANCH="$val" ;;
-      spec_file) SPEC_FILE="$val" ;;
-      plan_file) PLAN_FILE="$val" ;;
+      source_branch) source_branch="$val" ;;
+      spec_file) spec_file="$val" ;;
+      plan_file) plan_file="$val" ;;
     esac
-  done < "$MANIFEST_FILE"
-  [ -n "$SOURCE_BRANCH" ] || die 1 "Manifest missing source_branch: $MANIFEST_FILE"
-  [ -n "$SPEC_FILE" ] || die 1 "Manifest missing spec_file: $MANIFEST_FILE"
-  [ -n "$PLAN_FILE" ] || die 1 "Manifest missing plan_file: $MANIFEST_FILE"
-  EPIC_MARKER="<!-- plan-to-tickets:epic:$PLAN_FILE -->"
+  done < "$manifest_file"
+  if [ -z "$source_branch" ] || [ -z "$spec_file" ] || [ -z "$plan_file" ]; then
+    log "Manifest missing source_branch/spec_file/plan_file: $manifest_file"
+    return 1
+  fi
+  local epic_marker="<!-- plan-to-tickets:epic:$plan_file -->"
+  local epic_number
+  epic_number="$(find_epic_issue_by_marker "$epic_marker")"
+  if [ -z "$epic_number" ]; then
+    log "No epic issue found with marker $epic_marker. Run plan-to-tickets first."
+    return 1
+  fi
+  PLAN_SLUG="$slug"
+  MANIFEST_FILE="$manifest_file"
+  SOURCE_BRANCH="$source_branch"
+  SPEC_FILE="$spec_file"
+  PLAN_FILE="$plan_file"
+  EPIC_MARKER="$epic_marker"
   TICKET_MARKER_PREFIX="<!-- plan-to-tickets:ticket:$PLAN_FILE:"
-  EPIC_NUMBER="$(find_epic_issue)"
-  [ -n "$EPIC_NUMBER" ] || die 1 "No epic issue found with marker $EPIC_MARKER. Run plan-to-tickets first."
+  EPIC_NUMBER="$epic_number"
   vlog "manifest: $MANIFEST_FILE"
   vlog "  source_branch: $SOURCE_BRANCH"
   vlog "  spec_file:     $SPEC_FILE"
   vlog "  plan_file:     $PLAN_FILE"
   vlog "  epic issue:    #$EPIC_NUMBER"
+  return 0
 }
 
-find_epic_issue() {
+find_epic_issue_by_marker() {
   # The epic issue carries the plan-to-tickets:epic marker. Search all states
   # (a completed epic may be closed; a human may have re-opened it for rework).
+  local marker="$1"
   gh issue list --repo "$REPO" --state all --limit 500 \
     --json number,body 2>/dev/null \
-    | jq -r --arg marker "$EPIC_MARKER" '.[] | select(.body // "" | contains($marker)) | .number' \
+    | jq -r --arg marker "$marker" '.[] | select(.body // "" | contains($marker)) | .number' \
     | head -1
 }
 
