@@ -72,6 +72,7 @@ Turn a plan into a live GitHub backlog and drive it to done.
 | [`plan-to-tickets`](skills/delivery-pipeline/plan-to-tickets/SKILL.md) | Turns a superpowers spec + implementation plan into a GitHub backlog — an epic issue plus complexity/model-tier/priority/dependency-tagged ticket sub-issues for independent workers to pick up. Idempotent, with a `--dry-run` preview gate before anything is filed. |
 | [`execute-tickets`](skills/delivery-pipeline/execute-tickets/SKILL.md) | Picks up a plan-to-tickets backlog, drives each ready ticket through agent + codex review + CI verification, and merges the PR back to the plan's epic branch. Runs as up to 10 named concurrent workers (`alice`–`justin`) with per-slot `lock:<name>` labels. |
 | [`epic-manager`](skills/delivery-pipeline/epic-manager/SKILL.md) | Supervises a plan-to-tickets epic end-to-end: tracks executor progress, gates the epic→`main` PR behind a per-project hybrid checklist (run: shell + judge: codex), runs a final integration review, and obeys human commands (`ship it` / `rework:` / `abandon`) posted as comments on the epic issue. Singleton, cron-friendly, communicates through GitHub state only. |
+| [`init-delivery-pipeline`](skills/delivery-pipeline/init-delivery-pipeline/SKILL.md) | Interactively scaffolds a project-aware `.execute-tickets/agents.yml` + `checklist.yml` for a repo running the other three skills, then prints the exact ready-to-paste `execute-tickets`/`epic-manager` cron commands. One-time setup companion — never runs headless, never touches GitHub. |
 
 ### DevOps
 
