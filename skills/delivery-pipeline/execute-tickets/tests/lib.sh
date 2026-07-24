@@ -54,6 +54,27 @@ EOF
   git -C "$dir/work" push -q origin main epic
 }
 
+# add_second_manifest <workdir> <slug> <plan_file> [source_branch]
+# Writes a second manifest (a different plan than make_repo's default) directly
+# into an already-initialized work tree, mirroring what plan-to-tickets' own
+# create-tickets.sh would have produced for a second, independently-filed plan.
+add_second_manifest() {
+  local workdir="$1" slug="$2" plan_file="$3" source_branch="${4:-epic}"
+  mkdir -p "$workdir/docs/superpowers/tickets"
+  cat > "$workdir/docs/superpowers/tickets/$slug.md" <<EOF
+---
+source_branch: "$source_branch"
+spec_file: "docs/superpowers/specs/test-spec-2.md"
+plan_file: "$plan_file"
+---
+
+# Tickets filed for $plan_file
+EOF
+  git -C "$workdir" add "docs/superpowers/tickets/$slug.md"
+  git -C "$workdir" commit -q -m "file tickets for $slug"
+  git -C "$workdir" push -q origin epic
+}
+
 # issue_json <number> <title> <body> <labels_json_array> -> one issue object
 issue_json() {
   local n="$1" title="$2" body="$3" labels="$4"

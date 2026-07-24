@@ -24,16 +24,6 @@ test_help() {
 }
 test_help
 
-test_missing_plan_flag() {
-  local d; d="$(mktemp -d)"
-  make_repo "$d" test-plan
-  run_em "$d/work" "$(bindir_for "$d")" --
-  assert_eq "$RC" "2" "missing --plan exits 2"
-  assert_contains "$ERR" "Missing --plan" "clear error for missing --plan"
-  rm -rf "$d"
-}
-test_missing_plan_flag
-
 test_load_manifest() {
   local d; d="$(mktemp -d)"
   make_repo "$d" test-plan
@@ -316,3 +306,145 @@ test_approval_reset_after_epic_merge() {
   rm -rf "$d"
 }
 test_approval_reset_after_epic_merge
+
+# ---- Repo-wide discovery: Task 5 — --plan optional, load_manifest() parameterized ----
+
+test_em_plan_flag_now_optional() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" test-plan
+  seed_state "$d/state" "[]"
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" -- --once
+  assert_not_contains "$ERR" "Missing --plan" "--plan is no longer required"
+  rm -rf "$d"
+}
+test_em_plan_flag_now_optional
+
+test_em_repo_wide_no_manifest_loaded_at_startup() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" test-plan
+  seed_state "$d/state" "[]"
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" -- --once
+  assert_not_contains "$ERR" "Manifest not found" "no manifest load is attempted at startup without --plan"
+  rm -rf "$d"
+}
+test_em_repo_wide_no_manifest_loaded_at_startup
+
+test_em_plan_given_manifest_missing_still_fatal() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" test-plan
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" -- --plan does-not-exist --dry-run
+  assert_eq "$RC" "1" "missing manifest with --plan given still exits 1"
+  assert_contains "$ERR" "Manifest not found" "still reports the specific reason"
+  rm -rf "$d"
+}
+test_em_plan_given_manifest_missing_still_fatal
+
+test_em_plan_given_no_epic_still_fatal() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" test-plan
+  seed_state "$d/state" "[$(issue_json 100 'Not the epic' 'no marker here' '[]')]"
+  run_em "$d/work" "$(bindir_for "$d")" FAKE_GH_STATE="$d/state" -- --plan test-plan --dry-run
+  assert_eq "$RC" "1" "missing epic issue with --plan given still exits 1"
+  assert_contains "$ERR" "No epic issue" "still reports the specific reason (regression pin -- must match this exact wording)"
+  rm -rf "$d"
+}
+test_em_plan_given_no_epic_still_fatal
+
+# ---- Repo-wide discovery: Task 6 — discover_open_epics() staleness ranking ----
+
+test_discover_older_visit_sorts_first_among_visited() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan-a docs/superpowers/plans/plan-a.md
+  add_second_manifest_em "$d/work" plan-b docs/superpowers/plans/plan-b.md
+  local bin; bin="$(bindir_for "$d")"
+  local epic_a epic_b
+  epic_a="$(issue_json 100 'Epic A' '<!-- plan-to-tickets:epic:docs/superpowers/plans/plan-a.md -->' '[]')"
+  epic_b="$(issue_json 200 'Epic B' '<!-- plan-to-tickets:epic:docs/superpowers/plans/plan-b.md -->' '[]')"
+  seed_state "$d/state" "[$epic_a,$epic_b]"
+  jq '.issues["100"].comments = [{databaseId:1, body:"<!-- manager:lock-acquired:2026-01-05T00:00:00Z -->", createdAt:"2026-01-05T00:00:00Z"}]
+      | .issues["200"].comments = [{databaseId:2, body:"<!-- manager:lock-acquired:2026-01-01T00:00:00Z -->", createdAt:"2026-01-01T00:00:00Z"}]' \
+    "$d/state" > "$d/state.tmp" && mv "$d/state.tmp" "$d/state"
+  run_em "$d/work" "$bin" FAKE_GH_STATE="$d/state" -- --dry-run --once
+  assert_contains "$ERR" "epic issue:    #200" "epic B (older visit, Jan 1) sorts before epic A (newer visit, Jan 5)"
+  rm -rf "$d"
+}
+test_discover_older_visit_sorts_first_among_visited
+
+test_discover_ignores_non_epic_issues() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan-a docs/superpowers/plans/plan-a.md
+  local bin; bin="$(bindir_for "$d")"
+  local epic_a not_an_epic
+  epic_a="$(issue_json 100 'Epic A' '<!-- plan-to-tickets:epic:docs/superpowers/plans/plan-a.md -->' '[]')"
+  not_an_epic="$(issue_json 101 'A ticket' '<!-- plan-to-tickets:ticket:docs/superpowers/plans/plan-a.md:001-a -->' '[]')"
+  seed_state "$d/state" "[$epic_a,$not_an_epic]"
+  run_em "$d/work" "$bin" FAKE_GH_STATE="$d/state" -- --dry-run --once
+  assert_contains "$ERR" "epic issue:    #100" "the epic-marker issue resolves correctly"
+  assert_not_contains "$ERR" "Skipping discovered epic" "the ticket issue is not mistaken for an epic and doesn't trigger a skip"
+  rm -rf "$d"
+}
+test_discover_ignores_non_epic_issues
+
+# ---- Repo-wide discovery: Task 7 — per-cycle epic resolution ----
+
+test_repo_wide_processes_stalest_epic() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan-a docs/superpowers/plans/plan-a.md
+  add_second_manifest_em "$d/work" plan-b docs/superpowers/plans/plan-b.md
+  local bin; bin="$(bindir_for "$d")"
+  local epic_a epic_b
+  epic_a="$(issue_json 100 'Epic A' '<!-- plan-to-tickets:epic:docs/superpowers/plans/plan-a.md -->' '[]')"
+  epic_b="$(issue_json 200 'Epic B' '<!-- plan-to-tickets:epic:docs/superpowers/plans/plan-b.md -->' '[]')"
+  seed_state "$d/state" "[$epic_a,$epic_b]"
+  # Epic A already visited; Epic B never visited -> B is stalest, must be chosen.
+  jq '.issues["100"].comments = [{databaseId:1, body:"<!-- manager:lock-acquired:2026-01-01T00:00:00Z -->", createdAt:"2026-01-01T00:00:00Z"}]' \
+    "$d/state" > "$d/state.tmp" && mv "$d/state.tmp" "$d/state"
+  run_em "$d/work" "$bin" FAKE_GH_STATE="$d/state" -- --dry-run --once
+  assert_eq "$RC" "0" "repo-wide dry-run exits 0"
+  assert_contains "$ERR" "epic issue:    #200" "resolved the stalest epic (B, #200), not epic A"
+  rm -rf "$d"
+}
+test_repo_wide_processes_stalest_epic
+
+test_repo_wide_skips_epic_with_missing_manifest() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan-a docs/superpowers/plans/plan-a.md
+  # No manifest committed for plan-missing -- epic 200's marker references a
+  # plan that was never filed with a manifest.
+  local bin; bin="$(bindir_for "$d")"
+  local epic_missing epic_a
+  epic_missing="$(issue_json 200 'Broken epic' '<!-- plan-to-tickets:epic:docs/superpowers/plans/plan-missing.md -->' '[]')"
+  epic_a="$(issue_json 100 'Epic A' '<!-- plan-to-tickets:epic:docs/superpowers/plans/plan-a.md -->' '[]')"
+  seed_state "$d/state" "[$epic_missing,$epic_a]"
+  # Both never-visited; #200 sorts first only by number-stability of jq's sort,
+  # which is not guaranteed -- assert on behavior (skip + fallthrough), not order.
+  run_em "$d/work" "$bin" FAKE_GH_STATE="$d/state" -- --dry-run --once
+  assert_eq "$RC" "0" "repo-wide dry-run exits 0 despite one broken epic"
+  assert_contains "$ERR" "epic issue:    #100" "fell through to the resolvable epic"
+  rm -rf "$d"
+}
+test_repo_wide_skips_epic_with_missing_manifest
+
+test_repo_wide_all_epics_broken() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan-a docs/superpowers/plans/plan-a.md
+  local bin; bin="$(bindir_for "$d")"
+  local epic_missing
+  epic_missing="$(issue_json 200 'Broken epic' '<!-- plan-to-tickets:epic:docs/superpowers/plans/plan-missing.md -->' '[]')"
+  seed_state "$d/state" "[$epic_missing]"
+  run_em "$d/work" "$bin" FAKE_GH_STATE="$d/state" -- --once
+  assert_contains "$ERR" "No discovered epics resolved to a valid manifest" "clear message when every discovered epic is broken"
+  rm -rf "$d"
+}
+test_repo_wide_all_epics_broken
+
+test_repo_wide_no_open_epics() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan-a docs/superpowers/plans/plan-a.md
+  local bin; bin="$(bindir_for "$d")"
+  seed_state "$d/state" "[]"
+  run_em "$d/work" "$bin" FAKE_GH_STATE="$d/state" -- --once
+  assert_contains "$ERR" "No open epics found" "clear message when nothing is discovered"
+  rm -rf "$d"
+}
+test_repo_wide_no_open_epics

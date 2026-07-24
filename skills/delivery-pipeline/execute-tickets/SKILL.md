@@ -12,11 +12,13 @@ description: >-
   iterations. Use when the user has a filed plan-to-tickets backlog and wants
   tickets executed end-to-end (agent -> review -> merge), when they ask to
   run/dispatch/execute a ticket backlog, or when they want the codex review loop
-  wired to a ticket queue. Never coordinates across plans or repos, never merges
-  the epic itself, and hard-caps at 10 workers per repo.
+  wired to a ticket queue. Omit --plan for repo-wide mode, ranking every open
+  plan's ready tickets by true cross-plan priority -- ideal for a fixed,
+  long-running worker pool. Never merges the epic itself, never coordinates
+  across repos, and hard-caps at 10 workers per repo.
 metadata:
   author: stephen-martin
-  version: "0.6.0"
+  version: "0.7.0"
 ---
 
 # Execute a plan-to-tickets backlog end-to-end
@@ -57,6 +59,18 @@ If no plan slug is named, use the most recently modified manifest under
 `docs/superpowers/tickets/` and confirm it with the user before proceeding. If
 no manifest exists, stop and point at `plan-to-tickets` — do not try to
 reconstruct backlog metadata from issue bodies.
+
+**Repo-wide mode.** Omit `--plan` entirely to have a worker consider every open
+plan's ready tickets at once, ranked by true cross-plan priority (a `priority:p1`
+ticket in one plan outranks a `priority:p2` ticket in another). Each ticket's own
+plan is resolved from its own hidden marker — no manifest is loaded upfront. A
+candidate whose plan's manifest can't be resolved (missing or malformed) is
+skipped with a logged warning; the worker tries the next-highest-priority
+candidate instead of dying, since in repo-wide mode there's usually other good
+work available. This is the mode a fixed, long-running worker pool should use
+(e.g. deployed continuously via systemd) so new plans get picked up as soon as
+`plan-to-tickets` files them — no per-plan process to start. Use `--plan` when
+you want a worker (or pool) dedicated to one specific plan instead.
 
 ## Branch topology
 
@@ -358,7 +372,7 @@ ticket output.
 | Flag | Effect |
 |--|--|
 | `--worker <name>` | Worker identity, case-insensitive (required). One of: alice, bob, carol, dave, eve, frank, gordon, hank, isaac, justin. Becomes lock label `lock:<name>`. |
-| `--plan <slug>` | Plan slug: basename of `docs/superpowers/tickets/<slug>.md` (required). |
+| `--plan <slug>` | Plan slug: basename of `docs/superpowers/tickets/<slug>.md`. Optional — omit for repo-wide mode (see below). |
 | `--agent-cmd <cmd>` | Optional process-wide agent command (overrides `agents.yml`). Required only if no valid `.execute-tickets/agents.yml` is present. |
 | `--repo <owner/repo>` | Target repo (default: current repo via `gh repo view`). |
 | `--reviewer-cmd <cmd>` | Codex review command (default: `codex exec ... --sandbox read-only`). |
@@ -380,7 +394,9 @@ ticket output.
 - **Retry `needs-human` tickets.** All failures require human triage.
 - **Invent model IDs for you over time.** `init-agents.sh` ships a Claude
   snapshot; projects own edits to `agents.yml`.
-- **Coordinate across plans or repos.** One invocation, one plan, one repo.
+- **Coordinate across repos.** One invocation, one repo — even in repo-wide
+  mode, which ranks tickets across multiple *plans* within that one repo,
+  never multiple repos at once.
 - **Scale past 10 workers per repo.** The 10-name lock label set is the cap.
 - **Auto-merge PRs before codex says the patch is correct.** `overall_correctness`
   is a hard gate, even without matching high-priority findings.

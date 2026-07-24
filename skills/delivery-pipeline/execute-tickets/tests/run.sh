@@ -582,3 +582,171 @@ test_dry_run_reports_agent_source_from_yml() {
 }
 
 test_dry_run_reports_agent_source_from_yml
+
+# ---- Repo-wide discovery: Task 1 — --plan optional, load_manifest() parameterized ----
+
+test_plan_flag_now_optional() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json"
+  seed_state "$state" "[]"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --agent-cmd echo --once
+  assert_not_contains "$ERR" "Missing --plan" "--plan is no longer required"
+  rm -rf "$d"
+}
+test_plan_flag_now_optional
+
+test_repo_wide_no_manifest_loaded_at_startup() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json"
+  seed_state "$state" "[]"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --agent-cmd echo --once
+  assert_eq "$RC" "0" "repo-wide with no tickets exits 0 (once mode always exits 0)"
+  assert_not_contains "$ERR" "Manifest not found" "no manifest load is attempted at startup without --plan"
+  assert_contains "$ERR" "No ready tickets" "empty repo-wide backlog behaves like today's empty-backlog case, not an error"
+  rm -rf "$d"
+}
+test_repo_wide_no_manifest_loaded_at_startup
+
+test_plan_given_manifest_missing_still_fatal() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$d/state.json" \
+    -- --worker alice --plan does-not-exist --agent-cmd echo --once
+  assert_eq "$RC" "1" "missing manifest with --plan given still exits 1"
+  assert_contains "$ERR" "Manifest not found" "still reports the specific reason"
+  rm -rf "$d"
+}
+test_plan_given_manifest_missing_still_fatal
+
+# ---- Repo-wide discovery: Task 2 — pick_candidate() repo-wide filter + array return ----
+
+test_pick_candidate_single_plan_still_works() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json"
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Ticket A", body:"Body A\n\n<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->",
+     labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --plan plan1 --agent-cmd echo --dry-run --once
+  assert_eq "$RC" "0" "single-plan dry-run still exits 0 after array-contract change"
+  assert_contains "$ERR" "#101" "still finds and reports the ticket"
+  rm -rf "$d"
+}
+test_pick_candidate_single_plan_still_works
+
+test_repo_wide_matches_generic_prefix() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json"
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Ticket A", body:"Body A\n\n<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->",
+     labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --agent-cmd echo --dry-run --once
+  assert_eq "$RC" "0" "repo-wide dry-run exits 0"
+  assert_contains "$ERR" "#101" "repo-wide mode finds the ticket via the generic marker prefix"
+  rm -rf "$d"
+}
+test_repo_wide_matches_generic_prefix
+
+# Proves the repo-wide filter actually discriminates on the marker rather than
+# matching every open issue -- TICKET_MARKER_PREFIX defaults to "", and jq's
+# `contains("")` is true for any string, so a naive unconditional use of that
+# global would silently pass every open issue through regardless of marker.
+test_repo_wide_ignores_issues_without_the_marker() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan1
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json"
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Unrelated issue", body:"Just a regular bug report, no plan-to-tickets marker at all.",
+     labels:["priority:p1"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --agent-cmd echo --once
+  assert_contains "$ERR" "No ready tickets" "a non-plan-to-tickets issue is never treated as a candidate"
+  assert_not_contains "$ERR" "Candidate: #101" "the unrelated issue was not picked"
+  rm -rf "$d"
+}
+test_repo_wide_ignores_issues_without_the_marker
+
+# ---- Repo-wide discovery: Task 3 — per-candidate manifest resolution ----
+
+test_repo_wide_picks_globally_highest_priority_across_plans() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan-a docs/superpowers/plans/test-plan.md
+  # plan-b gets its own distinct source_branch ("epic-b", not "epic") --
+  # deliberately different from plan-a's, so a bug that resolved the WRONG
+  # plan's manifest (e.g. leaked plan-a's SOURCE_BRANCH via a stale global)
+  # would be caught by the source_branch assertion below, not just the slug.
+  add_second_manifest "$d/work" plan-b docs/superpowers/plans/plan-b.md epic-b
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json"
+  # Ticket 101 belongs to plan-a at p2; ticket 102 belongs to plan-b at p1.
+  # Repo-wide (no --plan) must pick #102 -- true cross-plan priority ranking,
+  # not "whichever plan happens to be scanned first."
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Plan A ticket", body:"<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->",
+     labels:["priority:p2","complexity:small","model-tier:efficient"], assignees:[], state:"open"},
+    {number:102, title:"Plan B ticket", body:"<!-- plan-to-tickets:ticket:docs/superpowers/plans/plan-b.md:001-a -->",
+     labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --agent-cmd echo --dry-run --once
+  assert_eq "$RC" "0" "repo-wide cross-plan dry-run exits 0"
+  assert_contains "$ERR" "#102" "picked the p1 ticket from plan-b, not the p2 ticket from plan-a"
+  assert_contains "$ERR" "plan:              plan-b" "dry-run report shows plan-b's own resolved slug"
+  assert_contains "$ERR" "source_branch:     epic-b" "resolved plan-b's own source_branch, not plan-a's ('epic')"
+  rm -rf "$d"
+}
+test_repo_wide_picks_globally_highest_priority_across_plans
+
+test_repo_wide_skips_candidate_with_missing_manifest() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan-a docs/superpowers/plans/test-plan.md
+  # Deliberately do NOT add a manifest for plan-missing -- ticket 101 references
+  # a plan whose manifest was never committed (simulates a stale/broken marker).
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json"
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Broken ticket", body:"<!-- plan-to-tickets:ticket:docs/superpowers/plans/plan-missing.md:001-a -->",
+     labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"},
+    {number:102, title:"Good ticket", body:"<!-- plan-to-tickets:ticket:docs/superpowers/plans/test-plan.md:001-a -->",
+     labels:["priority:p2","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --agent-cmd echo --dry-run --once
+  assert_eq "$RC" "0" "repo-wide dry-run exits 0 despite one broken candidate"
+  assert_contains "$ERR" "Skipping #101" "logs a warning for the unresolvable candidate"
+  assert_contains "$ERR" "#102" "falls through to the next candidate and reports it"
+  rm -rf "$d"
+}
+test_repo_wide_skips_candidate_with_missing_manifest
+
+test_repo_wide_all_candidates_broken() {
+  local d; d="$(mktemp -d)"
+  make_repo "$d" plan-a docs/superpowers/plans/test-plan.md
+  local bin; bin="$(bindir_for "$d")"
+  local state="$d/state.json"
+  seed_state "$state" "$(jq -n '[
+    {number:101, title:"Broken ticket", body:"<!-- plan-to-tickets:ticket:docs/superpowers/plans/plan-missing.md:001-a -->",
+     labels:["priority:p1","complexity:small","model-tier:efficient"], assignees:[], state:"open"}
+  ]')"
+  run_et "$d/work" "$bin" FAKE_GH_STATE="$state" \
+    -- --worker alice --agent-cmd echo --once
+  assert_contains "$ERR" "No candidates resolved to a valid manifest" "clear message when every candidate is broken"
+  rm -rf "$d"
+}
+test_repo_wide_all_candidates_broken
