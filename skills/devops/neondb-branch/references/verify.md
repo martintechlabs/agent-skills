@@ -2,11 +2,11 @@
 
 Read this when you want end-to-end confidence that provisioning works on the project's actual
 Neon project — beyond `tsc`/unit tests. It exercises the **true-ledger baseline**: a throwaway
-`conductor/verify` workspace branch (schema-only) plus a throwaway `tmp/verify` check branch
+`workspace/verify` workspace branch (schema-only) plus a throwaway `tmp/verify` check branch
 (full data), confirms the check branch's real migration ledger gets copied verbatim into the
 workspace branch, confirms migrate-deploy applies whatever's still missing, and deletes both.
 Production is never touched: every database op targets one of the two throwaway branches, and
-both branch names carry the prefix (`conductor/` or `tmp/`) the safety guard requires.
+both branch names carry the prefix (`workspace/` or `tmp/`) the safety guard requires.
 
 The walkthrough below is written for **Prisma**; a **Drizzle** variant follows at the end, with
 the per-step deltas (different migrations table, no `prisma db execute`, `drizzle-kit migrate`
@@ -48,7 +48,7 @@ in as `PARENT` — never point this verification at real production — and leav
 migration file committed locally that this stand-in parent has never run:
 
 ```bash
-PROJECT=<neon-project-id>; PARENT=conductor/verify-parent
+PROJECT=<neon-project-id>; PARENT=workspace/verify-parent
 <pm> neonctl branches delete "$PARENT" --project-id "$PROJECT" </dev/null >/dev/null 2>&1  # clear leftover
 <pm> neonctl branches create --project-id "$PROJECT" --name "$PARENT" --parent production --output json </dev/null >/dev/null && echo "created $PARENT"
 PCS=$(<pm> neonctl connection-string "$PARENT" --project-id "$PROJECT" </dev/null)
@@ -62,7 +62,7 @@ the workspace branch both clone from below.
 ## 3. Run the flow
 
 ```bash
-BR=conductor/verify; CHECK=tmp/verify
+BR=workspace/verify; CHECK=tmp/verify
 trap '<pm> neonctl branches delete "$BR" --project-id "$PROJECT" </dev/null >/dev/null 2>&1; \
       <pm> neonctl branches delete "$CHECK" --project-id "$PROJECT" </dev/null >/dev/null 2>&1; \
       echo "cleaned up $BR and $CHECK"' EXIT
@@ -110,7 +110,7 @@ DATABASE_URL="$CS" E2E_EXPECTED_DATABASE_URL="$CS" <seed-creds> <pm> tsx prisma/
 
 To produce `/tmp/true-baseline.sql`, run a tiny script that:
 1. Queries the check branch for its real ledger: `SELECT checksum, migration_name FROM "_prisma_migrations" WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL ORDER BY started_at`.
-2. Passes the rows to `buildPrismaLedgerBaselineSql` (imported from `scripts/conductor-db.ts`) and writes the result.
+2. Passes the rows to `buildPrismaLedgerBaselineSql` (imported from `scripts/neondb-branch.ts`) and writes the result.
 
 This exercises the exact read/build code the real provisioning uses — the only difference is
 driving it by hand instead of through `provision()`.
@@ -132,7 +132,7 @@ read back from the check branch verbatim, not values recomputed from local `migr
 
 ## Drizzle variant
 
-Same two-branch lifecycle (steps 1–2 identical: a throwaway schema-only `conductor/verify`
+Same two-branch lifecycle (steps 1–2 identical: a throwaway schema-only `workspace/verify`
 workspace branch **and** a throwaway full-data `tmp/verify` check branch, both off a
 deliberately-behind `$PARENT`). Deltas:
 
@@ -145,7 +145,7 @@ deliberately-behind `$PARENT`). Deltas:
    the same `execSql` you wired in the script — or, for a throwaway manual check where `psql` is
    handy, `psql "$CHECK_CS" -c '...'` to read and `psql "$CS" -f /tmp/true-baseline.sql` to
    write. Produce `/tmp/true-baseline.sql` by feeding the check branch's rows straight into
-   `buildDrizzleLedgerBaselineSql` (imported from `scripts/conductor-db.ts`) — exercising the
+   `buildDrizzleLedgerBaselineSql` (imported from `scripts/neondb-branch.ts`) — exercising the
    exact code the real provisioning uses.
 3. **The "nothing pending" check.** Instead of `prisma migrate status`, run
    `DATABASE_URL="$CS" <pm> drizzle-kit migrate` after baselining — it should apply exactly the

@@ -1,71 +1,48 @@
-// scripts/conductor-db.ts
+// scripts/neondb-branch.ts
 //
-// Per-workspace ISOLATED database for Conductor (works in local AND cloud workspaces).
-// Each workspace gets its own SCHEMA-ONLY Neon branch off the production branch: the full
-// schema + extensions (e.g. PostGIS's spatial_ref_sys data) but ZERO production rows, created
-// instantly (Neon copies no data).
+// Per-workspace ISOLATED Neon database branch — for any git repo, with no orchestration tool
+// required at this layer. Each workspace gets its own SCHEMA-ONLY Neon branch off the parent
+// (production) branch: full schema + extensions (e.g. PostGIS's spatial_ref_sys data), ZERO
+// production rows, created instantly (Neon copies no data).
 //
 // provision() is a full, deterministic rebuild — EVERY run, not just the first, deletes whatever
 // branch is currently recorded for this workspace (if any) and creates a fresh one. Any data
 // written into the workspace branch through normal app usage is discarded on every re-run — the
-// branch is disposable by design; there is no "reuse an existing branch" path. This also handles
-// a renamed workspace for free: the OLD recorded branch gets deleted, and the new one is created
-// fresh under the current name — no rename API call needed.
+// branch is disposable by design; there is no "reuse an existing branch" path.
 //
 // A schema-only branch starts with an EMPTY migrations table (even if the parent's isn't), which
 // would otherwise make the migrator either re-run every migration against tables that already
-// exist (if the parent has real schema) and fail, or silently believe a falsely assumed history
-// is real — e.g. if the parent hasn't actually run every migration committed on this code branch
-// yet, baselining from local migration files would falsely mark those as applied without ever
-// running them. So before deploying migrations, provision() learns the parent's TRUE
-// applied-migration set: it clones the parent again — this time WITH data, into a second,
-// equally disposable `tmp/*` branch — reads that clone's real migration-ledger rows (row data is
-// the only source of truth for "what really ran"; a schema-only clone strips it, even for this
-// table), deletes the clone, and seeds the workspace branch's ledger with exactly those rows.
-// The ORM's migrate-deploy then applies whatever's genuinely still missing — correct whether the
-// parent has every migration, none of them, or is only partway caught up.
+// exist (if the parent has real schema) and fail, or silently believe a falsely assumed history is
+// real. So before deploying migrations, provision() learns the parent's TRUE applied-migration set:
+// it clones the parent again — this time WITH data, into a second, equally disposable `tmp/*`
+// branch — reads that clone's real migration-ledger rows (row data is the only source of truth for
+// "what really ran"; a schema-only clone strips it, even for this table), deletes the clone, and
+// seeds the workspace branch's ledger with exactly those rows. The ORM's migrate-deploy then
+// applies whatever's genuinely still missing — correct whether the parent has every migration, none
+// of them, or is only partway caught up.
 //
-// 'pending'/'ready' in the state file tracks whether a rebuild is mid-flight — sync() (see
-// below) refuses to start the dev server against a branch caught mid-rebuild by a kill.
+// Workspace identity resolves through a precedence chain (see resolveWorkspaceName()):
+// CONDUCTOR_WORKSPACE_NAME > ORCA_WORKSPACE_NAME > WORKSPACE_NAME > worktree-directory basename >
+// current git branch. `sync()` hard-gates unsafe states (never provisioned, setup interrupted, the
+// recorded branch is gone) and, once past those, best-effort RENAMES the live Neon branch when the
+// resolved identity has moved on from what's recorded (e.g. a Conductor/Orca workspace rename) —
+// but refuses (hard gate) if the target name is already a DIFFERENT live branch, since that's two
+// workspaces colliding, not a rename.
 //
-// provision() also records the exact branch name it used in .conductor/db-branch (gitignored) so
-// teardown finds the SAME branch even if the workspace is renamed in Conductor afterward — a
-// rename changes CONDUCTOR_WORKSPACE_NAME, which would otherwise make teardown re-derive a
-// DIFFERENT slug and silently miss the real branch (see readBranchState()).
+//   provision → `tsx scripts/neondb-branch.ts provision`
+//   sync      → `tsx scripts/neondb-branch.ts sync` (chained in front of the dev server command)
+//   teardown  → `tsx scripts/neondb-branch.ts teardown`
 //
-// Conductor has no "workspace renamed" event, so `sync` piggybacks on `run` instead — the only
-// hook that fires repeatedly through a workspace's life. It compares the recorded branch name
-// against one freshly derived from CONDUCTOR_WORKSPACE_NAME, and if a rename happened since the
-// last check, renames the Neon branch to match (a real rename, not delete+recreate — data and
-// DATABASE_URL are untouched, since Neon connection strings key off the branch's compute
-// endpoint, not its name). Purely cosmetic: teardown works correctly with or without it, since it
-// always trusts whatever .conductor/db-branch last recorded.
-//
-//   setup   → `tsx scripts/conductor-db.ts provision`
-//   run     → `tsx scripts/conductor-db.ts sync` (prepended to the dev server command)
-//   archive → `dotenv -e .env.neondb -o -- tsx scripts/conductor-db.ts teardown`
-//
-// Requires (set as Conductor environment variables — Local tab for local workspaces, Cloud tab
-// for cloud workspaces). Missing NEON_API_KEY / NEON_PROJECT_ID, or a failed branch delete, fails
-// provision/teardown loudly (non-zero exit) instead of warning-and-continuing — a swallowed
-// failure here is exactly how Neon branches leaked past Conductor's archive step before (teardown
-// of an ALREADY-ABSENT branch is fine, though: an absent branch cannot leak). `sync`'s rename part
-// is the one best-effort exception — it warns and no-ops on failure, since a cosmetic naming sync
-// must never block the dev server — but sync DOES fail hard when .env.neondb is missing
-// (unprovisioned workspace), see sync():
+// Requires (set in .env.neondb, your shell, or your orchestrator's env config — see SKILL.md):
 //   NEON_API_KEY       – Neon API key (read by neonctl); required by provision AND teardown
 //   NEON_PROJECT_ID    – Neon project to branch within; required by provision AND teardown
 //   NEON_PARENT_BRANCH – REQUIRED by provision (no default); branch to clone, e.g. "production".
 //                        teardown/sync only use it for the production-safety guard, if set.
 //   (seed credentials) – whatever your seed needs; provision-only — see seedWorkspace() below
 //
-// Conductor's Environment tabs are supposed to be enough on their own (its docs say scripts get
-// the same environment_variables as agents), but archive's environment has been observed NOT to
-// have NEON_API_KEY / NEON_PROJECT_ID / NEON_PARENT_BRANCH even when they're confirmed present in
-// a live shell in the same workspace (root cause unconfirmed). So provision() ALSO mirrors all
-// three into ENV_FILE (see writeEnvFile() below), and the `archive` command above loads that file
-// itself before teardown runs — `dotenv -e` silently no-ops when the file doesn't exist, so this
-// is a no-op fallback for workspaces provisioned before this existed, not a new requirement.
+// provision() mirrors NEON_API_KEY/NEON_PROJECT_ID/NEON_PARENT_BRANCH into .env.neondb (alongside
+// DATABASE_URL) so sync/teardown are self-sufficient regardless of how they're invoked (a bare
+// terminal, Conductor archive, Orca archive) — see the .env.neondb upsert helpers below.
 //
 // Assumes Neon (Postgres) with migrations managed by EITHER Prisma OR Drizzle (set ORM below),
 // with `neonctl` and `tsx` available as project-local binaries. BOTH ORMs need the project's own
@@ -74,14 +51,15 @@
 // PORTING KNOBS just below for your project.
 //
 // SAFETY: every destructive op (branch delete/rename) is guarded to only ever run against a
-// disposable `conductor/*` workspace branch or a disposable `tmp/*` check branch — never the
+// disposable `workspace/*` workspace branch or a disposable `tmp/*` check branch — never the
 // parent/production branch. provision() never opens a connection to the parent directly, only to
 // the disposable check branch cloned from it.
 
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { basename, dirname } from 'node:path'
+import { config as dotenvConfig } from 'dotenv'
 
 // ── PORTING KNOBS ────────────────────────────────────────────────────────────
 // Which ORM manages migrations. Switches the ledger table + baseline SQL shape throughout.
@@ -110,7 +88,7 @@ const DB_ENV_VARS = ['DATABASE_URL']
 // server as well, not just from archive — acceptable since Conductor already injects the same
 // NEON_API_KEY into every agent process in this workspace, so this doesn't cross a new trust
 // boundary, only extends an existing one.
-const BRANCH_PREFIX = 'conductor/' // workspace-branch namespace (matches Neon's preview/)
+const BRANCH_PREFIX = 'workspace/' // workspace-branch namespace (matches Neon's preview/)
 const CHECK_BRANCH_PREFIX = 'tmp/' // disposable per-run branch used only to read the parent's true migration ledger
 const MAX_SLUG = 48 // Neon-safe branch-name length budget (excluding either prefix)
 const SEED_SCRIPT = 'prisma/seed.ts' // project's seed entrypoint (see seedWorkspace)
@@ -204,10 +182,24 @@ async function readTruePrismaLedger(uri: string): Promise<Array<{ checksum: stri
 
 /**
  * Where provision() records the branch it used. Resolved at call time so tests can point it at a
- * sandbox via CONDUCTOR_DB_STATE_FILE (test-only override — never set it in Conductor).
+ * sandbox via NEONDB_BRANCH_STATE_FILE (test-only override — never set it in Conductor).
  */
 function stateFilePath(): string {
-  return process.env.CONDUCTOR_DB_STATE_FILE ?? '.conductor/db-branch'
+  return process.env.NEONDB_BRANCH_STATE_FILE ?? '.neondb/branch'
+}
+
+/** Where main() loads .env.neondb from. Test-only override via NEONDB_BRANCH_ENV_FILE — never set this in a real workspace. */
+function envFilePath(): string {
+  return process.env.NEONDB_BRANCH_ENV_FILE ?? ENV_FILE
+}
+
+/**
+ * Load .env.neondb into process.env, never overriding an already-set var. Exported (and factored
+ * out of main()) so tests can exercise the loading behavior directly without invoking the CLI
+ * dispatch.
+ */
+export function loadEnvFile(): void {
+  dotenvConfig({ path: envFilePath() })
 }
 
 /** The child-process environment with every DB var pinned to the workspace branch. */
@@ -215,78 +207,39 @@ function childDbEnv(uri: string): NodeJS.ProcessEnv {
   return { ...process.env, ...Object.fromEntries(DB_ENV_VARS.map((name) => [name, uri])) }
 }
 
-/**
- * Whether this workspace shows any trace of a provisioned branch: the generated env file, or a
- * `.env` written by the PRE-.env.neondb version of this script (identified by its header
- * comment). Used by teardown to distinguish "never provisioned — nothing to clean" from "a
- * branch may exist — failing to delete it would leak".
- */
-function provisionedEnvTraceExists(): boolean {
-  if (existsSync(ENV_FILE)) return true
-  try {
-    return readFileSync('.env', 'utf8').includes('Generated by scripts/conductor-db.ts')
-  } catch (error) {
-    // Only a missing .env means "no trace". An unreadable one (EACCES, EISDIR) must NOT be
-    // silently read as never-provisioned — that would let teardown skip a live branch.
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
-    throw error
-  }
-}
-
-/**
- * Remove every env file this script (or its pre-.env.neondb predecessor, identified by its
- * header comment) generated. Env file first, state record last — see the teardown comment.
- */
-function removeGeneratedEnvFiles(): void {
-  rmSync(ENV_FILE, { force: true })
-  try {
-    if (readFileSync('.env', 'utf8').includes('Generated by scripts/conductor-db.ts')) {
-      rmSync('.env', { force: true })
-    }
-  } catch {
-    // Missing or unreadable .env — nothing we can (or should) remove.
-  }
-}
-
 function requireEnv(name: string): string {
   const value = process.env[name]
   if (!value) {
     throw new Error(
-      `${name} is required for Conductor's per-workspace Neon branch. ` +
-        `Add it as a Conductor environment variable (Local tab for local, Cloud tab for cloud).`,
+      `${name} is required for the per-workspace Neon branch. Set it in .env.neondb, your shell ` +
+        `environment, or your orchestrator's environment config (e.g. Conductor's Environment tabs).`,
     )
   }
   return value
 }
 
-/** The raw slug for the current workspace, before any length handling. */
-function workspaceSlug(): string {
-  const raw = process.env.CONDUCTOR_WORKSPACE_NAME
-  if (!raw) {
-    // Deliberately NOT requireEnv: Conductor injects this variable itself. Telling the user to
-    // add it to the env tabs would pin every workspace to ONE shared slug (and one branch).
-    throw new Error(
-      'CONDUCTOR_WORKSPACE_NAME is not set — this script must run inside a Conductor workspace ' +
-        '(Conductor injects it automatically). Do NOT add it to the Conductor env tabs.',
-    )
-  }
+/**
+ * What identifies "this workspace" — before slugify, before any Neon prefix. See
+ * resolveWorkspaceName() for the precedence chain; this is only the pure slug/truncation logic
+ * shared by workspaceBranchName() and checkBranchName().
+ */
+function slugify(raw: string): string {
   const slug = raw
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
   if (!slug) {
-    throw new Error(`Could not derive a branch name from CONDUCTOR_WORKSPACE_NAME="${raw}".`)
+    throw new Error(`Could not derive a branch name from workspace identity "${raw}".`)
   }
   return slug
 }
 
 /**
  * Shared by workspaceBranchName() and checkBranchName() — same slug/truncation/collision-hash
- * logic under a different disposable-branch prefix.
+ * logic under a different disposable-branch prefix, given an already-resolved raw identity.
  */
-function branchNameWithPrefix(prefix: string): string {
-  const raw = process.env.CONDUCTOR_WORKSPACE_NAME ?? ''
-  let slug = workspaceSlug()
+function branchNameWithPrefix(prefix: string, raw: string): string {
+  let slug = slugify(raw)
   if (slug.length > MAX_SLUG) {
     // Truncate, but keep distinct workspaces distinct: append a short hash of the FULL name so
     // two long names that share a prefix don't collide onto the same branch (which would break
@@ -298,9 +251,9 @@ function branchNameWithPrefix(prefix: string): string {
   return `${prefix}${slug}`
 }
 
-/** Stable, Neon-safe branch name derived from the workspace name. */
-export function workspaceBranchName(): string {
-  return branchNameWithPrefix(BRANCH_PREFIX)
+/** Stable, Neon-safe branch name derived from an already-resolved raw workspace identity. */
+export function workspaceBranchName(raw: string): string {
+  return branchNameWithPrefix(BRANCH_PREFIX, raw)
 }
 
 /**
@@ -309,19 +262,62 @@ export function workspaceBranchName(): string {
  * under CHECK_BRANCH_PREFIX — deterministic, not random, so a leftover from a killed run is found
  * by name and replaced rather than accumulating orphans.
  */
-export function checkBranchName(): string {
-  return branchNameWithPrefix(CHECK_BRANCH_PREFIX)
+export function checkBranchName(raw: string): string {
+  return branchNameWithPrefix(CHECK_BRANCH_PREFIX, raw)
+}
+
+/** What resolveWorkspaceName() needs to know about the current checkout, gathered by the caller. */
+export interface GitContext {
+  /** true when this checkout is a linked git worktree (not the main/primary checkout) */
+  isSecondaryWorktree: boolean
+  /** current branch name, or null when HEAD is detached or this isn't a git repository */
+  branch: string | null
 }
 
 /**
- * The name an EARLIER version of this script (flat `.slice(0, 48)` truncation, no hash suffix)
- * would have derived, or null when it matches the current derivation. Teardown and sync check it
- * as a fallback so upgrading doesn't orphan long-named workspaces provisioned before the state
- * file existed.
+ * Workspace identity, before slugify. First match wins:
+ *   1. CONDUCTOR_WORKSPACE_NAME — Conductor injects this per workspace.
+ *   2. ORCA_WORKSPACE_NAME — Orca's own identity, when the project/tool sets it.
+ *   3. WORKSPACE_NAME — general ambient override for custom tools, tests, or a project that
+ *      exports one name for every tool. Only read from process env — NEVER from .env.neondb,
+ *      which can be copied across workspaces and would collide them onto the same Neon branch.
+ *   4. basename(cwd) for a secondary git worktree with none of the above set — each worktree is
+ *      its own directory, so this is stable across a `git checkout` inside it.
+ *   5. The current git branch, for a plain single-clone checkout with none of the above set —
+ *      here "the workspace" genuinely IS the branch, so switching branches IS switching identity.
+ * Throws when nothing resolves (detached HEAD / not a git repo, and no env var set) — there is no
+ * derivable identity in that case.
  */
-export function legacyWorkspaceBranchName(): string | null {
-  const flat = `${BRANCH_PREFIX}${workspaceSlug().slice(0, MAX_SLUG)}`
-  return flat === workspaceBranchName() ? null : flat
+export function resolveWorkspaceName(env: NodeJS.ProcessEnv, cwd: string, git: GitContext): string {
+  const fromEnv = env.CONDUCTOR_WORKSPACE_NAME || env.ORCA_WORKSPACE_NAME || env.WORKSPACE_NAME
+  if (fromEnv) return fromEnv
+  if (git.isSecondaryWorktree) return basename(cwd)
+  if (git.branch) return git.branch
+  throw new Error(
+    'Could not determine workspace identity: no CONDUCTOR_WORKSPACE_NAME / ORCA_WORKSPACE_NAME / ' +
+      'WORKSPACE_NAME is set, this checkout is not a secondary git worktree, and there is no usable ' +
+      'git branch (detached HEAD, or not a git repository). Check out a named branch, or set ' +
+      'WORKSPACE_NAME explicitly.',
+  )
+}
+
+/** Impure glue for resolveWorkspaceName()'s `git` parameter — not itself unit-tested; exercised via references/verify.md. */
+function currentGitContext(cwd: string): GitContext {
+  let gitDir: string
+  try {
+    gitDir = execFileSync('git', ['rev-parse', '--git-dir'], { cwd, encoding: 'utf8' }).trim()
+  } catch {
+    return { isSecondaryWorktree: false, branch: null }
+  }
+  const isSecondaryWorktree = /[\\/]worktrees[\\/]/.test(gitDir)
+  let branch: string | null = null
+  try {
+    const ref = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd, encoding: 'utf8' }).trim()
+    branch = ref === 'HEAD' ? null : ref // literal 'HEAD' means detached
+  } catch {
+    branch = null
+  }
+  return { isSecondaryWorktree, branch }
 }
 
 /**
@@ -347,7 +343,7 @@ export function writeBranchState(branchName: string, phase: 'pending' | 'ready' 
 }
 
 /** Single reader for the state file; the exported helpers below are thin views over it. */
-function readStateFile(): { branch: string; phase: 'pending' | 'ready' } | null {
+export function readBranchStateFull(): { branch: string; phase: 'pending' | 'ready' } | null {
   try {
     const lines = readFileSync(stateFilePath(), 'utf8').split('\n')
     const branch = lines[0].trim()
@@ -361,12 +357,12 @@ function readStateFile(): { branch: string; phase: 'pending' | 'ready' } | null 
 
 /** The branch name provision() recorded, or null if absent — e.g. a workspace provisioned before this file existed, in which case the caller should fall back to re-deriving it. */
 export function readBranchState(): string | null {
-  return readStateFile()?.branch ?? null
+  return readBranchStateFull()?.branch ?? null
 }
 
 /** Whether the recorded branch was created but never finished baseline+seed (see writeBranchState). */
 export function setupIsPending(): boolean {
-  return readStateFile()?.phase === 'pending'
+  return readBranchStateFull()?.phase === 'pending'
 }
 
 /** Sibling of the workspace-branch state file, for the disposable check branch instead. */
@@ -408,7 +404,7 @@ export function clearCheckBranchState(): void {
 
 /**
  * Hard safety guard. Destructive operations (deleting or renaming a branch) must only ever
- * target a disposable per-workspace `conductor/*` branch or a disposable `tmp/*` check branch —
+ * target a disposable per-workspace `workspace/*` branch or a disposable `tmp/*` check branch —
  * never the parent (production). Throws otherwise.
  */
 export function assertDisposableChildBranch(branchName: string, parentBranch: string): void {
@@ -425,9 +421,9 @@ export function assertDisposableChildBranch(branchName: string, parentBranch: st
 
 /**
  * Stricter than assertDisposableChildBranch: a check-branch reference must be tmp/*-prefixed
- * specifically — never conductor/* (a workspace branch name), even though that alone would
+ * specifically — never workspace/* (a workspace branch name), even though that alone would
  * satisfy the generic guard above. Without this, a corrupted or hand-edited
- * .conductor/db-branch-check record that happens to hold a conductor/*-prefixed value (e.g. this
+ * .neondb/branch-check record that happens to hold a workspace/*-prefixed value (e.g. this
  * workspace's own branch name) would be accepted as a "valid" check branch and deleted by
  * check-branch cleanup logic — which runs independently of, and potentially before, the actual
  * workspace branch's own guarded delete path.
@@ -592,32 +588,47 @@ function runWithRetry(bin: string, binArgs: string[], env: NodeJS.ProcessEnv, at
   }
 }
 
-/**
- * The contents of the generated env file: one single-quoted `NAME='value'` line per entry, in the
- * given order, after the header comment that marks the file as ours (see
- * provisionedEnvTraceExists(), which looks for it). Single quotes: dotenv-cli runs dotenv-expand
- * on load, which would rewrite `$…` inside a double-quoted value; single-quoted values are taken
- * literally. Pulled out of writeEnvFile() as a pure function so its output is unit-testable
- * without touching the filesystem.
- */
-export function buildEnvFileContents(vars: Record<string, string>): string {
-  return (
-    `# Generated by scripts/conductor-db.ts for this Conductor workspace. Do not commit.\n` +
-    Object.entries(vars)
-      .map(([name, value]) => `${name}='${value}'\n`)
-      .join('')
-  )
+function readEnvFileRaw(path: string): string {
+  try {
+    return readFileSync(path, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return ''
+    throw error
+  }
+}
+
+/** Non-empty lines of `content`, trailing newline stripped, with any line whose key is in `keys` removed. */
+function withoutKeys(content: string, keys: string[]): string[] {
+  const trimmed = content.replace(/\n+$/, '')
+  if (trimmed === '') return []
+  const keySet = new Set(keys)
+  return trimmed.split('\n').filter((line) => {
+    const eq = line.indexOf('=')
+    return eq === -1 ? true : !keySet.has(line.slice(0, eq))
+  })
 }
 
 /**
- * Replace the generated env file (.env.neondb) with one that points at this workspace's own Neon
- * branch and carries the Neon credentials archive needs (see the comment on DB_ENV_VARS, above).
- * The file is entirely ours — the project's real .env is never touched. Any pre-existing file or
- * stale symlink is removed first so we always write a real, workspace-local file.
+ * Upsert every NAME=value pair in `vars` into `path`, preserving every other line (unrelated vars,
+ * comments, blank lines) untouched. Creates the file if it doesn't exist yet. Single-quoted values:
+ * dotenv's expand step would otherwise rewrite a literal `$` inside a connection string.
  */
-function writeEnvFile(vars: Record<string, string>): void {
-  rmSync(ENV_FILE, { force: true })
-  writeFileSync(ENV_FILE, buildEnvFileContents(vars), { mode: 0o600 })
+export function upsertEnvVars(path: string, vars: Record<string, string>): void {
+  const kept = withoutKeys(readEnvFileRaw(path), Object.keys(vars))
+  const appended = Object.entries(vars).map(([name, value]) => `${name}='${value}'`)
+  writeFileSync(path, `${[...kept, ...appended].join('\n')}\n`, { mode: 0o600 })
+}
+
+/**
+ * Remove every line whose key is in `keys` from `path`, preserving everything else. Deletes the
+ * file entirely if that leaves nothing behind; no-ops if the file doesn't exist.
+ */
+export function stripEnvVars(path: string, keys: string[]): void {
+  const raw = readEnvFileRaw(path)
+  if (!raw.trim()) return
+  const kept = withoutKeys(raw, keys)
+  if (kept.length === 0) rmSync(path, { force: true })
+  else writeFileSync(path, `${kept.join('\n')}\n`, { mode: 0o600 })
 }
 
 /**
@@ -698,7 +709,7 @@ function deployMigrations(uri: string): void {
  * check branch is always fresh: delete-if-present before creating, never reused, since a leaked
  * one from an interrupted run could hold a stale snapshot of the parent's true state.
  */
-async function seedTrueBaseline(projectId: string, parent: string, uri: string): Promise<void> {
+async function seedTrueBaseline(projectId: string, parent: string, uri: string, raw: string): Promise<void> {
   // Handle a leftover from a previous, incomplete run first. Prefer the PERSISTED name over the
   // freshly-derived one: it's written below before the branch is created, specifically so a
   // leaked branch is still findable even if the workspace was renamed since (checkBranchName()
@@ -714,7 +725,7 @@ async function seedTrueBaseline(projectId: string, parent: string, uri: string):
     } catch (error) {
       previousUsable = false
       console.warn(
-        `[conductor-db] ignoring unusable ${checkBranchStateFilePath()} record "${previousCheckName}" ` +
+        `[neondb-branch] ignoring unusable ${checkBranchStateFilePath()} record "${previousCheckName}" ` +
           `(${error instanceof Error ? error.message : error}) — it will be overwritten.`,
       )
     }
@@ -731,7 +742,7 @@ async function seedTrueBaseline(projectId: string, parent: string, uri: string):
     }
   }
 
-  const checkName = checkBranchName()
+  const checkName = checkBranchName(raw)
   writeCheckBranchState(checkName) // before creating — see writeCheckBranchState()'s docstring
   console.log(`[neon] creating check branch ${checkName} off ${parent} (full data, disposable)…`)
   await withRetry(
@@ -783,7 +794,7 @@ async function seedTrueBaseline(projectId: string, parent: string, uri: string):
         // throw in `finally` would). The persisted record (still in place) means teardown()'s
         // own leaked-check-branch sweep will find and remove it on a later archive.
         console.error(
-          `[conductor-db] WARNING: could not delete check branch ${checkName} while handling ` +
+          `[neondb-branch] WARNING: could not delete check branch ${checkName} while handling ` +
             `another error; it may be orphaned (${cleanupError instanceof Error ? cleanupError.message : cleanupError}). ` +
             `teardown()'s sweep will catch it on a later archive.`,
         )
@@ -825,7 +836,8 @@ async function provision(): Promise<void> {
   const projectId = requireEnv('NEON_PROJECT_ID')
   const apiKey = requireEnv('NEON_API_KEY') // consumed by neonctl from the environment; also mirrored into ENV_FILE below for archive
   const parent = requireEnv('NEON_PARENT_BRANCH')
-  const branchName = workspaceBranchName()
+  const raw = resolveWorkspaceName(process.env, process.cwd(), currentGitContext(process.cwd()))
+  const branchName = workspaceBranchName(raw)
   assertDisposableChildBranch(branchName, parent)
 
   // Every run is a full rebuild — delete whatever's currently recorded (if it still exists),
@@ -843,7 +855,7 @@ async function provision(): Promise<void> {
       // destructive op" — it will simply be overwritten by the fresh create below.
       recordedUsable = false
       console.warn(
-        `[conductor-db] ignoring unusable ${stateFilePath()} record "${recorded}" ` +
+        `[neondb-branch] ignoring unusable ${stateFilePath()} record "${recorded}" ` +
           `(${error instanceof Error ? error.message : error}) — it will be overwritten.`,
       )
     }
@@ -872,16 +884,16 @@ async function provision(): Promise<void> {
   // otherwise a create followed by a transient error would leak the branch.
   try {
     const uri = await withRetry('fetch connection string', () => getConnectionString(projectId, branchName))
-    writeEnvFile({
+    upsertEnvVars(ENV_FILE, {
       ...Object.fromEntries(DB_ENV_VARS.map((name) => [name, uri])),
       NEON_API_KEY: apiKey,
       NEON_PROJECT_ID: projectId,
       NEON_PARENT_BRANCH: parent,
     })
-    console.log(`[conductor-db] wrote ${DB_ENV_VARS.join(', ')} and Neon credentials for ${branchName} → ${ENV_FILE}`)
+    console.log(`[neondb-branch] wrote ${DB_ENV_VARS.join(', ')} and Neon credentials for ${branchName} → ${ENV_FILE}`)
 
     console.log(`[${ORM}] learning the parent's true applied-migration state…`)
-    await seedTrueBaseline(projectId, parent, uri)
+    await seedTrueBaseline(projectId, parent, uri, raw)
 
     console.log(`[${ORM}] applying any migrations beyond the baseline…`)
     deployMigrations(uri)
@@ -889,312 +901,216 @@ async function provision(): Promise<void> {
     seedWorkspace(uri)
     writeBranchState(branchName, 'ready')
   } catch (error) {
-    console.error('[conductor-db] setup failed — deleting the branch so the next attempt starts clean.')
+    console.error('[neondb-branch] setup failed — deleting the branch so the next attempt starts clean.')
     try {
       await deleteBranch(projectId, branchName)
-      // Env file first, state record last — a crash between the two leaves the record
-      // (harmless, self-corrects on the next provision), rather than an env file with no
+      // Strip only the branch-specific DB vars (they'd point at a dead endpoint) — leave
+      // NEON_API_KEY/NEON_PROJECT_ID/NEON_PARENT_BRANCH in .env.neondb so the next provision
+      // attempt doesn't need them re-supplied. State record last: a crash between the two leaves
+      // the record (harmless, self-corrects on the next provision), rather than a DB var with no
       // record, which would slip past sync's gates and boot the app against a dead endpoint.
-      rmSync(ENV_FILE, { force: true })
+      stripEnvVars(ENV_FILE, DB_ENV_VARS)
       rmSync(stateFilePath(), { force: true })
     } catch {
       console.error(
-        `[conductor-db] WARNING: could not delete branch ${branchName}; ` +
+        `[neondb-branch] WARNING: could not delete branch ${branchName}; ` +
           `keeping ${stateFilePath()} so the next provision/teardown can find it.`,
       )
     }
     throw error
   }
 
-  console.log('✅ [conductor-db] workspace database ready.')
+  console.log('✅ [neondb-branch] workspace database ready.')
+}
+
+export type TeardownAction = { type: 'delete' } | { type: 'alreadyGone' }
+
+/**
+ * Pure decision function for teardown(): whether the target branch still exists on Neon. Mirrors
+ * planSync()'s extraction for the same class of decision — self-heal (skip a delete that would
+ * 404 forever) is directly testable without mocking neonctl.
+ */
+export function planTeardown(branchExists: boolean): TeardownAction {
+  return branchExists ? { type: 'delete' } : { type: 'alreadyGone' }
 }
 
 async function teardown(): Promise<void> {
-  // Missing Neon credentials: if there is also no trace of a provisioned branch (no state file,
-  // no generated env file, no check-branch record), the workspace never got a database — archive
-  // must not error. But with a recorded/possible branch, failing loudly is the point: skipping
-  // here is exactly how branches used to leak past archive.
+  const raw = resolveWorkspaceName(process.env, process.cwd(), currentGitContext(process.cwd()))
+  const derived = workspaceBranchName(raw)
+  const state = readBranchStateFull()
+  const target = state?.branch ?? derived
+
   if (!process.env.NEON_PROJECT_ID || !process.env.NEON_API_KEY) {
-    if (!readBranchState() && !provisionedEnvTraceExists() && !readCheckBranchState()) {
-      console.warn('[conductor-db] NEON_PROJECT_ID / NEON_API_KEY not set and no provisioned branch recorded — nothing to clean.')
+    if (!state && !readCheckBranchState()) {
+      console.warn('[neondb-branch] NEON_PROJECT_ID / NEON_API_KEY not set and nothing recorded — nothing to clean.')
       return
     }
     throw new Error(
-      'NEON_PROJECT_ID / NEON_API_KEY are required to delete this workspace\'s Neon branch ' +
-        '(a branch record exists). Set them in Conductor env and re-run archive, or the branch will leak.',
+      'NEON_PROJECT_ID / NEON_API_KEY are required to delete this workspace\'s Neon branch (a record ' +
+        'exists). Set them (e.g. in .env.neondb) and re-run teardown, or the branch will leak.',
     )
   }
   const projectId = requireEnv('NEON_PROJECT_ID')
   const parent = process.env.NEON_PARENT_BRANCH ?? ''
 
-  // Best-effort: the check branch seedTrueBaseline() creates (a disposable full-data clone of
-  // the parent, used to learn its true migration state) is normally cleaned up by that same
-  // function. If provision() was killed between creating it and its own cleanup, it survives
-  // until noticed — sweep for it here too so archiving still catches it. Prefer the PERSISTED
-  // name (survives a workspace rename since) over the freshly-derived one, falling back to the
-  // derived name only if nothing was ever persisted (e.g. no incomplete run). This must never
-  // block cleanup of the actual workspace branch below: an unusable CONDUCTOR_WORKSPACE_NAME
-  // just means there's nothing derivable to check, not a reason to fail.
+  // Sweep a leaked tmp/* check branch first (a provision killed between creating it and its own
+  // cleanup) — independent of which workspace branch we target below.
   try {
-    const checkName = readCheckBranchState() ?? checkBranchName()
-    let checkNameUsable = true
-    try {
-      assertDisposableCheckBranch(checkName, parent)
-    } catch (error) {
-      // A corrupted/hand-edited record isn't a real branch reference worth preserving (a
-      // genuinely-written one is always tmp/*-prefixed) — clear it so this warning doesn't
-      // repeat on every future archive with no way to self-heal.
-      checkNameUsable = false
-      console.warn(
-        `[conductor-db] ignoring unusable ${checkBranchStateFilePath()} record "${checkName}" ` +
-          `(${error instanceof Error ? error.message : error}) — clearing it.`,
-      )
-      clearCheckBranchState()
+    const checkName = readCheckBranchState() ?? checkBranchName(raw)
+    assertDisposableCheckBranch(checkName, parent)
+    if (await withRetry('check for leaked check branch', () => branchExists(projectId, checkName), 3)) {
+      console.log(`[neon] deleting leaked check branch ${checkName}…`)
+      await deleteBranch(projectId, checkName, { inherit: true })
     }
-    if (checkNameUsable) {
-      if (await withRetry('check for leaked check branch', () => branchExists(projectId, checkName), 3)) {
-        console.log(`[neon] deleting leaked check branch ${checkName}…`)
-        await deleteBranch(projectId, checkName, { inherit: true })
-      }
-      // Only clear after a CONFIRMED delete (or confirmed absence) — if branchExists()/
-      // deleteBranch() above throws, this is never reached and the record survives so a
-      // still-live leaked branch isn't forgotten just because this attempt failed.
-      clearCheckBranchState()
-    }
+    clearCheckBranchState()
   } catch (error) {
-    console.warn(
-      `[conductor-db] WARNING: could not check for/delete a leaked check branch: ` +
-        `${error instanceof Error ? error.message : error}`,
-    )
+    console.warn(`[neondb-branch] WARNING: could not check for/delete a leaked check branch: ${error instanceof Error ? error.message : error}`)
   }
 
-  // Prefer the name provision() actually used — CONDUCTOR_WORKSPACE_NAME may have changed since
-  // (the workspace was renamed), which would otherwise re-derive a different slug and miss the
-  // real branch. The derived names (current scheme AND the pre-hash-suffix legacy scheme) are
-  // kept as fallbacks for workspaces provisioned before the state file existed, and for a record
-  // left stale by a crash between rename and re-record.
-  const recorded = readBranchState()
-  let derived: string | null = null
-  let legacy: string | null = null
-  try {
-    derived = workspaceBranchName()
-    legacy = legacyWorkspaceBranchName()
-  } catch {
-    // CONDUCTOR_WORKSPACE_NAME unset/unusable — proceed with the recorded name alone.
+  assertDisposableChildBranch(target, parent)
+  const exists = await withRetry('check branch exists', () => branchExists(projectId, target), 3)
+  const action = planTeardown(exists)
+  if (action.type === 'alreadyGone') {
+    console.log(`[neondb-branch] branch ${target} not found in project ${projectId} — treating as already torn down.`)
+  } else {
+    console.log(`[neon] deleting branch ${target}…`)
+    await deleteBranch(projectId, target, { inherit: true })
   }
-  // A corrupted record (or one naming the parent) must not abort teardown outright — skip it
-  // with a warning and let the other candidates be tried; the guard still makes it undeletable.
-  let recordUnusable = false
-  const candidates = [...new Set([recorded, derived, legacy])]
-    .filter((name): name is string => Boolean(name))
-    .filter((name) => {
-      try {
-        assertDisposableChildBranch(name, parent)
-        return true
-      } catch (error) {
-        if (name === recorded) recordUnusable = true
-        console.warn(`[conductor-db] ignoring candidate "${name}": ${error instanceof Error ? error.message : error}`)
-        return false
-      }
-    })
-  if (candidates.length === 0) {
-    // No record AND no generated env file means provisioning never got anywhere (e.g. the
-    // workspace name never yielded a usable slug) — there is no branch to leak; don't block
-    // archive. With either trace present, a branch may exist somewhere: fail loudly.
-    if (!recorded && !provisionedEnvTraceExists()) {
-      console.warn('[conductor-db] no branch was ever recorded or provisioned for this workspace — nothing to clean.')
-      return
-    }
-    throw new Error(
-      'Cannot determine this workspace\'s branch: no usable .conductor/db-branch record and no ' +
-        'usable CONDUCTOR_WORKSPACE_NAME to derive it from. Delete the branch manually ' +
-        `(neonctl branches list --project-id ${projectId}) before archiving.`,
-    )
-  }
-
-  // Idempotent: a branch that was never created (setup failed early) or is already gone
-  // (self-destructed, or a previous teardown died between delete and state cleanup) is not an
-  // error — an absent branch cannot leak. Real delete failures below still exit non-zero.
-  let target: string | null = null
-  for (const name of candidates) {
-    if (await withRetry('check branch exists', () => branchExists(projectId, name), 3)) {
-      target = name
-      break
-    }
-  }
-  if (!target) {
-    if (recordUnusable) {
-      // The record existed but was unusable, and nothing matches the derived names — the real
-      // branch may live under a name we can no longer see. Cleaning up here would destroy the
-      // only evidence a branch was provisioned; fail loudly instead.
-      throw new Error(
-        `The ${stateFilePath()} record was unusable and no branch matches this workspace's ` +
-          `derived names (checked: ${candidates.join(', ')}). Find and delete the branch ` +
-          `manually (neonctl branches list --project-id ${projectId}), then remove ` +
-          `${stateFilePath()} and re-run archive.`,
-      )
-    }
-    if (!recorded && provisionedEnvTraceExists()) {
-      // A generated env file proves a branch was provisioned, but nothing was recorded and no
-      // branch matches this workspace's current or legacy names — classic pre-state-file
-      // workspace renamed before upgrading. Exiting 0 here would silently leak its branch.
-      throw new Error(
-        'A generated env file shows this workspace was provisioned, but no branch matches its ' +
-          `current or legacy names (checked: ${candidates.join(', ')}) — it was likely renamed ` +
-          `before upgrading to this script version. Find and delete the branch manually ` +
-          `(neonctl branches list --project-id ${projectId}), then remove the generated env ` +
-          'file(s) and re-run archive.',
-      )
-    }
-    console.log(`[conductor-db] no workspace branch found (checked: ${candidates.join(', ')}) — nothing to delete.`)
-    removeGeneratedEnvFiles()
-    rmSync(stateFilePath(), { force: true })
-    return
-  }
-
-  console.log(`[neon] deleting branch ${target}…`)
-  await deleteBranch(projectId, target, { inherit: true })
-  // Env files first (leaving one would let sync()'s gates pass and boot the dev server against
-  // the deleted branch's dead endpoint), the state record LAST — a crash between the two leaves
-  // the harmless record, and the next teardown finds the branch already absent and cleans up.
-  removeGeneratedEnvFiles()
+  stripEnvVars(ENV_FILE, DB_ENV_VARS)
   rmSync(stateFilePath(), { force: true })
-  console.log('✅ [conductor-db] deleted the workspace database branch.')
+  console.log('✅ [neondb-branch] workspace database torn down.')
 }
 
 /**
- * Runs before every dev-server start. Hard gates throw (blocking the dev server, deliberately);
- * the rename catch-up is best-effort:
- *
- * 1. HARD GATE (throws): refuse to start if .env.neondb is missing. `dotenv -e` silently
- *    proceeds when the file doesn't exist, so without this check a workspace whose provisioning
- *    failed would boot against whatever DATABASE_URL leaks in from the ambient env — the exact
- *    shared-database collision this whole setup exists to prevent.
- * 2. HARD GATE (throws): refuse to start a workspace whose setup is still marked 'pending' — the
- *    branch is mid-rebuild; provision must recover it first.
- * 3. Rename catch-up (best-effort, never throws): Conductor has no rename event, so this is
- *    where the Neon branch's name is brought back in line with the workspace. Any failure here
- *    only leaves the Neon console's branch name cosmetically stale.
- * 4. HARD GATE (throws on definitive absence): the recorded branch must still exist in Neon —
- *    otherwise .env.neondb points at a dead endpoint and the app would boot into opaque
- *    connection errors. A transient verification failure only warns.
+ * Runs before every dev-server start. See planSync() for the full decision table.
  */
-async function sync(): Promise<void> {
-  if (!existsSync(ENV_FILE)) {
-    throw new Error(
-      `${ENV_FILE} not found — this workspace's database was never provisioned, provisioning ` +
-        `failed, or the workspace predates this script version (which wrote .env instead). ` +
-        `In every case the fix is the same: re-run workspace setup (scripts/conductor-db.ts ` +
-        `provision — this rebuilds the workspace branch from scratch, discarding any data in ` +
-        `it) before starting the dev server. Starting without ${ENV_FILE} would silently use a ` +
-        `shared/ambient DATABASE_URL.`,
-    )
-  }
-  if (setupIsPending()) {
-    throw new Error(
-      'This workspace\'s database setup never completed (state is "pending" — a previous ' +
-        'provision was interrupted before baseline/seed finished). Re-run workspace setup ' +
-        '(scripts/conductor-db.ts provision) to recover it before starting the dev server.',
-    )
-  }
-  const projectId = process.env.NEON_PROJECT_ID
-  if (!projectId || !process.env.NEON_API_KEY) {
-    console.warn('[conductor-db] NEON_PROJECT_ID / NEON_API_KEY not set — skipping branch rename sync.')
-    return
-  }
-  try {
-    await renameCatchUp(projectId)
-  } catch (error) {
-    console.warn(`[conductor-db] WARNING: branch rename sync failed: ${error instanceof Error ? error.message : error}`)
-  }
 
-  // HARD GATE 4: the branch the env file points at must still exist — a teardown that died
-  // between delete and file cleanup (or a console-side delete) leaves a valid-looking
-  // .env.neondb aimed at a dead endpoint, and the dev server would boot into opaque connection
-  // errors. Definitive absence fails the run; a transient check failure does not. If no record
-  // could be established at all (renameCatchUp found no live branch either), the env file is
-  // unaccounted for — fail rather than boot into the same dead endpoint.
-  const finalRecord = readBranchState()
-  if (!finalRecord) {
-    throw new FatalError(
-      `${ENV_FILE} exists but no branch is recorded for this workspace and none was found ` +
-        `under its derived names — the branch was likely deleted by an interrupted archive. ` +
-        `Re-run workspace setup (scripts/conductor-db.ts provision) to recreate it, or delete ` +
-        `${ENV_FILE} if the workspace is being retired.`,
-    )
+export type SyncGateReason =
+  | { type: 'unprovisioned' }
+  | { type: 'pending' }
+  | { type: 'deadBranch'; recorded: string }
+
+export type SyncAction =
+  | { type: 'gate'; reason: SyncGateReason }
+  | { type: 'noop' }
+  | { type: 'reconcile'; to: string }
+  | { type: 'rename'; from: string; to: string }
+  | { type: 'collision'; from: string; to: string }
+
+/**
+ * Pure decision function for sync(). Hard gates (unprovisioned / pending / dead recorded branch)
+ * always win. Only once past those does a recorded-vs-current mismatch get evaluated: normal
+ * rename, a reconcile-only self-heal (a prior sync already renamed on Neon but crashed before
+ * persisting locally), or — when the target name is already a DIFFERENT live branch — a hard
+ * collision gate instead of a rename that would silently fail and leave a stale DATABASE_URL.
+ */
+export function planSync(
+  state: { branch: string; phase: 'pending' | 'ready' } | null,
+  current: string,
+  recordedExists: boolean,
+  currentExists: boolean,
+): SyncAction {
+  if (!state) return { type: 'gate', reason: { type: 'unprovisioned' } }
+  if (state.phase === 'pending') return { type: 'gate', reason: { type: 'pending' } }
+  if (state.branch === current) {
+    return recordedExists ? { type: 'noop' } : { type: 'gate', reason: { type: 'deadBranch', recorded: state.branch } }
   }
-  try {
-    if (!(await withRetry('verify branch exists', () => branchExists(projectId, finalRecord), 2))) {
-      throw new FatalError(
-        `Recorded branch ${finalRecord} no longer exists in Neon — it was deleted out-of-band ` +
-          `(or a previous archive was interrupted). Re-run workspace setup ` +
-          `(scripts/conductor-db.ts provision) to recreate it before starting the dev server.`,
-      )
-    }
-  } catch (error) {
-    if (error instanceof FatalError) throw error
-    console.warn(
-      `[conductor-db] WARNING: could not verify branch ${finalRecord} still exists: ` +
-        `${error instanceof Error ? error.message : error}`,
-    )
-  }
+  if (!recordedExists && currentExists) return { type: 'reconcile', to: current }
+  if (!recordedExists && !currentExists) return { type: 'gate', reason: { type: 'deadBranch', recorded: state.branch } }
+  if (currentExists) return { type: 'collision', from: state.branch, to: current }
+  return { type: 'rename', from: state.branch, to: current }
 }
 
-/** sync()'s best-effort rename catch-up — see sync() for the failure rules. */
-async function renameCatchUp(projectId: string): Promise<void> {
-  const recorded = readBranchState()
-  const current = workspaceBranchName()
-  if (!recorded) {
-    // Workspace provisioned before the state file existed: record the name now, while the
-    // derived slug still matches the live branch, so a later rename can't orphan it. Long names
-    // may live under the OLD flat-truncation scheme — check that name too.
-    const live = [current, legacyWorkspaceBranchName()]
-      .filter((name): name is string => Boolean(name))
-      .find((name) => branchExists(projectId, name))
-    if (live) {
-      assertDisposableChildBranch(live, process.env.NEON_PARENT_BRANCH ?? '')
-      writeBranchState(live)
-      console.log(`[conductor-db] recorded existing branch ${live} → ${stateFilePath()}`)
+function throwForGate(reason: SyncGateReason): never {
+  if (reason.type === 'unprovisioned') {
+    throw new Error('Workspace not provisioned — run `db:provision` (or `worktree:setup`) before starting the dev server.')
+  }
+  if (reason.type === 'pending') {
+    throw new Error('Workspace database setup did not finish (state is "pending") — re-run `db:provision` to recover it.')
+  }
+  throw new Error(`Recorded branch "${reason.recorded}" no longer exists in Neon — re-run \`db:provision\` to recreate it.`)
+}
+
+function collisionMessage(action: Extract<SyncAction, { type: 'collision' }>): string {
+  return (
+    `Refusing to start: this workspace's identity resolves to "${action.to}", which already exists ` +
+    `as its own live Neon branch, while "${action.from}" (a different, still-live branch) is ` +
+    `recorded here. These are two previously-provisioned workspaces colliding — renaming would ` +
+    `silently fail and leave a stale DATABASE_URL. Re-run \`db:provision\` to rebuild "${action.to}" ` +
+    `for this checkout (discards its current data), or check back out whatever matches "${action.from}".`
+  )
+}
+
+/**
+ * Runs before every dev-server start (chained in front of it — see the "dev" package.json script).
+ * Hard gates throw (blocking the dev server, deliberately); a rename/reconcile is best-effort and
+ * never blocks the dev server on its own failure. See planSync() for the full decision table.
+ */
+async function sync(): Promise<void> {
+  const raw = resolveWorkspaceName(process.env, process.cwd(), currentGitContext(process.cwd()))
+  const current = workspaceBranchName(raw)
+  const state = readBranchStateFull()
+
+  if (!state || state.phase === 'pending') {
+    const action = planSync(state, current, false, false)
+    if (action.type === 'gate') throwForGate(action.reason)
+    return
+  }
+
+  const projectId = requireEnv('NEON_PROJECT_ID')
+  requireEnv('NEON_API_KEY')
+  const recordedExists = await withRetry('check recorded branch', () => branchExists(projectId, state.branch), 3)
+  const currentExists =
+    state.branch === current ? recordedExists : await withRetry('check current branch', () => branchExists(projectId, current), 3)
+  const action = planSync(state, current, recordedExists, currentExists)
+
+  switch (action.type) {
+    case 'noop':
+      return
+    case 'gate':
+      throwForGate(action.reason)
+      return
+    case 'collision':
+      throw new Error(collisionMessage(action))
+    case 'reconcile':
+      writeBranchState(action.to)
+      console.log(`[neondb-branch] recorded branch was already renamed on Neon — reconciled local state to "${action.to}".`)
+      return
+    case 'rename': {
+      try {
+        const parent = process.env.NEON_PARENT_BRANCH ?? ''
+        assertDisposableChildBranch(action.from, parent)
+        assertDisposableChildBranch(action.to, parent)
+        await renameBranch(projectId, action.from, action.to)
+        writeBranchState(action.to)
+        console.log(`✅ [neondb-branch] renamed ${action.from} → ${action.to} to match the current workspace.`)
+      } catch (error) {
+        console.warn(`[neondb-branch] WARNING: branch rename failed: ${error instanceof Error ? error.message : error}`)
+      }
+      return
     }
-    return
   }
-  if (recorded === current) return // no rename since the last check
-
-  assertDisposableChildBranch(recorded, process.env.NEON_PARENT_BRANCH ?? '')
-  assertDisposableChildBranch(current, process.env.NEON_PARENT_BRANCH ?? '')
-
-  // Self-heal a record left stale by a crash between a rename and its re-record: if the recorded
-  // branch is gone but one under the current name exists, just re-record.
-  if (!branchExists(projectId, recorded) && branchExists(projectId, current)) {
-    writeBranchState(current)
-    console.log(`[conductor-db] record was stale — re-recorded live branch ${current}.`)
-    return
-  }
-
-  console.log(`[neon] workspace renamed — renaming branch ${recorded} → ${current}…`)
-  await renameBranch(projectId, recorded, current)
-  writeBranchState(current)
-  console.log('✅ [conductor-db] branch renamed to match the workspace.')
 }
 
 async function main(): Promise<void> {
+  loadEnvFile() // .env.neondb, never overriding an already-set var
   const mode = process.argv[2]
   try {
     if (mode === 'provision') await provision()
     else if (mode === 'teardown') await teardown()
     else if (mode === 'sync') await sync()
     else {
-      console.error('Usage: tsx scripts/conductor-db.ts <provision|teardown|sync>')
+      console.error('Usage: tsx scripts/neondb-branch.ts <provision|teardown|sync>')
       process.exit(2)
     }
   } catch (error) {
-    console.error(`❌ [conductor-db] ${mode ?? '(no mode)'} failed:`, error instanceof Error ? error.message : error)
+    console.error(`❌ [neondb-branch] ${mode ?? '(no mode)'} failed:`, error instanceof Error ? error.message : error)
     process.exit(1)
   }
 }
 
-// Run only when executed directly (e.g. `tsx scripts/conductor-db.ts provision`),
+// Run only when executed directly (e.g. `tsx scripts/neondb-branch.ts provision`),
 // so unit tests can import the pure helpers above without triggering the CLI.
-if (process.argv[1] && /conductor-db\.[cm]?[jt]s$/.test(process.argv[1])) {
+if (process.argv[1] && /neondb-branch\.[cm]?[jt]s$/.test(process.argv[1])) {
   void main()
 }
