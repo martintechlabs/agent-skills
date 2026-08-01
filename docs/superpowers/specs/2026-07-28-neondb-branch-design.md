@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-28
 **Category:** `devops`
-**Status:** Approved
+**Status:** Approved (amended 2026-08-01 — dual Orca + Conductor seamless support)
 
 ## Purpose
 
@@ -14,100 +14,191 @@ wired entirely to Conductor: `CONDUCTOR_WORKSPACE_NAME` for identity,
 for the local/cloud split.
 
 This design replaces it **in place** with `neondb-branch`: the same Neon+Prisma/Drizzle
-mechanic, installable in any git repo with no orchestration tool assumed. Workspace
-identity comes from the current git branch. Lifecycle triggers become plain
-`package.json` scripts the developer runs (or a worktree-management tool calls)
-directly, instead of Conductor-specific hooks.
+mechanic, installable in any git repo. The script itself assumes **no** orchestration
+tool. Workspace identity is **workspace-stable** under Conductor and Orca (and git-branch
+based only for plain single-clone checkouts). Lifecycle is plain `package.json` scripts;
+Conductor and Orca are first-class consumers of those same scripts via thin config
+templates the skill ships and documents.
 
-A reference implementation at a sibling project (`mobata`, internal — not part of this
-repo) was reviewed during design. It is an **earlier fork** of this script's history
-(pre-dates the true-ledger baseline fix and the four safety-hardening review passes
-already shipped in `conductor-neon-db`), generalized sideways to also support a second
-orchestration tool (Orca) rather than removed from needing one at all. Several of its
-mechanics are call-outs below as things to explicitly **not** carry over; a few
-testability/robustness patterns are worth adopting regardless.
+The Neon mechanics stay those already hardened in `conductor-neon-db` (true-ledger
+baseline, full-rebuild provision, safety guards). What changes is packaging and
+identity: dual-orchestrator wiring (`worktree:*` scripts + `.conductor/settings.toml` +
+`orca.yaml`), workspace-stable name resolution, `.env.neondb` upsert, programmatic
+dotenv load, `load-env.cjs`, and pure `planSync` / `planTeardown` helpers for
+testability. Reuse-if-exists provision and baselining from local migration files remain
+explicitly out of scope — both are regressions of bugs the true-ledger work fixed.
 
 ## Non-goals
 
 - Does not change the Neon+Prisma/Drizzle mechanics: schema-only branch, disposable
   `tmp/*` check branch, true-ledger read/baseline, `migrate deploy`, seeding. All of
-  this is Conductor-independent already and stays exactly as it is.
+  this is orchestrator-independent already and stays exactly as it is.
 - Does not support a "reuse an existing branch, keep its data across re-runs" mode.
   `provision()` stays a full, deterministic rebuild every run, matching
-  `conductor-neon-db`'s existing (already-fixed) behavior. `mobata`'s reuse-if-exists
-  model is a regression of the bug the true-ledger baseline replaced and is explicitly
-  rejected here.
+  `conductor-neon-db`'s existing (already-fixed) behavior. A reuse-if-exists path would
+  reintroduce the partial-state / baseline-drift class of bugs true-ledger replaced and
+  is explicitly rejected here.
 - Does not read migration state from local migration files as a baseline source.
-  `mobata`'s `buildBaselineSql(readMigrations())` (parent trusted to have run every
-  committed migration) is the exact drift bug `conductor-neon-db`'s check-branch
-  mechanism exists to prevent. Not adopted.
-- Does not keep any Conductor-specific concept: `CONDUCTOR_WORKSPACE_NAME`,
-  `CONDUCTOR_IS_LOCAL`, `$CONDUCTOR_PORT`, `.conductor/settings.toml`. A project still
-  using Conductor can wire its `run`/`setup`/`archive` scripts to call the plain
-  `package.json` scripts this design defines (that composition is the project's
-  choice, not something this skill documents or special-cases).
-- Does not auto-rename the live Neon branch when the git branch changes. Renaming is
-  a deliberate action (re-running `db:provision`), never a side effect of starting the
-  dev server — see "Workspace identity and renaming" below for why.
+  Reconstructing the ledger from committed migrations (parent trusted to have run every
+  one) is the exact drift bug `conductor-neon-db`'s check-branch mechanism exists to
+  prevent. Not adopted.
+- Does not fork script behavior on `CONDUCTOR_IS_LOCAL` (or any Orca equivalent). Local
+  and cloud workspaces run the same code path; secrets come from env / `.env.neondb`,
+  not from tool-specific branching.
+- Does not auto-rebuild (delete+recreate) the Neon branch as a side effect of starting
+  the dev server. A deliberate identity move that *discards data* is always
+  `db:provision` / `worktree:setup` — see "Workspace identity and renaming".
 - Does not keep `conductor-neon-db` as a separate skill. It is replaced in place;
   there is no dual-maintenance path.
-- Does not add a `WORKSPACE_NAME` override env var or a directory-basename fallback.
-  Git branch name is the sole identity source (see "Decisions ruled out" below).
+- Does not require Conductor *or* Orca. A plain git clone with only `package.json`
+  scripts is a supported install path. Orchestrator configs are optional, documented
+  add-ons that call the same scripts.
+
+## Dual-orchestrator requirement (first-class)
+
+**Seamless with both Conductor and Orca is a hard requirement**, not an afterthought
+left to each project. Concretely:
+
+1. One script (`scripts/neondb-branch.ts`) with three commands: `provision`, `sync`,
+   `teardown`.
+2. One shared `package.json` surface both tools call — thin `worktree:*` aliases over
+   `db:*` (see "Lifecycle" below). Neither orchestrator needs to know about Neon,
+   neonctl, or state-file paths.
+3. Skill ships and documents **both** config templates:
+   - `.conductor/settings.toml` — `setup` / `run` / `archive` → `worktree:*`
+   - `orca.yaml` — `scripts.setup` / `scripts.archive` → `worktree:*` (Orca has no
+     `run` hook; the hard gate lives in `package.json`'s `dev` script instead)
+4. Identity resolution prefers each tool's own env var, then a general
+   `WORKSPACE_NAME`, then checkout-derived fallbacks: `CONDUCTOR_WORKSPACE_NAME` →
+   `ORCA_WORKSPACE_NAME` → `WORKSPACE_NAME` → secondary-worktree basename → git
+   branch. Conductor already injects its var. Orca 1.4.x does **not** currently
+   export `ORCA_WORKSPACE_NAME`, so the basename fallback is what makes Orca work
+   today; when Orca (or the project) sets `ORCA_WORKSPACE_NAME` /
+   `WORKSPACE_NAME`, those win over basename.
+
+The skill is still "no orchestration tool assumed" at the **script** layer. It is
+**not** "composition is the project's private business" at the **skill/docs** layer —
+dual wiring is part of what the skill teaches and installs.
 
 ## Decisions ruled out (and why)
 
-Two structural alternatives were considered and rejected during design:
-
-1. **Directory basename as identity** (`mobata`'s actual approach — derives from
-   `basename(cwd)`, falling back from `CONDUCTOR_WORKSPACE_NAME`). This is correct
-   only when every workspace lives in its own directory (worktree-per-branch tooling)
-   and silently wrong for a plain single-clone repo where branches are switched in
-   place — every branch would collide onto the same Neon branch. Rejected in favor of
-   git branch name, which works for both worktree-based and plain single-clone usage.
-2. **Explicit `WORKSPACE_NAME` env var with a fallback chain.** Adds a second identity
-   source to document and reason about (which one won, in which precedence) for a
-   generalization step whose whole point is removing environment-variable plumbing.
-   Rejected; git branch name alone is the identity source.
+1. **Git branch as the sole identity source** (earlier draft of this design). Rejected
+   for dual-orchestrator use: Conductor identity is the stable workspace name (city
+   codename), not the git branch; Orca worktree display/path codenames (`mojarra`)
+   differ from the feature branch (`martintechlabs/…`). A brief `git checkout main`
+   inside a live workspace would either hard-fail `dev` or, on re-provision, wipe that
+   workspace's Neon branch. Workspace-stable identity fixes this; git branch remains
+   only the plain-single-clone fallback (see below).
+2. **Basename alone as identity** (no further fallback). Correct for
+   worktree-per-workspace tools (each worktree is its own directory) but silently wrong
+   for a plain single-clone repo where branches are switched in place — every branch
+   would collide onto one Neon branch. Rejected as the *only* source; retained as the
+   secondary-worktree fallback.
+3. **An explicit hand-set `WORKSPACE_NAME` in `.env.neondb`.** That file can be
+   copied/reused across workspaces and would collide two of them onto the same Neon
+   branch. Identity is always resolved at runtime from orchestrator env, ambient
+   process env, or the checkout — never stored as a fixed value in the env file.
+   Ambient `WORKSPACE_NAME` is the **general** env slot (after tool-specific vars),
+   not something provision writes into `.env.neondb`.
+4. **`sync()` hard-failing on every recorded-vs-current identity mismatch with no
+   rename path.** Correct if identity were git branch (checkout ≠ rename). Wrong when
+   identity is workspace-stable: Conductor renames the workspace in the UI with no
+   rename event, and the existing skill's best-effort Neon rename on `run` is the
+   right UX (data preserved, name catches up). Restored: soft rename on mismatch when
+   the recorded branch still exists; hard gates only for unsafe states (see below).
 
 ## Workspace identity and renaming
 
-Identity is the current git branch (`git rev-parse --abbrev-ref HEAD`), slugified with
-the same rules `conductor-neon-db` already uses (lowercase, non-alnum runs collapsed to
-`-`, trimmed, truncated with a content hash suffix past `MAX_SLUG`). Detached HEAD or
-"not inside a git repository" throws a clear, actionable error — there is no derivable
-identity in either case.
+### Resolution order
 
-A git branch changes on **every checkout**, not just a deliberate rename — unlike
-`CONDUCTOR_WORKSPACE_NAME`, which only changed when a human renamed the workspace in
-Conductor's UI. Treating every branch change as "the workspace was renamed, follow it"
-would mean:
+`resolveWorkspaceName(env, cwd, gitContext)` returns the raw identity string (before
+slugify), first match wins:
 
-- Checking out `main` momentarily to look something up, then running `pnpm dev`,
-  silently renames the live Neon branch to `workspace/main`.
-- Checking back out the original feature branch renames it back.
-- Provisioning while accidentally on the wrong branch would delete a *different*
-  branch's real, in-progress Neon branch.
+1. **`env.CONDUCTOR_WORKSPACE_NAME`** — Conductor injects this per workspace. Wins
+   over any general `WORKSPACE_NAME` so a copied shell env cannot override the
+   tool's own identity.
+2. **`env.ORCA_WORKSPACE_NAME`** — Orca's own identity when present. Same precedence
+   rationale as Conductor.
+3. **`env.WORKSPACE_NAME`** — the **general** ambient env var for plain installs,
+   custom orchestrators, tests, or a project that exports one name for every tool.
+   Only if already set in the process environment. **Never** read from
+   `.env.neondb` (that file can be copied across workspaces and would collide them).
+4. **Secondary git worktree → `basename(cwd)`** — when none of the three env vars
+   are set. Detected when `.git` is a file, or `git rev-parse --git-dir` contains
+   `/worktrees/`. Makes **Orca work today** without `ORCA_WORKSPACE_NAME` (worktree
+   dirs like `…/workspaces/agent-skills/mojarra`) and covers a Conductor workspace
+   if its env var is ever missing.
+5. **Plain main-worktree / single clone → current git branch**
+   (`git rev-parse --abbrev-ref HEAD`). Detached HEAD or "not a git repository"
+   throws a clear, actionable error — no derivable identity.
 
-To avoid this, renaming is split into two different behaviors depending on whether the
-action is deliberate or incidental:
+Slugify rules stay as in `conductor-neon-db` (lowercase, non-alnum runs collapsed to
+`-`, trimmed, truncated with a content hash suffix past `MAX_SLUG`). Neon branch name
+is `workspace/<slug>` (see prefixes below).
 
-- **`provision()`** keeps `conductor-neon-db`'s existing full-rebuild behavior
-  unchanged: it derives the branch name from whatever branch is currently checked out,
-  deletes whatever branch is currently recorded in the state file (if it still exists),
-  and creates a fresh one under the current name — already logging clearly which
-  branch it's replacing. Re-running `db:provision` after `git branch -m old new` is how
-  you deliberately move this workspace's Neon branch to follow a rename.
-- **`sync()`** (chained in front of the dev server — see "Lifecycle" below) becomes a
-  **pure verifier, never a mutator**. If the branch recorded in the state file doesn't
-  match the branch derived from the current checkout, `sync()` throws — it never
-  renames anything. Error message: which branch is recorded, which branch you're
-  currently on, and the two ways to resolve it (check back out the recorded branch, or
-  re-run `db:provision` if you meant to move this workspace to the new branch).
+This function is pure and unit-tested with injected `env` / `cwd` / git-context so the
+precedence chain cannot silently regress. Tests must lock **tool-specific before
+general**: `CONDUCTOR_WORKSPACE_NAME` / `ORCA_WORKSPACE_NAME` beat `WORKSPACE_NAME`
+when both are set.
 
-This also restores two hard gates `conductor-neon-db` has today that a naive port could
-drop: `sync()` still refuses to start (non-zero exit) when the state file shows setup
-never finished (`pending` phase — see below), and still refuses to start when the
-recorded branch no longer exists in Neon at all.
+### Why this order
+
+| Environment | What wins | Stable across `git checkout`? |
+|---|---|---|
+| Conductor workspace | `CONDUCTOR_WORKSPACE_NAME` | Yes |
+| Orca with `ORCA_WORKSPACE_NAME` set | `ORCA_WORKSPACE_NAME` | Yes |
+| Custom / plain with `WORKSPACE_NAME` set | `WORKSPACE_NAME` | Yes (caller-controlled) |
+| Orca worktree, no env (current 1.4.x) | `basename(cwd)` (e.g. `mojarra`) | Yes |
+| Plain single clone, no env | git branch | No — by design: branch *is* the workspace |
+
+### Rename / mismatch behavior
+
+Identity sources that change only on deliberate workspace rename (Conductor UI rename,
+Orca worktree directory/codename change, or a caller changing `WORKSPACE_NAME` /
+`ORCA_WORKSPACE_NAME`) are rare and intentional. Git-branch identity changes on every
+checkout — but that path only applies to plain single-clone with no env vars set,
+where "the workspace" *is* the branch.
+
+Split by action:
+
+- **`provision()`** — full rebuild, unchanged from `conductor-neon-db`: derive current
+  identity → delete whatever is recorded in the state file (if it still exists) →
+  create fresh under the current name. Logs clearly which Neon branch it is replacing.
+  This is the deliberate "move me / rebuild me" path (data discarded).
+- **`sync()`** — **hard gates first** (non-zero exit, block the dev server):
+  1. No state file / missing `.env.neondb` → unprovisioned; tell user to run
+     `db:provision` or `worktree:setup`.
+  2. State phase is `pending` → interrupted provision; same remediation.
+  3. Recorded Neon branch no longer exists in the project → dead endpoint; re-provision.
+  - **Then**, if recorded name ≠ name derived from current identity:
+    - Prefer **best-effort rename** of the live Neon branch (real rename, not
+      delete+recreate — data and connection endpoint stay valid) and update the state
+      file, matching today's `conductor-neon-db` rename catch-up (including the
+      "recorded gone but current already exists → reconcile local state only"
+      self-heal via `planSync`).
+    - Rename failures are **warnings, exit 0** — cosmetic name drift must never block
+      the dev server. Isolation is preserved because teardown always trusts the state
+      file, not a re-derived name.
+  - Under plain-single-clone (git-branch identity), a checkout to a different branch
+    that was never provisioned hits hard gate (1) or (3) for that identity's name —
+    it does **not** silently rename the previous branch's Neon DB onto `main`. If the
+    previous branch's Neon name is still what the state file records and the user is
+    now on a different git branch, derived identity differs: `sync` attempts rename
+    to the new branch slug. That is acceptable for plain-clone (one checkout, one
+    active identity) and is why provision-on-the-right-branch remains the rule for
+    multi-branch isolation there. Document this clearly in the skill.
+  - **Guard the rename target**: before attempting the rename, check whether the
+    derived target name already exists in Neon as a *different* live branch (i.e. a
+    branch this same state file did not just record). If so, this is not a rename —
+    it's two distinct previously-provisioned identities colliding (e.g. checking out a
+    branch that already has its own real `workspace/<slug>` from an earlier session).
+    Treat this as a hard gate (refuse to start, name both branches, tell the user to
+    re-run `db:provision` for the current identity) rather than attempting a rename
+    that would fail anyway and fall through to booting against the stale
+    `DATABASE_URL` left in `.env.neondb`.
+
+`planSync` / `planTeardown` pure helpers encode the above for unit-testing without
+mocking `neonctl`.
 
 ## Branch prefixes and state files
 
@@ -119,37 +210,102 @@ recorded branch no longer exists in Neon at all.
 | `.conductor/db-branch-check` | `.neondb/branch-check` |
 
 `.neondb/` is gitignored in full — there is no shared config file inside it (unlike
-`.conductor/`, which had to carve out an exception for the committed
-`settings.toml`). State file format, atomic write-then-rename, and the
+`.conductor/`, which still needs a carve-out for the committed `settings.toml` when
+Conductor is used). State file format, atomic write-then-rename, and the
 `pending`/`ready` phase marker are otherwise unchanged from `conductor-neon-db`.
 
-## Lifecycle — no orchestration tool assumed
+## Lifecycle — shared `package.json` surface
 
-There are no `setup`/`run`/`archive` hooks to wire into. Instead, three
-`package.json` scripts:
+Core scripts every install gets:
 
 ```jsonc
 {
   "scripts": {
     "db:provision": "tsx scripts/neondb-branch.ts provision",
-    "dev": "tsx scripts/neondb-branch.ts sync && NODE_OPTIONS='--require ./scripts/load-env.cjs' <original dev command>",
-    "db:teardown": "tsx scripts/neondb-branch.ts teardown"
+    "db:sync": "tsx scripts/neondb-branch.ts sync",
+    "db:teardown": "tsx scripts/neondb-branch.ts teardown",
+
+    // Thin aliases both orchestrators call — install deps / generate client as needed
+    "worktree:setup": "<pm install> && <orm generate if prisma> && tsx scripts/neondb-branch.ts provision",
+    "worktree:sync": "tsx scripts/neondb-branch.ts sync",
+    "worktree:archive": "tsx scripts/neondb-branch.ts teardown",
+
+    // Hard gate + env load; Orca has no run hook, so this is the universal entry
+    "dev": "tsx scripts/neondb-branch.ts sync && NODE_OPTIONS='--require ./scripts/load-env.cjs' <original dev command>"
   }
 }
 ```
 
-- `db:provision` — manual, run once per branch (or again to deliberately rebuild /
-  follow a rename — see above).
-- `dev` — the project's existing dev script, prefixed with `sync` (hard gate) and the
-  `NODE_OPTIONS` require-hook (see next section). Nothing else about the dev command
-  changes.
-- `db:teardown` — manual, run before deleting/abandoning the branch (worktree removal,
-  branch deletion, or simply "done with this feature").
+- `db:provision` / `worktree:setup` — run once per workspace (or again to deliberately
+  rebuild / follow an identity change that should discard data).
+- `db:sync` / `worktree:sync` / leading `sync` in `dev` — hard gates + optional
+  best-effort rename (see above).
+- `db:teardown` / `worktree:archive` — run before abandoning the workspace (worktree
+  removal, Conductor archive, Orca worktree rm, or "done with this feature").
 
-A project using a worktree-management tool (Conductor, Orca, a custom script, etc.) is
-free to call these same three `pnpm`/`npm` scripts from its own lifecycle hooks — that
-composition is the project's business, not something this skill documents, since the
-whole point is not assuming any particular tool exists.
+Plain-clone users can ignore `worktree:*` and call `db:*` only. Orchestrator installs
+use `worktree:*` so both tools share one vocabulary.
+
+### Conductor — `.conductor/settings.toml` (skill ships this template)
+
+```toml
+"$schema" = "https://conductor.build/schemas/settings.repo.schema.json"
+
+# setup/archive/run all delegate to the shared worktree:* package.json scripts.
+# Secrets (NEON_*) live in Conductor Environment tabs (Local + Cloud) and/or
+# .env.neondb — never committed here. Do NOT set DATABASE_URL here or in env tabs.
+
+[scripts]
+setup = "corepack enable pnpm && pnpm worktree:setup"
+archive = "pnpm worktree:archive"
+run = "pnpm worktree:sync && pnpm dev --port $CONDUCTOR_PORT"
+run_mode = "concurrent"
+```
+
+Notes the skill must document (carried forward from `conductor-neon-db`):
+
+- `run_mode = "concurrent"` is safe because each workspace has its own Neon branch and
+  `$CONDUCTOR_PORT`.
+- **Do not put `DATABASE_URL` in Conductor Environment tabs** — it overrides the
+  per-workspace branch.
+- `NEON_API_KEY` / `NEON_PROJECT_ID` / `NEON_PARENT_BRANCH` in **both** Local and Cloud
+  tabs. `provision()` still mirrors them into `.env.neondb`; `main()` loads that file
+  before `teardown`, so archive is self-sufficient even when Conductor's archive
+  process is missing env vars (observed production bug — keep the fallback).
+- Gitignore carve-out: track `settings.toml`, ignore `.conductor/db-branch*` if any
+  legacy paths remain; prefer `.neondb/` fully ignored for new state.
+- `file_include_globs` is top-level only (not inside `[scripts]`).
+
+### Orca — `orca.yaml` (skill ships this template)
+
+```yaml
+# Mirrors Conductor's setup/archive. Both tools call the same worktree:* scripts.
+# NEON_* come from .env.neondb (and/or the ambient environment) — not from this file.
+# Orca has no run hook: sync is chained inside package.json "dev".
+scripts:
+  setup: |
+    corepack enable pnpm && pnpm worktree:setup
+  archive: |
+    pnpm worktree:archive
+```
+
+Notes the skill must document:
+
+- Orca worktree create/setup should run `worktree:setup` (via this recipe or the
+  project's equivalent environment recipe hooks).
+- Orca worktree remove/archive should run `worktree:archive` so Neon branches do not
+  leak.
+- Because there is no Orca `run` equivalent, **never** ship a `dev` script that skips
+  `sync` — that hard gate is what makes `load-env.cjs`'s ENOENT fallback safe.
+- Identity: `ORCA_WORKSPACE_NAME` if set, else `WORKSPACE_NAME` if set, else worktree
+  directory basename (current Orca 1.4.x has neither env var — basename is what
+  works today).
+
+### Custom / other tools
+
+Any tool that can run shell on workspace create / start / destroy can call
+`worktree:setup` / rely on `dev`'s sync / `worktree:archive`. No further integration
+surface exists or is planned.
 
 ## `.env.neondb` handling
 
@@ -160,15 +316,16 @@ whole point is not assuming any particular tool exists.
   connection string.
 - `NEON_API_KEY`, `NEON_PROJECT_ID`, `NEON_PARENT_BRANCH` — mirrored in from ambient
   environment (wherever the developer already has them — shell profile, `.env`,
-  direnv) on every `provision()` run, same as `conductor-neon-db` does today. This
-  keeps `.env.neondb` self-sufficient for later `sync`/`teardown` invocations even
-  from a shell that never had them exported.
+  direnv, Conductor Environment tabs) on every `provision()` run, same as
+  `conductor-neon-db` does today. This keeps `.env.neondb` self-sufficient for later
+  `sync`/`teardown` invocations even from a shell that never had them exported
+  (including Conductor archive).
 
 `main()` loads `.env.neondb` itself, programmatically, via the `dotenv` package
 (`config({ path: ENV_FILE })`, never overriding an already-set var) before dispatching
-to `provision`/`sync`/`teardown` — the same approach `mobata` uses. This is why none of
-the three `package.json` scripts above need a `dotenv -e ... --` shell prefix: the
-script is self-sufficient regardless of how it's invoked. `dotenv` becomes a new
+to `provision`/`sync`/`teardown`. This is why none of the package.json scripts need a
+`dotenv -e ... --` shell prefix: the script is self-sufficient regardless of how it's
+invoked (Conductor archive, Orca archive, bare terminal). `dotenv` becomes a new
 dev-dependency the setup instructions add alongside `neonctl`/`tsx`.
 
 Upsert semantics: read the file if present, replace the first matching `KEY=` line for
@@ -186,10 +343,10 @@ the three Neon control vars) are kept.
 
 ## Loading `.env.neondb` into the dev server
 
-Adopted from `mobata` rather than the `dotenv -e ... -o --` prefix originally
-considered: a small bundled `scripts/load-env.cjs` (~10 lines), loaded via
-`NODE_OPTIONS='--require ./scripts/load-env.cjs'` in the `dev` script (and `build`/
-`start`/seed scripts, if the project wants provisioned-workspace parity there too):
+Prefer a small bundled `scripts/load-env.cjs` (~10 lines) over a `dotenv -e ... -o --`
+shell prefix, loaded via `NODE_OPTIONS='--require ./scripts/load-env.cjs'` in the
+`dev` script (and `build`/`start`/seed scripts, if the project wants
+provisioned-workspace parity there too):
 
 ```js
 try {
@@ -206,11 +363,13 @@ in the same `&&` chain**: `load-env.cjs`'s ENOENT-swallowing fallback means an
 unprovisioned workspace would otherwise boot the dev server straight against whatever
 ambient `DATABASE_URL` is lying around (e.g. `.env.local`) with no warning at all. The
 hard gate is what makes that fallback safe instead of a silent shared-database
-collision — the two are adopted together, not independently.
+collision — the two are adopted together, not independently. This matters equally for
+Conductor `run` (which chains `worktree:sync` before `dev`) and for Orca (which only
+has `dev`).
 
 Prisma's CLI needs the same file loaded for `migrate`/`db execute`/`studio` outside the
-`dev` script; document a `prisma.config.ts` snippet (mirroring `mobata`'s) that loads
-`.env.neondb` first, falling back to plain `.env`:
+`dev` script; document a `prisma.config.ts` snippet that loads `.env.neondb` first,
+falling back to plain `.env`:
 
 ```ts
 import { config as loadEnv } from 'dotenv'
@@ -222,44 +381,51 @@ loadEnv()
 projects should source `.env.neondb` explicitly for any ad hoc `drizzle-kit` CLI
 invocation outside `dev`.)
 
-## Adopted testability/robustness patterns (from `mobata`)
+## Testability / robustness patterns
 
-Independent of the mechanics rejected above, two patterns are worth carrying into the
-rewrite:
-
-- **Pure decision functions** for `sync`/`teardown` branching logic (`planSync`-style,
-  `planTeardown`-style) — given local state plus live Neon-existence booleans, return
-  what action to take, unit-tested without mocking `neonctl`. `conductor-neon-db`
-  today inlines this logic; extracting it improves testability with no behavior
-  change.
-- **Teardown self-heal**: if the target branch is already gone (a previous teardown
-  died between delete and state cleanup, or a manual delete), treat it as
-  already-torn-down and clean up local state, rather than retrying a delete that would
-  404 forever. `conductor-neon-db` already has an equivalent for this specific case;
-  keep it, expressed as a small pure `planTeardown()` helper for testability parity
-  with `sync`.
+- **Pure decision functions** for `sync`/`teardown` (`planSync`, `planTeardown`) —
+  given local state plus live Neon-existence booleans, return what action to take,
+  unit-tested without mocking `neonctl`. Includes rename / reconcile / noop for sync
+  and delete / alreadyGone for teardown.
+- **Pure `resolveWorkspaceName`** with injected env/cwd/git-context — locks the
+  dual-orchestrator precedence chain.
+- **Teardown self-heal**: if the target branch is already gone, treat as
+  already-torn-down and clean up local state (idempotent archive under both tools).
 
 ## Files and components
 
 | Path | Change |
 |---|---|
-| `skills/devops/neondb-branch/SKILL.md` | New (replaces `skills/devops/conductor-neon-db/SKILL.md`) — full rewrite: new frontmatter name/description, `metadata: {author: martintechlabs, version: "0.1.0"}`, drop all Conductor sections, document the three `package.json` scripts, `.env.neondb` upsert semantics, `load-env.cjs`, git-branch identity + deliberate-vs-automatic renaming |
-| `skills/devops/neondb-branch/scripts/neondb-branch.ts` | Renamed + reworked from `conductor-db.ts`: git-branch identity, `sync()` hard-gate-not-rename, `.env.neondb` upsert (not full rewrite), `planSync`/`planTeardown` pure helpers |
+| `skills/devops/neondb-branch/SKILL.md` | New (replaces `skills/devops/conductor-neon-db/SKILL.md`) — full rewrite: frontmatter name/description, `metadata: {author: martintechlabs, version: "0.1.0"}`, hybrid identity, `db:*` + `worktree:*` scripts, **both** Conductor and Orca config templates, `.env.neondb` upsert, `load-env.cjs`, rename-vs-hard-gate semantics |
+| `skills/devops/neondb-branch/scripts/neondb-branch.ts` | Renamed + reworked from `conductor-db.ts`: `resolveWorkspaceName` chain, `workspace/` prefix, `.neondb/*` state paths, `.env.neondb` upsert, `planSync`/`planTeardown` pure helpers, best-effort rename + hard gates |
 | `skills/devops/neondb-branch/scripts/load-env.cjs` | New, bundled — the `NODE_OPTIONS` require-hook |
-| `skills/devops/neondb-branch/tests/neondb-branch.test.ts` | Renamed + extended from `conductor-db.test.ts`: new branch-mismatch-hard-gate cases, upsert/strip env-file cases, `planSync`/`planTeardown` unit tests |
-| `skills/devops/neondb-branch/references/verify.md` | Updated for new prefixes/paths/lifecycle (mechanics of the verify walkthrough itself — schema-only + true-baseline flow — are unchanged) |
+| `skills/devops/neondb-branch/tests/neondb-branch.test.ts` | Renamed + extended: identity precedence cases (`CONDUCTOR_WORKSPACE_NAME` > `ORCA_WORKSPACE_NAME` > `WORKSPACE_NAME` > worktree basename > git branch), hard-gate cases, best-effort rename/reconcile cases, upsert/strip env-file cases, `planSync`/`planTeardown` |
+| `skills/devops/neondb-branch/references/verify.md` | Updated for new prefixes/paths/lifecycle; still schema-only + true-baseline flow |
+| `skills/devops/neondb-branch/references/conductor-settings.toml.example` | Optional: exact Conductor template (or inline in SKILL.md — either is fine if not duplicated poorly) |
+| `skills/devops/neondb-branch/references/orca.yaml.example` | Optional: exact Orca template (same rule) |
 | `skills.sh.json` | `conductor-neon-db` → `neondb-branch` in the `DevOps` grouping |
-| `README.md` | Skill table row renamed + description updated |
+| `README.md` | Skill table row renamed + description updated (mention Neon branch-per-workspace for Conductor, Orca, or plain git) |
 | `skills/devops/conductor-neon-db/` | Removed (replaced in place, not kept alongside) |
 
 ## Success criteria
 
-- A fresh git repo (no Conductor, no Orca, no worktree tooling of any kind) can adopt
-  this skill and get an isolated per-branch Neon database using only `git` +
-  `package.json` scripts.
-- Switching branches and running `pnpm dev` on an unprovisioned or different branch
-  fails loudly with a clear remediation, never silently boots against the wrong
-  database.
+- A fresh git repo (no Conductor, no Orca) can adopt this skill and get an isolated
+  per-branch Neon database using only `git` + `package.json` `db:*` scripts.
+- A Conductor project that applies the shipped `.conductor/settings.toml` template
+  gets setup → isolated DB, run → sync hard gates + best-effort rename, archive →
+  teardown, with `run_mode = concurrent`, without any script changes beyond the shared
+  `worktree:*` surface.
+- An Orca project that applies the shipped `orca.yaml` template gets setup/archive
+  parity via the same `worktree:*` scripts; `pnpm dev` enforces sync (Orca has no run
+  hook). Identity resolves via `ORCA_WORKSPACE_NAME` or `WORKSPACE_NAME` when set,
+  otherwise basename of the worktree directory.
+- Checking out another git branch **inside** a Conductor or Orca workspace does **not**
+  change Neon identity and does **not** block `dev` solely because of that checkout.
+- Renaming a Conductor workspace (or changing the derived workspace name under Orca)
+  best-effort renames the Neon branch on next sync; data is preserved. Failures warn
+  and still allow the dev server to start.
+- Unprovisioned / `pending` / deleted-Neon-branch states still hard-fail `sync` with
+  clear remediation — never silently boot against ambient `DATABASE_URL`.
 - `provision()` remains a full, deterministic rebuild every run; no data-preserving
   reuse path exists.
 - The true-ledger baseline (disposable `tmp/*` check branch, never trusting local
@@ -267,7 +433,7 @@ rewrite:
 - `ORM` (Prisma/Drizzle), `PM_EXEC`, and `DB_ENV_VARS` porting knobs all still exist
   and work as they do in `conductor-neon-db` today.
 - `tsc --noEmit` clean; `tests/neondb-branch.test.ts` passes with 0 failures,
-  including new coverage for the branch-mismatch hard gate and the upsert/strip
-  env-file behavior.
+  including identity-precedence, hard-gate, rename/reconcile, and upsert/strip
+  coverage.
 - `conductor-neon-db` no longer exists as a separate skill; all references
   (`skills.sh.json`, `README.md`) point at `neondb-branch`.
