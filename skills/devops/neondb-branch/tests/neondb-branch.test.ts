@@ -15,6 +15,7 @@ import {
   FatalError,
   loadEnvFile,
   planSync,
+  planTeardown,
   readBranchState,
   readCheckBranchState,
   resolveWorkspaceName,
@@ -272,6 +273,16 @@ describe('neondb-branch helpers', () => {
         from: 'workspace/feature-x',
         to: 'workspace/main',
       })
+    })
+  })
+
+  describe('planTeardown (teardown() decision logic)', () => {
+    it('deletes when the branch still exists on Neon (the normal case)', () => {
+      expect(planTeardown(true)).toEqual({ type: 'delete' })
+    })
+
+    it('treats it as already torn down when the branch is gone — avoids retrying a delete that would 404 forever', () => {
+      expect(planTeardown(false)).toEqual({ type: 'alreadyGone' })
     })
   })
 

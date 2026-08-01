@@ -320,11 +320,6 @@ function currentGitContext(cwd: string): GitContext {
   return { isSecondaryWorktree, branch }
 }
 
-/** The workspace's Neon branch name, resolved from the live process/cwd/git state. */
-function currentWorkspaceBranchName(): string {
-  return workspaceBranchName(resolveWorkspaceName(process.env, process.cwd(), currentGitContext(process.cwd())))
-}
-
 /**
  * Persist the exact branch name provision() used. Reading this back in teardown() (instead of
  * re-deriving via workspaceBranchName()) makes teardown immune to a workspace rename changing
@@ -928,157 +923,62 @@ async function provision(): Promise<void> {
   console.log('✅ [neondb-branch] workspace database ready.')
 }
 
+export type TeardownAction = { type: 'delete' } | { type: 'alreadyGone' }
+
+/**
+ * Pure decision function for teardown(): whether the target branch still exists on Neon. Mirrors
+ * planSync()'s extraction for the same class of decision — self-heal (skip a delete that would
+ * 404 forever) is directly testable without mocking neonctl.
+ */
+export function planTeardown(branchExists: boolean): TeardownAction {
+  return branchExists ? { type: 'delete' } : { type: 'alreadyGone' }
+}
+
 async function teardown(): Promise<void> {
-  // Missing Neon credentials: if there is also no trace of a provisioned branch (no state file,
-  // no generated env file, no check-branch record), the workspace never got a database — archive
-  // must not error. But with a recorded/possible branch, failing loudly is the point: skipping
-  // here is exactly how branches used to leak past archive.
+  const raw = resolveWorkspaceName(process.env, process.cwd(), currentGitContext(process.cwd()))
+  const derived = workspaceBranchName(raw)
+  const state = readBranchStateFull()
+  const target = state?.branch ?? derived
+
   if (!process.env.NEON_PROJECT_ID || !process.env.NEON_API_KEY) {
-    if (!readBranchState() && !false && !readCheckBranchState()) {
-      console.warn('[neondb-branch] NEON_PROJECT_ID / NEON_API_KEY not set and no provisioned branch recorded — nothing to clean.')
+    if (!state && !readCheckBranchState()) {
+      console.warn('[neondb-branch] NEON_PROJECT_ID / NEON_API_KEY not set and nothing recorded — nothing to clean.')
       return
     }
     throw new Error(
-      'NEON_PROJECT_ID / NEON_API_KEY are required to delete this workspace\'s Neon branch ' +
-        '(a branch record exists). Set them in Conductor env and re-run archive, or the branch will leak.',
+      'NEON_PROJECT_ID / NEON_API_KEY are required to delete this workspace\'s Neon branch (a record ' +
+        'exists). Set them (e.g. in .env.neondb) and re-run teardown, or the branch will leak.',
     )
   }
   const projectId = requireEnv('NEON_PROJECT_ID')
   const parent = process.env.NEON_PARENT_BRANCH ?? ''
 
-  // Best-effort: the check branch seedTrueBaseline() creates (a disposable full-data clone of
-  // the parent, used to learn its true migration state) is normally cleaned up by that same
-  // function. If provision() was killed between creating it and its own cleanup, it survives
-  // until noticed — sweep for it here too so archiving still catches it. Prefer the PERSISTED
-  // name (survives a workspace rename since) over the freshly-derived one, falling back to the
-  // derived name only if nothing was ever persisted (e.g. no incomplete run). This must never
-  // block cleanup of the actual workspace branch below: an unusable CONDUCTOR_WORKSPACE_NAME
-  // just means there's nothing derivable to check, not a reason to fail.
+  // Sweep a leaked tmp/* check branch first (a provision killed between creating it and its own
+  // cleanup) — independent of which workspace branch we target below.
   try {
-    const checkName =
-      readCheckBranchState() ?? checkBranchName(resolveWorkspaceName(process.env, process.cwd(), currentGitContext(process.cwd())))
-    let checkNameUsable = true
-    try {
-      assertDisposableCheckBranch(checkName, parent)
-    } catch (error) {
-      // A corrupted/hand-edited record isn't a real branch reference worth preserving (a
-      // genuinely-written one is always tmp/*-prefixed) — clear it so this warning doesn't
-      // repeat on every future archive with no way to self-heal.
-      checkNameUsable = false
-      console.warn(
-        `[neondb-branch] ignoring unusable ${checkBranchStateFilePath()} record "${checkName}" ` +
-          `(${error instanceof Error ? error.message : error}) — clearing it.`,
-      )
-      clearCheckBranchState()
+    const checkName = readCheckBranchState() ?? checkBranchName(raw)
+    assertDisposableCheckBranch(checkName, parent)
+    if (await withRetry('check for leaked check branch', () => branchExists(projectId, checkName), 3)) {
+      console.log(`[neon] deleting leaked check branch ${checkName}…`)
+      await deleteBranch(projectId, checkName, { inherit: true })
     }
-    if (checkNameUsable) {
-      if (await withRetry('check for leaked check branch', () => branchExists(projectId, checkName), 3)) {
-        console.log(`[neon] deleting leaked check branch ${checkName}…`)
-        await deleteBranch(projectId, checkName, { inherit: true })
-      }
-      // Only clear after a CONFIRMED delete (or confirmed absence) — if branchExists()/
-      // deleteBranch() above throws, this is never reached and the record survives so a
-      // still-live leaked branch isn't forgotten just because this attempt failed.
-      clearCheckBranchState()
-    }
+    clearCheckBranchState()
   } catch (error) {
-    console.warn(
-      `[neondb-branch] WARNING: could not check for/delete a leaked check branch: ` +
-        `${error instanceof Error ? error.message : error}`,
-    )
+    console.warn(`[neondb-branch] WARNING: could not check for/delete a leaked check branch: ${error instanceof Error ? error.message : error}`)
   }
 
-  // Prefer the name provision() actually used — CONDUCTOR_WORKSPACE_NAME may have changed since
-  // (the workspace was renamed), which would otherwise re-derive a different slug and miss the
-  // real branch. The derived names (current scheme AND the pre-hash-suffix legacy scheme) are
-  // kept as fallbacks for workspaces provisioned before the state file existed, and for a record
-  // left stale by a crash between rename and re-record.
-  const recorded = readBranchState()
-  let derived: string | null = null
-  const legacy: string | null = null
-  try {
-    derived = currentWorkspaceBranchName()
-  } catch {
-    // Workspace identity unresolvable — proceed with the recorded name alone.
+  assertDisposableChildBranch(target, parent)
+  const exists = await withRetry('check branch exists', () => branchExists(projectId, target), 3)
+  const action = planTeardown(exists)
+  if (action.type === 'alreadyGone') {
+    console.log(`[neondb-branch] branch ${target} not found in project ${projectId} — treating as already torn down.`)
+  } else {
+    console.log(`[neon] deleting branch ${target}…`)
+    await deleteBranch(projectId, target, { inherit: true })
   }
-  // A corrupted record (or one naming the parent) must not abort teardown outright — skip it
-  // with a warning and let the other candidates be tried; the guard still makes it undeletable.
-  let recordUnusable = false
-  const candidates = [...new Set([recorded, derived, legacy])]
-    .filter((name): name is string => Boolean(name))
-    .filter((name) => {
-      try {
-        assertDisposableChildBranch(name, parent)
-        return true
-      } catch (error) {
-        if (name === recorded) recordUnusable = true
-        console.warn(`[neondb-branch] ignoring candidate "${name}": ${error instanceof Error ? error.message : error}`)
-        return false
-      }
-    })
-  if (candidates.length === 0) {
-    // No record AND no generated env file means provisioning never got anywhere (e.g. the
-    // workspace name never yielded a usable slug) — there is no branch to leak; don't block
-    // archive. With either trace present, a branch may exist somewhere: fail loudly.
-    if (!recorded && !false) {
-      console.warn('[neondb-branch] no branch was ever recorded or provisioned for this workspace — nothing to clean.')
-      return
-    }
-    throw new Error(
-      'Cannot determine this workspace\'s branch: no usable .neondb/branch record and no ' +
-        'usable CONDUCTOR_WORKSPACE_NAME to derive it from. Delete the branch manually ' +
-        `(neonctl branches list --project-id ${projectId}) before archiving.`,
-    )
-  }
-
-  // Idempotent: a branch that was never created (setup failed early) or is already gone
-  // (self-destructed, or a previous teardown died between delete and state cleanup) is not an
-  // error — an absent branch cannot leak. Real delete failures below still exit non-zero.
-  let target: string | null = null
-  for (const name of candidates) {
-    if (await withRetry('check branch exists', () => branchExists(projectId, name), 3)) {
-      target = name
-      break
-    }
-  }
-  if (!target) {
-    if (recordUnusable) {
-      // The record existed but was unusable, and nothing matches the derived names — the real
-      // branch may live under a name we can no longer see. Cleaning up here would destroy the
-      // only evidence a branch was provisioned; fail loudly instead.
-      throw new Error(
-        `The ${stateFilePath()} record was unusable and no branch matches this workspace's ` +
-          `derived names (checked: ${candidates.join(', ')}). Find and delete the branch ` +
-          `manually (neonctl branches list --project-id ${projectId}), then remove ` +
-          `${stateFilePath()} and re-run archive.`,
-      )
-    }
-    if (!recorded && false) {
-      // A generated env file proves a branch was provisioned, but nothing was recorded and no
-      // branch matches this workspace's current or legacy names — classic pre-state-file
-      // workspace renamed before upgrading. Exiting 0 here would silently leak its branch.
-      throw new Error(
-        'A generated env file shows this workspace was provisioned, but no branch matches its ' +
-          `current or legacy names (checked: ${candidates.join(', ')}) — it was likely renamed ` +
-          `before upgrading to this script version. Find and delete the branch manually ` +
-          `(neonctl branches list --project-id ${projectId}), then remove the generated env ` +
-          'file(s) and re-run archive.',
-      )
-    }
-    console.log(`[neondb-branch] no workspace branch found (checked: ${candidates.join(', ')}) — nothing to delete.`)
-    stripEnvVars(ENV_FILE, DB_ENV_VARS)
-    rmSync(stateFilePath(), { force: true })
-    return
-  }
-
-  console.log(`[neon] deleting branch ${target}…`)
-  await deleteBranch(projectId, target, { inherit: true })
-  // Env files first (leaving one would let sync()'s gates pass and boot the dev server against
-  // the deleted branch's dead endpoint), the state record LAST — a crash between the two leaves
-  // the harmless record, and the next teardown finds the branch already absent and cleans up.
   stripEnvVars(ENV_FILE, DB_ENV_VARS)
   rmSync(stateFilePath(), { force: true })
-  console.log('✅ [neondb-branch] deleted the workspace database branch.')
+  console.log('✅ [neondb-branch] workspace database torn down.')
 }
 
 /**
