@@ -80,7 +80,7 @@ Skills for provisioning and wiring up development infrastructure.
 
 | Skill | What it does |
 |-------|--------------|
-| [`conductor-neon-db`](skills/devops/conductor-neon-db/SKILL.md) | Sets up fully isolated per-workspace databases for Conductor — each workspace gets its own instant schema-only Neon branch (full schema, zero production data) with the ORM's migration history baselined (Prisma or Drizzle) and fixtures seeded, plus the `.conductor/settings.toml` that wires setup/run/archive. |
+| [`neondb-branch`](skills/devops/neondb-branch/SKILL.md) | Sets up fully isolated per-workspace Neon databases for any git repo — each workspace gets its own instant schema-only Neon branch (full schema, zero production data) with the ORM's migration history baselined against production's true applied-migration state (Prisma or Drizzle) and fixtures seeded. Identity resolves from Conductor, Orca, a general `WORKSPACE_NAME`, or the current git branch; ships ready-to-use Conductor and Orca config templates. |
 | [`github-lockdown`](skills/devops/github-lockdown/SKILL.md) | Locks down a GitHub repo — protects the default branch behind a required PR (0 approvers by default), blocks force-pushes and branch deletion, and auto-deletes merged branches — via GitHub repository rulesets and the `gh` CLI. Manual-only, idempotent, with a short interview and a `--dry-run` preview. |
 
 ## Repository layout
