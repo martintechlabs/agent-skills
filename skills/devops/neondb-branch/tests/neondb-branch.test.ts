@@ -13,6 +13,7 @@ import {
   checkBranchName,
   clearCheckBranchState,
   FatalError,
+  loadEnvFile,
   readBranchState,
   readCheckBranchState,
   resolveWorkspaceName,
@@ -453,6 +454,38 @@ describe('neondb-branch helpers', () => {
     it('stripEnvVars is a no-op when the file does not exist', () => {
       expect(() => stripEnvVars(envFile, ['DATABASE_URL'])).not.toThrow()
       expect(existsSync(envFile)).toBe(false)
+    })
+  })
+
+  describe('main() loads .env.neondb before dispatching (never overriding an already-set var)', () => {
+    let envFile: string
+
+    beforeEach(() => {
+      envFile = join(sandbox, '.env.neondb')
+      process.env.NEONDB_BRANCH_ENV_FILE = envFile
+    })
+
+    afterEach(() => {
+      delete process.env.NEONDB_BRANCH_ENV_FILE
+      delete process.env.NEON_PROJECT_ID
+      rmSync(envFile, { force: true })
+    })
+
+    it('populates process.env from the file when the var is not already set', () => {
+      writeFileSync(envFile, "NEON_PROJECT_ID='from-file'\n")
+      loadEnvFile()
+      expect(process.env.NEON_PROJECT_ID).toBe('from-file')
+    })
+
+    it('never overrides a var already present in process.env', () => {
+      process.env.NEON_PROJECT_ID = 'from-shell'
+      writeFileSync(envFile, "NEON_PROJECT_ID='from-file'\n")
+      loadEnvFile()
+      expect(process.env.NEON_PROJECT_ID).toBe('from-shell')
+    })
+
+    it('is a no-op when the file does not exist', () => {
+      expect(() => loadEnvFile()).not.toThrow()
     })
   })
 })

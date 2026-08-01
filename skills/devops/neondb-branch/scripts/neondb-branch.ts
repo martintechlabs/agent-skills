@@ -59,6 +59,7 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, dirname } from 'node:path'
+import { config as dotenvConfig } from 'dotenv'
 
 // ── PORTING KNOBS ────────────────────────────────────────────────────────────
 // Which ORM manages migrations. Switches the ledger table + baseline SQL shape throughout.
@@ -185,6 +186,20 @@ async function readTruePrismaLedger(uri: string): Promise<Array<{ checksum: stri
  */
 function stateFilePath(): string {
   return process.env.NEONDB_BRANCH_STATE_FILE ?? '.neondb/branch'
+}
+
+/** Where main() loads .env.neondb from. Test-only override via NEONDB_BRANCH_ENV_FILE — never set this in a real workspace. */
+function envFilePath(): string {
+  return process.env.NEONDB_BRANCH_ENV_FILE ?? ENV_FILE
+}
+
+/**
+ * Load .env.neondb into process.env, never overriding an already-set var. Exported (and factored
+ * out of main()) so tests can exercise the loading behavior directly without invoking the CLI
+ * dispatch.
+ */
+export function loadEnvFile(): void {
+  dotenvConfig({ path: envFilePath() })
 }
 
 /** The child-process environment with every DB var pinned to the workspace branch. */
@@ -1182,6 +1197,7 @@ async function renameCatchUp(projectId: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  loadEnvFile() // .env.neondb, never overriding an already-set var
   const mode = process.argv[2]
   try {
     if (mode === 'provision') await provision()
