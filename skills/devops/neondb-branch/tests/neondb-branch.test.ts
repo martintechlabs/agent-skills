@@ -16,11 +16,13 @@ import {
   FatalError,
   readBranchState,
   readCheckBranchState,
+  resolveWorkspaceName,
   setupIsPending,
   withRetry,
   workspaceBranchName,
   writeBranchState,
   writeCheckBranchState,
+  type GitContext,
 } from '../scripts/neondb-branch'
 
 describe('neondb-branch helpers', () => {
@@ -46,65 +48,80 @@ describe('neondb-branch helpers', () => {
     rmSync(sandbox, { recursive: true, force: true })
   })
 
-  describe('workspaceBranchName', () => {
-    it('slugifies a short workspace name into a clean workspace/ branch (no hash suffix)', () => {
-      process.env.CONDUCTOR_WORKSPACE_NAME = 'My Cool Feature!'
-      expect(workspaceBranchName()).toBe('workspace/my-cool-feature')
+  describe('resolveWorkspaceName (workspace identity precedence)', () => {
+    const worktree: GitContext = { isSecondaryWorktree: true, branch: 'martintechlabs/feature-x' }
+    const singleClone: GitContext = { isSecondaryWorktree: false, branch: 'martintechlabs/feature-x' }
+    const noIdentity: GitContext = { isSecondaryWorktree: false, branch: null }
+
+    it('prefers CONDUCTOR_WORKSPACE_NAME over every other source', () => {
+      const env = { CONDUCTOR_WORKSPACE_NAME: 'conductor-ws', ORCA_WORKSPACE_NAME: 'orca-ws', WORKSPACE_NAME: 'general-ws' }
+      expect(resolveWorkspaceName(env, '/work/trees/mojarra', worktree)).toBe('conductor-ws')
+    })
+
+    it('prefers ORCA_WORKSPACE_NAME over WORKSPACE_NAME and checkout signals', () => {
+      const env = { ORCA_WORKSPACE_NAME: 'orca-ws', WORKSPACE_NAME: 'general-ws' }
+      expect(resolveWorkspaceName(env, '/work/trees/mojarra', worktree)).toBe('orca-ws')
+    })
+
+    it('falls back to WORKSPACE_NAME when no tool-specific var is set', () => {
+      expect(resolveWorkspaceName({ WORKSPACE_NAME: 'general-ws' }, '/work/trees/mojarra', worktree)).toBe('general-ws')
+    })
+
+    it('falls back to the checkout directory basename for a secondary git worktree with no env vars', () => {
+      expect(resolveWorkspaceName({}, '/Users/dev/workspaces/mojarra', worktree)).toBe('mojarra')
+    })
+
+    it('falls back to the current git branch for a plain single-clone checkout with no env vars', () => {
+      expect(resolveWorkspaceName({}, '/Users/dev/myrepo', singleClone)).toBe('martintechlabs/feature-x')
+    })
+
+    it('throws a clear error when nothing resolves (no env vars, not a worktree, detached HEAD)', () => {
+      expect(() => resolveWorkspaceName({}, '/Users/dev/myrepo', noIdentity)).toThrow(/Could not determine workspace identity/)
+    })
+  })
+
+  describe('workspaceBranchName / checkBranchName (given an already-resolved raw identity)', () => {
+    it('slugifies a short identity into a clean workspace/ branch (no hash suffix)', () => {
+      expect(workspaceBranchName('My Cool Feature!')).toBe('workspace/my-cool-feature')
     })
 
     it('collapses separator runs and trims leading/trailing separators', () => {
-      process.env.CONDUCTOR_WORKSPACE_NAME = '  Feature / 123 -- test  '
-      expect(workspaceBranchName()).toBe('workspace/feature-123-test')
+      expect(workspaceBranchName('  Feature / 123 -- test  ')).toBe('workspace/feature-123-test')
     })
 
-    it('truncates an over-long name and appends a hash suffix, never ending in a separator', () => {
-      process.env.CONDUCTOR_WORKSPACE_NAME = 'a'.repeat(100)
-      const name = workspaceBranchName()
+    it('truncates an over-long identity and appends a hash suffix, never ending in a separator', () => {
+      const raw = 'a'.repeat(100)
+      const name = workspaceBranchName(raw)
       expect(name).toMatch(/^workspace\/a{39}-[0-9a-f]{8}$/)
       expect(name).not.toMatch(/-$/)
       expect(name.length).toBeLessThanOrEqual('workspace/'.length + 48)
     })
 
     it('re-trims a separator left dangling by truncation before the hash (no "--")', () => {
-      // slug "a*38-b*20" is 59 chars; slice(0, 39) lands on the "-", which must be trimmed off.
-      process.env.CONDUCTOR_WORKSPACE_NAME = 'a'.repeat(38) + ' ' + 'b'.repeat(20)
-      const name = workspaceBranchName()
+      const raw = 'a'.repeat(38) + ' ' + 'b'.repeat(20)
+      const name = workspaceBranchName(raw)
       expect(name).toMatch(/^workspace\/a{38}-[0-9a-f]{8}$/)
       expect(name).not.toContain('--')
     })
 
-    it('gives distinct branches to distinct long names sharing a truncated prefix (no collision)', () => {
+    it('gives distinct branches to distinct long identities sharing a truncated prefix (no collision)', () => {
       const prefix = 'shared-prefix-that-is-definitely-longer-than-forty-eight-characters-'
-      process.env.CONDUCTOR_WORKSPACE_NAME = `${prefix}alpha`
-      const a = workspaceBranchName()
-      process.env.CONDUCTOR_WORKSPACE_NAME = `${prefix}beta`
-      const b = workspaceBranchName()
-      expect(a).not.toBe(b)
+      expect(workspaceBranchName(`${prefix}alpha`)).not.toBe(workspaceBranchName(`${prefix}beta`))
     })
 
-    it('throws a clear error when the workspace name is missing — without telling the user to set the Conductor-injected variable themselves', () => {
-      delete process.env.CONDUCTOR_WORKSPACE_NAME
-      expect(() => workspaceBranchName()).toThrow(/CONDUCTOR_WORKSPACE_NAME is not set/)
-      expect(() => workspaceBranchName()).toThrow(/Do NOT add it to the Conductor env tabs/)
+    it('throws when the identity has no usable characters', () => {
+      expect(() => workspaceBranchName('@@@')).toThrow(/Could not derive a branch name/)
     })
 
-    it('throws when the name has no usable characters', () => {
-      process.env.CONDUCTOR_WORKSPACE_NAME = '@@@'
-      expect(() => workspaceBranchName()).toThrow(/Could not derive a branch name/)
-    })
-  })
-
-  describe('checkBranchName (disposable per-run branch used to learn the true migration ledger)', () => {
-    it('shares workspaceBranchName\'s slug but under the tmp/ prefix', () => {
-      process.env.CONDUCTOR_WORKSPACE_NAME = 'My Cool Feature!'
-      expect(checkBranchName()).toBe('tmp/my-cool-feature')
-      expect(checkBranchName()).not.toBe(workspaceBranchName())
+    it('checkBranchName shares workspaceBranchName\'s slug but under the tmp/ prefix', () => {
+      expect(checkBranchName('My Cool Feature!')).toBe('tmp/my-cool-feature')
+      expect(checkBranchName('My Cool Feature!')).not.toBe(workspaceBranchName('My Cool Feature!'))
     })
 
     it('truncates and hashes independently of workspaceBranchName, never colliding across the two prefixes', () => {
-      process.env.CONDUCTOR_WORKSPACE_NAME = 'a'.repeat(100)
-      expect(checkBranchName()).toMatch(/^tmp\/a{39}-[0-9a-f]{8}$/)
-      expect(checkBranchName().slice('tmp/'.length)).toBe(workspaceBranchName().slice('workspace/'.length))
+      const raw = 'a'.repeat(100)
+      expect(checkBranchName(raw)).toMatch(/^tmp\/a{39}-[0-9a-f]{8}$/)
+      expect(checkBranchName(raw).slice('tmp/'.length)).toBe(workspaceBranchName(raw).slice('workspace/'.length))
     })
   })
 
@@ -157,12 +174,10 @@ describe('neondb-branch helpers', () => {
       expect(readBranchState()).toBe('workspace/my-feature')
     })
 
-    it('survives a simulated rename — teardown reads the ORIGINAL name, not one re-derived from a new CONDUCTOR_WORKSPACE_NAME', () => {
-      process.env.CONDUCTOR_WORKSPACE_NAME = 'original-name'
-      writeBranchState(workspaceBranchName())
+    it('survives a simulated rename — teardown reads the ORIGINAL name, not one re-derived from a new identity', () => {
+      writeBranchState(workspaceBranchName('original-name'))
 
-      process.env.CONDUCTOR_WORKSPACE_NAME = 'renamed-workspace'
-      expect(workspaceBranchName()).toBe('workspace/renamed-workspace') // re-deriving now gives a DIFFERENT (wrong) name
+      expect(workspaceBranchName('renamed-workspace')).toBe('workspace/renamed-workspace') // re-deriving now gives a DIFFERENT (wrong) name
       expect(readBranchState()).toBe('workspace/original-name') // but the recorded name is still correct
     })
 

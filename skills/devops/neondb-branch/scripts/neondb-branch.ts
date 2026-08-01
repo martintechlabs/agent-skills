@@ -58,7 +58,7 @@
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { basename, dirname } from 'node:path'
 
 // ── PORTING KNOBS ────────────────────────────────────────────────────────────
 // Which ORM manages migrations. Switches the ledger table + baseline SQL shape throughout.
@@ -236,34 +236,28 @@ function requireEnv(name: string): string {
   return value
 }
 
-/** The raw slug for the current workspace, before any length handling. */
-function workspaceSlug(): string {
-  const raw = process.env.CONDUCTOR_WORKSPACE_NAME
-  if (!raw) {
-    // Deliberately NOT requireEnv: Conductor injects this variable itself. Telling the user to
-    // add it to the env tabs would pin every workspace to ONE shared slug (and one branch).
-    throw new Error(
-      'CONDUCTOR_WORKSPACE_NAME is not set — this script must run inside a Conductor workspace ' +
-        '(Conductor injects it automatically). Do NOT add it to the Conductor env tabs.',
-    )
-  }
+/**
+ * What identifies "this workspace" — before slugify, before any Neon prefix. See
+ * resolveWorkspaceName() for the precedence chain; this is only the pure slug/truncation logic
+ * shared by workspaceBranchName() and checkBranchName().
+ */
+function slugify(raw: string): string {
   const slug = raw
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
   if (!slug) {
-    throw new Error(`Could not derive a branch name from CONDUCTOR_WORKSPACE_NAME="${raw}".`)
+    throw new Error(`Could not derive a branch name from workspace identity "${raw}".`)
   }
   return slug
 }
 
 /**
  * Shared by workspaceBranchName() and checkBranchName() — same slug/truncation/collision-hash
- * logic under a different disposable-branch prefix.
+ * logic under a different disposable-branch prefix, given an already-resolved raw identity.
  */
-function branchNameWithPrefix(prefix: string): string {
-  const raw = process.env.CONDUCTOR_WORKSPACE_NAME ?? ''
-  let slug = workspaceSlug()
+function branchNameWithPrefix(prefix: string, raw: string): string {
+  let slug = slugify(raw)
   if (slug.length > MAX_SLUG) {
     // Truncate, but keep distinct workspaces distinct: append a short hash of the FULL name so
     // two long names that share a prefix don't collide onto the same branch (which would break
@@ -275,9 +269,9 @@ function branchNameWithPrefix(prefix: string): string {
   return `${prefix}${slug}`
 }
 
-/** Stable, Neon-safe branch name derived from the workspace name. */
-export function workspaceBranchName(): string {
-  return branchNameWithPrefix(BRANCH_PREFIX)
+/** Stable, Neon-safe branch name derived from an already-resolved raw workspace identity. */
+export function workspaceBranchName(raw: string): string {
+  return branchNameWithPrefix(BRANCH_PREFIX, raw)
 }
 
 /**
@@ -286,8 +280,67 @@ export function workspaceBranchName(): string {
  * under CHECK_BRANCH_PREFIX — deterministic, not random, so a leftover from a killed run is found
  * by name and replaced rather than accumulating orphans.
  */
-export function checkBranchName(): string {
-  return branchNameWithPrefix(CHECK_BRANCH_PREFIX)
+export function checkBranchName(raw: string): string {
+  return branchNameWithPrefix(CHECK_BRANCH_PREFIX, raw)
+}
+
+/** What resolveWorkspaceName() needs to know about the current checkout, gathered by the caller. */
+export interface GitContext {
+  /** true when this checkout is a linked git worktree (not the main/primary checkout) */
+  isSecondaryWorktree: boolean
+  /** current branch name, or null when HEAD is detached or this isn't a git repository */
+  branch: string | null
+}
+
+/**
+ * Workspace identity, before slugify. First match wins:
+ *   1. CONDUCTOR_WORKSPACE_NAME — Conductor injects this per workspace.
+ *   2. ORCA_WORKSPACE_NAME — Orca's own identity, when the project/tool sets it.
+ *   3. WORKSPACE_NAME — general ambient override for custom tools, tests, or a project that
+ *      exports one name for every tool. Only read from process env — NEVER from .env.neondb,
+ *      which can be copied across workspaces and would collide them onto the same Neon branch.
+ *   4. basename(cwd) for a secondary git worktree with none of the above set — each worktree is
+ *      its own directory, so this is stable across a `git checkout` inside it.
+ *   5. The current git branch, for a plain single-clone checkout with none of the above set —
+ *      here "the workspace" genuinely IS the branch, so switching branches IS switching identity.
+ * Throws when nothing resolves (detached HEAD / not a git repo, and no env var set) — there is no
+ * derivable identity in that case.
+ */
+export function resolveWorkspaceName(env: NodeJS.ProcessEnv, cwd: string, git: GitContext): string {
+  const fromEnv = env.CONDUCTOR_WORKSPACE_NAME || env.ORCA_WORKSPACE_NAME || env.WORKSPACE_NAME
+  if (fromEnv) return fromEnv
+  if (git.isSecondaryWorktree) return basename(cwd)
+  if (git.branch) return git.branch
+  throw new Error(
+    'Could not determine workspace identity: no CONDUCTOR_WORKSPACE_NAME / ORCA_WORKSPACE_NAME / ' +
+      'WORKSPACE_NAME is set, this checkout is not a secondary git worktree, and there is no usable ' +
+      'git branch (detached HEAD, or not a git repository). Check out a named branch, or set ' +
+      'WORKSPACE_NAME explicitly.',
+  )
+}
+
+/** Impure glue for resolveWorkspaceName()'s `git` parameter — not itself unit-tested; exercised via references/verify.md. */
+function currentGitContext(cwd: string): GitContext {
+  let gitDir: string
+  try {
+    gitDir = execFileSync('git', ['rev-parse', '--git-dir'], { cwd, encoding: 'utf8' }).trim()
+  } catch {
+    return { isSecondaryWorktree: false, branch: null }
+  }
+  const isSecondaryWorktree = /[\\/]worktrees[\\/]/.test(gitDir)
+  let branch: string | null = null
+  try {
+    const ref = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd, encoding: 'utf8' }).trim()
+    branch = ref === 'HEAD' ? null : ref // literal 'HEAD' means detached
+  } catch {
+    branch = null
+  }
+  return { isSecondaryWorktree, branch }
+}
+
+/** The workspace's Neon branch name, resolved from the live process/cwd/git state. */
+function currentWorkspaceBranchName(): string {
+  return workspaceBranchName(resolveWorkspaceName(process.env, process.cwd(), currentGitContext(process.cwd())))
 }
 
 /**
@@ -664,7 +717,7 @@ function deployMigrations(uri: string): void {
  * check branch is always fresh: delete-if-present before creating, never reused, since a leaked
  * one from an interrupted run could hold a stale snapshot of the parent's true state.
  */
-async function seedTrueBaseline(projectId: string, parent: string, uri: string): Promise<void> {
+async function seedTrueBaseline(projectId: string, parent: string, uri: string, raw: string): Promise<void> {
   // Handle a leftover from a previous, incomplete run first. Prefer the PERSISTED name over the
   // freshly-derived one: it's written below before the branch is created, specifically so a
   // leaked branch is still findable even if the workspace was renamed since (checkBranchName()
@@ -697,7 +750,7 @@ async function seedTrueBaseline(projectId: string, parent: string, uri: string):
     }
   }
 
-  const checkName = checkBranchName()
+  const checkName = checkBranchName(raw)
   writeCheckBranchState(checkName) // before creating — see writeCheckBranchState()'s docstring
   console.log(`[neon] creating check branch ${checkName} off ${parent} (full data, disposable)…`)
   await withRetry(
@@ -791,7 +844,8 @@ async function provision(): Promise<void> {
   const projectId = requireEnv('NEON_PROJECT_ID')
   const apiKey = requireEnv('NEON_API_KEY') // consumed by neonctl from the environment; also mirrored into ENV_FILE below for archive
   const parent = requireEnv('NEON_PARENT_BRANCH')
-  const branchName = workspaceBranchName()
+  const raw = resolveWorkspaceName(process.env, process.cwd(), currentGitContext(process.cwd()))
+  const branchName = workspaceBranchName(raw)
   assertDisposableChildBranch(branchName, parent)
 
   // Every run is a full rebuild — delete whatever's currently recorded (if it still exists),
@@ -847,7 +901,7 @@ async function provision(): Promise<void> {
     console.log(`[neondb-branch] wrote ${DB_ENV_VARS.join(', ')} and Neon credentials for ${branchName} → ${ENV_FILE}`)
 
     console.log(`[${ORM}] learning the parent's true applied-migration state…`)
-    await seedTrueBaseline(projectId, parent, uri)
+    await seedTrueBaseline(projectId, parent, uri, raw)
 
     console.log(`[${ORM}] applying any migrations beyond the baseline…`)
     deployMigrations(uri)
@@ -902,7 +956,8 @@ async function teardown(): Promise<void> {
   // block cleanup of the actual workspace branch below: an unusable CONDUCTOR_WORKSPACE_NAME
   // just means there's nothing derivable to check, not a reason to fail.
   try {
-    const checkName = readCheckBranchState() ?? checkBranchName()
+    const checkName =
+      readCheckBranchState() ?? checkBranchName(resolveWorkspaceName(process.env, process.cwd(), currentGitContext(process.cwd())))
     let checkNameUsable = true
     try {
       assertDisposableCheckBranch(checkName, parent)
@@ -943,9 +998,9 @@ async function teardown(): Promise<void> {
   let derived: string | null = null
   const legacy: string | null = null
   try {
-    derived = workspaceBranchName()
+    derived = currentWorkspaceBranchName()
   } catch {
-    // CONDUCTOR_WORKSPACE_NAME unset/unusable — proceed with the recorded name alone.
+    // Workspace identity unresolvable — proceed with the recorded name alone.
   }
   // A corrupted record (or one naming the parent) must not abort teardown outright — skip it
   // with a warning and let the other candidates be tried; the guard still makes it undeletable.
@@ -1108,7 +1163,7 @@ async function sync(): Promise<void> {
 /** sync()'s best-effort rename catch-up — see sync() for the failure rules. */
 async function renameCatchUp(projectId: string): Promise<void> {
   const recorded = readBranchState()
-  const current = workspaceBranchName()
+  const current = currentWorkspaceBranchName()
   if (!recorded) {
     // Workspace provisioned before the state file existed: record the name now, while the
     // derived slug still matches the live branch, so a later rename can't orphan it.
