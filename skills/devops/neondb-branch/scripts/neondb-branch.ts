@@ -57,7 +57,7 @@
 
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, dirname } from 'node:path'
 import { config as dotenvConfig } from 'dotenv'
 
@@ -348,7 +348,7 @@ export function writeBranchState(branchName: string, phase: 'pending' | 'ready' 
 }
 
 /** Single reader for the state file; the exported helpers below are thin views over it. */
-function readStateFile(): { branch: string; phase: 'pending' | 'ready' } | null {
+export function readBranchStateFull(): { branch: string; phase: 'pending' | 'ready' } | null {
   try {
     const lines = readFileSync(stateFilePath(), 'utf8').split('\n')
     const branch = lines[0].trim()
@@ -362,12 +362,12 @@ function readStateFile(): { branch: string; phase: 'pending' | 'ready' } | null 
 
 /** The branch name provision() recorded, or null if absent — e.g. a workspace provisioned before this file existed, in which case the caller should fall back to re-deriving it. */
 export function readBranchState(): string | null {
-  return readStateFile()?.branch ?? null
+  return readBranchStateFull()?.branch ?? null
 }
 
 /** Whether the recorded branch was created but never finished baseline+seed (see writeBranchState). */
 export function setupIsPending(): boolean {
-  return readStateFile()?.phase === 'pending'
+  return readBranchStateFull()?.phase === 'pending'
 }
 
 /** Sibling of the workspace-branch state file, for the disposable check branch instead. */
@@ -1082,118 +1082,114 @@ async function teardown(): Promise<void> {
 }
 
 /**
- * Runs before every dev-server start. Hard gates throw (blocking the dev server, deliberately);
- * the rename catch-up is best-effort:
- *
- * 1. HARD GATE (throws): refuse to start if .env.neondb is missing. `dotenv -e` silently
- *    proceeds when the file doesn't exist, so without this check a workspace whose provisioning
- *    failed would boot against whatever DATABASE_URL leaks in from the ambient env — the exact
- *    shared-database collision this whole setup exists to prevent.
- * 2. HARD GATE (throws): refuse to start a workspace whose setup is still marked 'pending' — the
- *    branch is mid-rebuild; provision must recover it first.
- * 3. Rename catch-up (best-effort, never throws): Conductor has no rename event, so this is
- *    where the Neon branch's name is brought back in line with the workspace. Any failure here
- *    only leaves the Neon console's branch name cosmetically stale.
- * 4. HARD GATE (throws on definitive absence): the recorded branch must still exist in Neon —
- *    otherwise .env.neondb points at a dead endpoint and the app would boot into opaque
- *    connection errors. A transient verification failure only warns.
+ * Runs before every dev-server start. See planSync() for the full decision table.
  */
-async function sync(): Promise<void> {
-  if (!existsSync(ENV_FILE)) {
-    throw new Error(
-      `${ENV_FILE} not found — this workspace's database was never provisioned, provisioning ` +
-        `failed, or the workspace predates this script version (which wrote .env instead). ` +
-        `In every case the fix is the same: re-run workspace setup (scripts/neondb-branch.ts ` +
-        `provision — this rebuilds the workspace branch from scratch, discarding any data in ` +
-        `it) before starting the dev server. Starting without ${ENV_FILE} would silently use a ` +
-        `shared/ambient DATABASE_URL.`,
-    )
-  }
-  if (setupIsPending()) {
-    throw new Error(
-      'This workspace\'s database setup never completed (state is "pending" — a previous ' +
-        'provision was interrupted before baseline/seed finished). Re-run workspace setup ' +
-        '(scripts/neondb-branch.ts provision) to recover it before starting the dev server.',
-    )
-  }
-  const projectId = process.env.NEON_PROJECT_ID
-  if (!projectId || !process.env.NEON_API_KEY) {
-    console.warn('[neondb-branch] NEON_PROJECT_ID / NEON_API_KEY not set — skipping branch rename sync.')
-    return
-  }
-  try {
-    await renameCatchUp(projectId)
-  } catch (error) {
-    console.warn(`[neondb-branch] WARNING: branch rename sync failed: ${error instanceof Error ? error.message : error}`)
-  }
 
-  // HARD GATE 4: the branch the env file points at must still exist — a teardown that died
-  // between delete and file cleanup (or a console-side delete) leaves a valid-looking
-  // .env.neondb aimed at a dead endpoint, and the dev server would boot into opaque connection
-  // errors. Definitive absence fails the run; a transient check failure does not. If no record
-  // could be established at all (renameCatchUp found no live branch either), the env file is
-  // unaccounted for — fail rather than boot into the same dead endpoint.
-  const finalRecord = readBranchState()
-  if (!finalRecord) {
-    throw new FatalError(
-      `${ENV_FILE} exists but no branch is recorded for this workspace and none was found ` +
-        `under its derived names — the branch was likely deleted by an interrupted archive. ` +
-        `Re-run workspace setup (scripts/neondb-branch.ts provision) to recreate it, or delete ` +
-        `${ENV_FILE} if the workspace is being retired.`,
-    )
+export type SyncGateReason =
+  | { type: 'unprovisioned' }
+  | { type: 'pending' }
+  | { type: 'deadBranch'; recorded: string }
+
+export type SyncAction =
+  | { type: 'gate'; reason: SyncGateReason }
+  | { type: 'noop' }
+  | { type: 'reconcile'; to: string }
+  | { type: 'rename'; from: string; to: string }
+  | { type: 'collision'; from: string; to: string }
+
+/**
+ * Pure decision function for sync(). Hard gates (unprovisioned / pending / dead recorded branch)
+ * always win. Only once past those does a recorded-vs-current mismatch get evaluated: normal
+ * rename, a reconcile-only self-heal (a prior sync already renamed on Neon but crashed before
+ * persisting locally), or — when the target name is already a DIFFERENT live branch — a hard
+ * collision gate instead of a rename that would silently fail and leave a stale DATABASE_URL.
+ */
+export function planSync(
+  state: { branch: string; phase: 'pending' | 'ready' } | null,
+  current: string,
+  recordedExists: boolean,
+  currentExists: boolean,
+): SyncAction {
+  if (!state) return { type: 'gate', reason: { type: 'unprovisioned' } }
+  if (state.phase === 'pending') return { type: 'gate', reason: { type: 'pending' } }
+  if (state.branch === current) {
+    return recordedExists ? { type: 'noop' } : { type: 'gate', reason: { type: 'deadBranch', recorded: state.branch } }
   }
-  try {
-    if (!(await withRetry('verify branch exists', () => branchExists(projectId, finalRecord), 2))) {
-      throw new FatalError(
-        `Recorded branch ${finalRecord} no longer exists in Neon — it was deleted out-of-band ` +
-          `(or a previous archive was interrupted). Re-run workspace setup ` +
-          `(scripts/neondb-branch.ts provision) to recreate it before starting the dev server.`,
-      )
-    }
-  } catch (error) {
-    if (error instanceof FatalError) throw error
-    console.warn(
-      `[neondb-branch] WARNING: could not verify branch ${finalRecord} still exists: ` +
-        `${error instanceof Error ? error.message : error}`,
-    )
-  }
+  if (!recordedExists && currentExists) return { type: 'reconcile', to: current }
+  if (!recordedExists && !currentExists) return { type: 'gate', reason: { type: 'deadBranch', recorded: state.branch } }
+  if (currentExists) return { type: 'collision', from: state.branch, to: current }
+  return { type: 'rename', from: state.branch, to: current }
 }
 
-/** sync()'s best-effort rename catch-up — see sync() for the failure rules. */
-async function renameCatchUp(projectId: string): Promise<void> {
-  const recorded = readBranchState()
-  const current = currentWorkspaceBranchName()
-  if (!recorded) {
-    // Workspace provisioned before the state file existed: record the name now, while the
-    // derived slug still matches the live branch, so a later rename can't orphan it.
-    // TEMPORARY (Task 1 checkpoint only): this whole function is replaced in Task 5.
-    const live = [current]
-      .filter((name): name is string => Boolean(name))
-      .find((name) => branchExists(projectId, name))
-    if (live) {
-      assertDisposableChildBranch(live, process.env.NEON_PARENT_BRANCH ?? '')
-      writeBranchState(live)
-      console.log(`[neondb-branch] recorded existing branch ${live} → ${stateFilePath()}`)
+function throwForGate(reason: SyncGateReason): never {
+  if (reason.type === 'unprovisioned') {
+    throw new Error('Workspace not provisioned — run `db:provision` (or `worktree:setup`) before starting the dev server.')
+  }
+  if (reason.type === 'pending') {
+    throw new Error('Workspace database setup did not finish (state is "pending") — re-run `db:provision` to recover it.')
+  }
+  throw new Error(`Recorded branch "${reason.recorded}" no longer exists in Neon — re-run \`db:provision\` to recreate it.`)
+}
+
+function collisionMessage(action: Extract<SyncAction, { type: 'collision' }>): string {
+  return (
+    `Refusing to start: this workspace's identity resolves to "${action.to}", which already exists ` +
+    `as its own live Neon branch, while "${action.from}" (a different, still-live branch) is ` +
+    `recorded here. These are two previously-provisioned workspaces colliding — renaming would ` +
+    `silently fail and leave a stale DATABASE_URL. Re-run \`db:provision\` to rebuild "${action.to}" ` +
+    `for this checkout (discards its current data), or check back out whatever matches "${action.from}".`
+  )
+}
+
+/**
+ * Runs before every dev-server start (chained in front of it — see the "dev" package.json script).
+ * Hard gates throw (blocking the dev server, deliberately); a rename/reconcile is best-effort and
+ * never blocks the dev server on its own failure. See planSync() for the full decision table.
+ */
+async function sync(): Promise<void> {
+  const raw = resolveWorkspaceName(process.env, process.cwd(), currentGitContext(process.cwd()))
+  const current = workspaceBranchName(raw)
+  const state = readBranchStateFull()
+
+  if (!state || state.phase === 'pending') {
+    const action = planSync(state, current, false, false)
+    if (action.type === 'gate') throwForGate(action.reason)
+    return
+  }
+
+  const projectId = requireEnv('NEON_PROJECT_ID')
+  requireEnv('NEON_API_KEY')
+  const recordedExists = await withRetry('check recorded branch', () => branchExists(projectId, state.branch), 3)
+  const currentExists =
+    state.branch === current ? recordedExists : await withRetry('check current branch', () => branchExists(projectId, current), 3)
+  const action = planSync(state, current, recordedExists, currentExists)
+
+  switch (action.type) {
+    case 'noop':
+      return
+    case 'gate':
+      throwForGate(action.reason)
+      return
+    case 'collision':
+      throw new Error(collisionMessage(action))
+    case 'reconcile':
+      writeBranchState(action.to)
+      console.log(`[neondb-branch] recorded branch was already renamed on Neon — reconciled local state to "${action.to}".`)
+      return
+    case 'rename': {
+      try {
+        const parent = process.env.NEON_PARENT_BRANCH ?? ''
+        assertDisposableChildBranch(action.from, parent)
+        assertDisposableChildBranch(action.to, parent)
+        await renameBranch(projectId, action.from, action.to)
+        writeBranchState(action.to)
+        console.log(`✅ [neondb-branch] renamed ${action.from} → ${action.to} to match the current workspace.`)
+      } catch (error) {
+        console.warn(`[neondb-branch] WARNING: branch rename failed: ${error instanceof Error ? error.message : error}`)
+      }
+      return
     }
-    return
   }
-  if (recorded === current) return // no rename since the last check
-
-  assertDisposableChildBranch(recorded, process.env.NEON_PARENT_BRANCH ?? '')
-  assertDisposableChildBranch(current, process.env.NEON_PARENT_BRANCH ?? '')
-
-  // Self-heal a record left stale by a crash between a rename and its re-record: if the recorded
-  // branch is gone but one under the current name exists, just re-record.
-  if (!branchExists(projectId, recorded) && branchExists(projectId, current)) {
-    writeBranchState(current)
-    console.log(`[neondb-branch] record was stale — re-recorded live branch ${current}.`)
-    return
-  }
-
-  console.log(`[neon] workspace renamed — renaming branch ${recorded} → ${current}…`)
-  await renameBranch(projectId, recorded, current)
-  writeBranchState(current)
-  console.log('✅ [neondb-branch] branch renamed to match the workspace.')
 }
 
 async function main(): Promise<void> {

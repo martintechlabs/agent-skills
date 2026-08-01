@@ -14,6 +14,7 @@ import {
   clearCheckBranchState,
   FatalError,
   loadEnvFile,
+  planSync,
   readBranchState,
   readCheckBranchState,
   resolveWorkspaceName,
@@ -220,6 +221,57 @@ describe('neondb-branch helpers', () => {
       clearCheckBranchState()
       expect(readCheckBranchState()).toBeNull()
       expect(readBranchState()).toBe('workspace/my-feature')
+    })
+  })
+
+  describe('planSync (sync() decision logic)', () => {
+    const readyState = { branch: 'workspace/feature-x', phase: 'ready' as const }
+    const pendingState = { branch: 'workspace/feature-x', phase: 'pending' as const }
+
+    it('gates as unprovisioned when there is no state at all', () => {
+      expect(planSync(null, 'workspace/feature-x', false, false)).toEqual({ type: 'gate', reason: { type: 'unprovisioned' } })
+    })
+
+    it('gates as pending when setup never finished', () => {
+      expect(planSync(pendingState, 'workspace/feature-x', true, true)).toEqual({ type: 'gate', reason: { type: 'pending' } })
+    })
+
+    it('noops when the recorded branch matches current and still exists', () => {
+      expect(planSync(readyState, 'workspace/feature-x', true, true)).toEqual({ type: 'noop' })
+    })
+
+    it('gates as a dead branch when recorded matches current but the branch is gone', () => {
+      expect(planSync(readyState, 'workspace/feature-x', false, false)).toEqual({
+        type: 'gate',
+        reason: { type: 'deadBranch', recorded: 'workspace/feature-x' },
+      })
+    })
+
+    it('renames when recorded differs from current and only the recorded branch exists (the normal case)', () => {
+      expect(planSync(readyState, 'workspace/main', true, false)).toEqual({
+        type: 'rename',
+        from: 'workspace/feature-x',
+        to: 'workspace/main',
+      })
+    })
+
+    it('reconciles instead of renaming when a prior sync already renamed on Neon but crashed before recording it locally', () => {
+      expect(planSync(readyState, 'workspace/main', false, true)).toEqual({ type: 'reconcile', to: 'workspace/main' })
+    })
+
+    it('gates as a dead branch when recorded differs from current and NEITHER exists', () => {
+      expect(planSync(readyState, 'workspace/main', false, false)).toEqual({
+        type: 'gate',
+        reason: { type: 'deadBranch', recorded: 'workspace/feature-x' },
+      })
+    })
+
+    it('flags a collision when recorded differs from current and BOTH already exist as live branches', () => {
+      expect(planSync(readyState, 'workspace/main', true, true)).toEqual({
+        type: 'collision',
+        from: 'workspace/feature-x',
+        to: 'workspace/main',
+      })
     })
   })
 
