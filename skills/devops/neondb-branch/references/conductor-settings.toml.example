@@ -1,0 +1,12 @@
+"$schema" = "https://conductor.build/schemas/settings.repo.schema.json"
+
+# setup/archive/run all delegate to the shared worktree:* package.json scripts (see SKILL.md
+# step 3). Secrets (NEON_API_KEY / NEON_PROJECT_ID / NEON_PARENT_BRANCH) live in Conductor's
+# Environment tabs (Local + Cloud) and/or .env.neondb — never committed here. Do NOT set
+# DATABASE_URL here or in the Environment tabs; provision() owns it per workspace.
+
+[scripts]
+setup = "corepack enable pnpm && pnpm worktree:setup"
+archive = "pnpm worktree:archive"
+run = "pnpm worktree:sync && pnpm dev --port $CONDUCTOR_PORT"
+run_mode = "concurrent"

@@ -1,0 +1,9 @@
+# Mirrors Conductor's setup/archive — both delegate to the shared worktree:* package.json
+# scripts (see SKILL.md step 3). NEON_API_KEY / NEON_PROJECT_ID / NEON_PARENT_BRANCH come from
+# .env.neondb (and/or the ambient environment) — not from this file. Orca has no run hook: the
+# sync hard gate is chained inside package.json's "dev" script instead.
+scripts:
+  setup: |
+    corepack enable pnpm && pnpm worktree:setup
+  archive: |
+    pnpm worktree:archive
