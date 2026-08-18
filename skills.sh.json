@@ -51,6 +51,13 @@
         "neondb-branch",
         "github-lockdown"
       ]
+    },
+    {
+      "title": "Design",
+      "description": "Generate and maintain design-system documentation — starting with turning a brand's live site or an existing codebase into a spec-compliant DESIGN.md.",
+      "skills": [
+        "design-md"
+      ]
     }
   ]
 }

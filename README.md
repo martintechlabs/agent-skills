@@ -83,6 +83,14 @@ Skills for provisioning and wiring up development infrastructure.
 | [`neondb-branch`](skills/devops/neondb-branch/SKILL.md) | Sets up fully isolated per-workspace Neon databases for any git repo — each workspace gets its own instant schema-only Neon branch (full schema, zero production data) with the ORM's migration history baselined against production's true applied-migration state (Prisma or Drizzle) and fixtures seeded. Identity resolves from Conductor, Orca, a general `WORKSPACE_NAME`, or the current git branch; ships ready-to-use Conductor and Orca config templates. |
 | [`github-lockdown`](skills/devops/github-lockdown/SKILL.md) | Locks down a GitHub repo — protects the default branch behind a required PR (0 approvers by default), blocks force-pushes and branch deletion, and auto-deletes merged branches — via GitHub repository rulesets and the `gh` CLI. Manual-only, idempotent, with a short interview and a `--dry-run` preview. |
 
+### Design
+
+Generate and maintain design-system documentation.
+
+| Skill | What it does |
+|-------|--------------|
+| [`design-md`](skills/design/design-md/SKILL.md) | Generates a spec-compliant DESIGN.md at a target repo's root — from a live brand/marketing site via browser-automation token extraction, or from an existing codebase's Tailwind config/CSS vars/theme files. Validates with the official `@google/design.md` lint CLI when available. |
+
 ## Repository layout
 
 ```
@@ -97,7 +105,7 @@ agent-skills/
             └── references/    # Optional supporting files the skill loads on demand
 ```
 
-Skills are organized into **category directories** under `skills/` — currently `cto-toolkit/`, `productivity/`, `coding/`, `delivery-pipeline/`, and `devops/`. Each skill lives in its own `<skill-name>/` directory inside a category and is defined by a single `SKILL.md` file with YAML frontmatter (`name`, `description`, optional `metadata`) followed by the instructions the agent should follow when the skill triggers.
+Skills are organized into **category directories** under `skills/` — currently `cto-toolkit/`, `productivity/`, `coding/`, `delivery-pipeline/`, `devops/`, and `design/`. Each skill lives in its own `<skill-name>/` directory inside a category and is defined by a single `SKILL.md` file with YAML frontmatter (`name`, `description`, optional `metadata`) followed by the instructions the agent should follow when the skill triggers.
 
 The category directories **mirror the groupings in `skills.sh.json`** — that file remains the source of truth for how skills are grouped and ordered on the skills.sh page; the folders just make the same taxonomy visible when browsing the repo. Keep the two in sync: a skill's directory should sit under the category whose grouping lists it. Note that nothing tooling-side enforces this — the skills.sh CLI and the `--skill` flag resolve skills by their frontmatter `name`, not their path, so the category folder is purely organizational.
 
@@ -105,7 +113,7 @@ The category directories **mirror the groupings in `skills.sh.json`** — that f
 
 Each skill is a directory under a category in `skills/` containing a single `SKILL.md`: YAML frontmatter followed by the Markdown instructions the agent follows when the skill triggers.
 
-1. **Pick a category** under `skills/` (`cto-toolkit/`, `productivity/`, `coding/`, `delivery-pipeline/`, or `devops/`) — or add a new one if none fit, and create a matching grouping in `skills.sh.json` (step 6). **Create the file** `skills/<category>/<skill-name>/SKILL.md`. Use a short, hyphenated `<skill-name>` (e.g. `codebase-audit`); it must match the `name` in the frontmatter.
+1. **Pick a category** under `skills/` (`cto-toolkit/`, `productivity/`, `coding/`, `delivery-pipeline/`, `devops/`, or `design/`) — or add a new one if none fit, and create a matching grouping in `skills.sh.json` (step 6). **Create the file** `skills/<category>/<skill-name>/SKILL.md`. Use a short, hyphenated `<skill-name>` (e.g. `codebase-audit`); it must match the `name` in the frontmatter.
 2. **Write the frontmatter.** `name` and `description` are required; `metadata` is optional but recommended:
 
    ```yaml
