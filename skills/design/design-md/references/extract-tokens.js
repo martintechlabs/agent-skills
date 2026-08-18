@@ -43,7 +43,7 @@
   function componentKey(el) {
     const tag = el.tagName.toLowerCase();
     const cls = el.className && typeof el.className === 'string'
-      ? el.className.trim().split(/\s+/).slice(0, 2).join('.')
+      ? el.className.trim().split(/\s+/).join('.')
       : '';
     return cls ? `${tag}.${cls}` : tag;
   }

@@ -129,7 +129,10 @@ test('extracts a visually button-shaped link without naming-convention classes',
   const result = extractTokens();
 
   assert.equal(result.components.length, 1);
-  assert.equal(result.components[0].selector, 'a.inline-flex.items-center');
+  assert.equal(
+    result.components[0].selector,
+    'a.inline-flex.items-center.justify-center'
+  );
   assert.equal(result.components[0].backgroundColor, 'rgb(37, 99, 235)');
   assert.deepEqual(
     {
@@ -140,4 +143,74 @@ test('extracts a visually button-shaped link without naming-convention classes',
     },
     { top: '12px', right: '24px', bottom: '12px', left: '24px' }
   );
+});
+
+test('keeps component variants that share their leading classes', () => {
+  const transparent = 'rgba(0, 0, 0, 0)';
+  const baseStyle = {
+    color: 'rgb(255, 255, 255)',
+    backgroundColor: transparent,
+    borderColor: transparent,
+    borderWidth: '0px',
+    borderRadius: '8px',
+    boxShadow: 'none',
+    display: 'inline-flex',
+    fontFamily: 'Inter',
+    fontSize: '16px',
+    fontWeight: '600',
+    lineHeight: '24px',
+    letterSpacing: 'normal',
+    marginTop: '0px',
+    marginBottom: '0px',
+    marginLeft: '0px',
+    marginRight: '0px',
+    paddingTop: '12px',
+    paddingBottom: '12px',
+    paddingLeft: '24px',
+    paddingRight: '24px',
+  };
+  const linkOptions = (className) => ({
+    attributes: { href: '/contact' },
+    className,
+    matches: () => false,
+  });
+  const primary = createElement(
+    'A',
+    { ...baseStyle, backgroundColor: 'rgb(37, 99, 235)' },
+    linkOptions('inline-flex items-center bg-primary')
+  );
+  const secondary = createElement(
+    'A',
+    { ...baseStyle, backgroundColor: 'rgb(15, 118, 110)' },
+    linkOptions('inline-flex items-center bg-secondary')
+  );
+  const documentElement = createElement('HTML', {
+    ...baseStyle,
+    color: transparent,
+    backgroundColor: transparent,
+    paddingTop: '0px',
+    paddingBottom: '0px',
+    paddingLeft: '0px',
+    paddingRight: '0px',
+  });
+  const body = createElement('BODY', documentElement.computedStyle);
+  const context = {
+    document: {
+      documentElement,
+      body,
+      querySelectorAll: () => [primary, secondary],
+    },
+    getComputedStyle: (element) => element.computedStyle,
+    location: { href: 'https://example.test/' },
+  };
+  const extractTokens = vm.runInNewContext(`(${extractSource})`, context);
+
+  const result = extractTokens();
+  const backgrounds = Array.from(
+    result.components,
+    ({ backgroundColor }) => backgroundColor
+  ).sort();
+
+  assert.equal(result.components.length, 2);
+  assert.deepEqual(backgrounds, ['rgb(15, 118, 110)', 'rgb(37, 99, 235)']);
 });

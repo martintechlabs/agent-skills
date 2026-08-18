@@ -32,6 +32,6 @@ assert_contains "describe an inferred base rhythm in prose, but do not generate 
 assert_absent 'define `xs`/`sm`/`md`/`lg`/`xl` accordingly'
 assert_contains 'Component `padding`'
 assert_contains 'emit it only when all four sides are uniform; describe asymmetric padding'
-assert_absent 'padding: \"12px 24px\"'
+assert_absent 'padding: "12px 24px"'
 
 echo "ok   synthesis instructions preserve observed typography and schema-valid padding"
