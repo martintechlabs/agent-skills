@@ -3,7 +3,7 @@ name: design-md
 description: Generate a spec-compliant DESIGN.md — the designmd.app format, combining YAML front-matter design tokens with an 8-section human-readable body — at a target repo's root. Two modes, chosen automatically. Point it at a live brand/marketing website URL to extract real colors, fonts, spacing, and shadows via browser automation reading actual computed styles. Or point it at an existing codebase (no URL) to scan Tailwind config, CSS custom properties, and theme files for already-defined tokens. Validates the result with the official @google/design.md lint CLI when available. Use when asked to "create a DESIGN.md from [url]", "generate a design system doc from our brand site", "document our design tokens", or "point design-md at this codebase". Prefer frontend-design when building new distinctive UI rather than documenting an existing visual language; prefer web-perf for Core Web Vitals auditing rather than visual-token extraction.
 metadata:
   author: stephen-martin
-  version: "0.1.0"
+  version: "0.1.1"
 ---
 
 # design-md
@@ -100,24 +100,31 @@ Map the raw extracted data onto the schema:
   exclusively on CTAs/interactive elements is usually `primary` or `tertiary`
   per the spec's naming convention; the dominant background is usually
   `neutral`.
-- **Typography**: pick 9–15 representative levels from the samples (headline
-  sizes from `h1`–`h3` samples, body from `p`, labels/buttons from
-  small/bold samples), naming them with the spec's recommended convention
-  (`headline-lg`, `body-md`, `label-sm`, etc.).
-- **Layout/spacing**: infer the base unit from the spacing histogram — e.g. if
-  most values cluster around multiples of 8px, the scale is an 8px grid — and
-  define `xs`/`sm`/`md`/`lg`/`xl` accordingly.
+- **Typography**: Use only distinct, observed typography records from the
+  samples (headline sizes from `h1`–`h3`, body from `p`, labels/buttons from
+  small/bold samples). For each token, emit only the properties actually observed;
+  never fill missing properties from convention. Partial records from codebase token sources are valid.
+  Name them with the spec's recommended convention (`headline-lg`, `body-md`, `label-sm`, etc.). Fewer than 9 levels
+  is correct when the evidence is sparse; do not duplicate or extrapolate
+  styles to reach the spec's typical 9–15 range. Omit the group only when no
+  typography property was observed at all.
+- **Layout/spacing**: Create spacing tokens only from distinct values present in the histogram.
+  You may describe an inferred base rhythm in prose, but do not generate unobserved
+  scale values or fill `xs` through `xl` by convention.
 - **Rounded**: map the observed `radii` values to `sm`/`md`/`lg`/`full` scale
   levels.
 - **Components**: for each entry in the raw `components` data (website mode)
   or each component file read (codebase mode), define a
   `components.<name>` token group referencing the colors/rounded tokens
   already defined, e.g.
-  `components: {button-primary: {backgroundColor: "{colors.primary}", textColor: "{colors.neutral}", rounded: "{rounded.md}", padding: "12px 24px"}}`
+  `components: {button-primary: {backgroundColor: "{colors.primary}", textColor: "{colors.neutral}", rounded: "{rounded.md}", padding: "{spacing.md}"}}`
   — use `{path.to.token}` references, not restated raw values, when the
-  component's value matches a token you already defined. If no component-level
-  data was extracted in either mode, omit the section (see below) rather than
-  inventing a `button-primary` block from nothing.
+  component's value matches a token you already defined. Compare all four
+  extracted padding sides. Component `padding` accepts one `Dimension`, so
+  emit it only when all four sides are uniform; describe asymmetric padding
+  in prose instead of using CSS shorthand. If no
+  component-level data was extracted in either mode, omit the section (see
+  below) rather than inventing a `button-primary` block from nothing.
 - **Elevation & Depth**: describe the observed `shadows` in prose; if none
   were found, say so and describe whatever alternative hierarchy mechanism
   you observed (borders, tonal contrast) instead of inventing shadow values.

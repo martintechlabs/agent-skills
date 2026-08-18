@@ -1,9 +1,11 @@
 # Codebase-mode extraction checklist
 
-Search the target repo for these design-token sources, in priority order.
-Multiple sources can coexist — read all that are present and merge, preferring
-the more specific/recent source when values conflict (e.g. a CSS var overridden
-in a component wins over a stale config default).
+Search the target repo for these design-token sources in priority order. For
+each token category, use the first source type that provides a strong match.
+Different categories can come from different source types, but a lower-priority
+source must not override a value already established by a higher-priority
+source. Use lower-priority sources only to fill missing categories or to report
+drift between the source of truth and actual component usage.
 
 ## 1. Tailwind config
 

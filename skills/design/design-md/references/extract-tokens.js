@@ -12,11 +12,10 @@
 
   // Headings and CTA-shaped elements carry more weight toward brand/role
   // colors than incidental body text does.
-  function weightFor(el) {
+  function weightFor(el, computedStyle) {
     const tag = el.tagName.toLowerCase();
     if (['h1', 'h2', 'h3'].includes(tag)) return 5;
-    if (tag === 'button' || el.getAttribute('role') === 'button') return 5;
-    if (el.matches('a[class*="btn"], a[class*="button"], [class*="cta"]')) return 5;
+    if (isComponentCandidate(el, computedStyle)) return 5;
     if (['h4', 'h5', 'h6'].includes(tag)) return 3;
     return 1;
   }
@@ -24,8 +23,21 @@
   // Interactive/form-shaped elements are candidates for the Components
   // token group (buttons, inputs) — distinct from weightFor's role-color
   // weighting, which also covers headings.
-  function isComponentCandidate(el) {
-    return el.matches('button, [role="button"], a[class*="btn"], a[class*="button"], [class*="cta"], input, textarea, select');
+  function isComponentCandidate(el, computedStyle) {
+    if (el.matches('button, [role="button"], a[class*="btn"], a[class*="button"], [class*="cta"], input, textarea, select')) {
+      return true;
+    }
+
+    if (el.tagName !== 'A' || !el.getAttribute('href')) return false;
+
+    const hasPadding = ['paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft']
+      .some((property) => parseFloat(computedStyle[property]) > 0);
+    const hasBackground = computedStyle.backgroundColor &&
+      computedStyle.backgroundColor !== 'transparent' &&
+      computedStyle.backgroundColor !== 'rgba(0, 0, 0, 0)';
+    const hasBorder = parseFloat(computedStyle.borderWidth) > 0;
+
+    return hasPadding && (hasBackground || hasBorder);
   }
 
   function componentKey(el) {
@@ -38,14 +50,18 @@
 
   const componentsByKey = new Map();
 
-  const els = Array.from(document.querySelectorAll('body *')).filter((el) => {
+  const els = [
+    document.documentElement,
+    document.body,
+    ...document.querySelectorAll('body *'),
+  ].filter((el) => {
     const r = el.getBoundingClientRect();
     return r.width * r.height >= MIN_AREA && r.width > 0 && r.height > 0;
   });
 
   for (const el of els) {
     const cs = getComputedStyle(el);
-    const w = weightFor(el);
+    const w = weightFor(el, cs);
 
     if (cs.color && cs.color !== 'rgba(0, 0, 0, 0)') bump(colorFreq, cs.color, w);
     if (cs.backgroundColor && cs.backgroundColor !== 'rgba(0, 0, 0, 0)') {
@@ -75,7 +91,7 @@
     if (cs.borderRadius && cs.borderRadius !== '0px') radii.add(cs.borderRadius);
     if (cs.boxShadow && cs.boxShadow !== 'none') shadows.add(cs.boxShadow);
 
-    if (isComponentCandidate(el)) {
+    if (isComponentCandidate(el, cs)) {
       const key = componentKey(el);
       if (!componentsByKey.has(key)) {
         componentsByKey.set(key, {
@@ -85,6 +101,8 @@
           borderRadius: cs.borderRadius,
           paddingTop: cs.paddingTop,
           paddingRight: cs.paddingRight,
+          paddingBottom: cs.paddingBottom,
+          paddingLeft: cs.paddingLeft,
           fontSize: cs.fontSize,
           fontWeight: cs.fontWeight,
         });

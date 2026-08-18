@@ -53,8 +53,8 @@ CLI (`npx @google/design.md lint`) when available.
 1. `navigate_page` to the given URL, plus up to 2 linked subpages (e.g. pricing,
    product) if visible in primary nav — capped at 3 pages total to bound the work.
 2. Run the bundled extraction script (`references/extract-tokens.js`, adapted
-   inline into `evaluate_script`) on each page. It walks the DOM and returns raw,
-   uninterpreted JSON:
+   inline into `evaluate_script`) on each page. It walks the `html` and `body`
+   roots plus their descendants and returns raw, uninterpreted JSON:
    - colors (`color`/`background-color`/`border-color` via `getComputedStyle`),
      bucketed by frequency and element prominence (CTA buttons and headings
      weighted higher than body text)
@@ -77,7 +77,8 @@ judgment, not more script logic.
 ## Codebase mode — extraction
 
 No browser. Grep/Glob/Read the target repo for design-token sources, in priority
-order (first strong match per category wins; sources can coexist):
+order (first strong match per category wins; sources can coexist, but a
+lower-priority source never overrides a higher-priority match):
 
 1. **Tailwind config** (`tailwind.config.{js,ts,mjs}`, or `@theme` blocks in CSS
    for Tailwind v4) — colors/spacing/fontFamily/borderRadius map almost 1:1 onto
@@ -112,6 +113,15 @@ Components, Do's and Don'ts). Use frontmatter `omitted: [{section, reason}]` for
 any section with no real signal (e.g. no shadows detected on a flat-design site)
 instead of fabricating content.
 
+Typography tokens are limited to distinct observed records and properties;
+partial records from codebase token sources remain valid, while the spec's
+typical 9–15-level range is descriptive rather than a target to reach by
+duplication or extrapolation. Spacing tokens likewise come only from observed
+histogram/config values; any inferred rhythm belongs in prose. Component
+padding follows the schema's single `Dimension` field: website extraction
+captures all four sides, the token is included only when they are uniform, and
+asymmetric padding is documented in prose rather than encoded as CSS shorthand.
+
 **File placement:** target repo root, filename `DESIGN.md` (fixed, per spec
 convention). Target repo defaults to cwd; refuse if `DESIGN.md` already exists
 there (see Non-goals).
@@ -133,10 +143,11 @@ never run automatically (see Non-goals).
 
 | Path | Change |
 |---|---|
-| `skills/design/design-md/SKILL.md` | New — frontmatter (`name: design-md`, `metadata: {author: stephen-martin, version: "0.1.0"}`), the mode-detection → extraction → synthesis → validate → report procedure |
+| `skills/design/design-md/SKILL.md` | New — frontmatter (`name: design-md`, `metadata: {author: stephen-martin, version: "0.1.1"}`), the mode-detection → extraction → synthesis → validate → report procedure |
 | `skills/design/design-md/references/design-md-spec.md` | New — vendored verbatim output of `npx @google/design.md spec`, refreshed at authoring time |
 | `skills/design/design-md/references/extract-tokens.js` | New — browser `evaluate_script` template for website-mode raw extraction |
 | `skills/design/design-md/references/codebase-scan.md` | New — glob checklist + source-to-schema mapping for codebase mode |
+| `skills/design/design-md/tests/` | New — regression coverage for browser extraction behavior |
 | `skills.sh.json` | New `design` grouping, listing `design-md` |
 | `README.md` | New "Design" section in Available skills table, plus category added to Repository layout description |
 
