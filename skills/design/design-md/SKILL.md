@@ -77,6 +77,15 @@ Read `references/design-md-spec.md` — the vendored, verbatim `design.md spec`
 output. This is the authoritative token schema and section spec; don't rely
 on memory of the designmd.app marketing page for exact field names or types.
 
+That reference includes a `### Design Tokens` fenced YAML block under several
+sections (Colors, Typography, Layout, Shapes) — those are illustrating *the
+spec itself* (how each token group is shaped), not a template to repeat in
+the file you write. The frontmatter is the single source of truth for tokens;
+don't add a matching `### Design Tokens` code block restating them under the
+corresponding prose section — the linter flags that as a duplicate-definition
+warning (confirmed empirically: `"Section 'colors' is defined in both
+frontmatter and code block 1"`). Section bodies are prose only.
+
 ## Step 4: Synthesize
 
 Always set `name` (the brand/product name — from the site's title/header in
