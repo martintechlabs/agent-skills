@@ -72,8 +72,8 @@ normal, full-data child of the configured production branch.
   production does not.
 
 The captured LSN doubles as an ownership nonce: `name + parent_id + parent_lsn` together
-distinguish the branch *we* created from a same-named branch created by someone else, which is
-what makes the manual recovery path in `adopt` safe.
+distinguish the branch *we* created from a same-named branch created by someone else — the check
+that lets provisioning delete an unverifiable response instead of leaking it.
 
 **Trade-off, accepted and documented:** a normal child initially contains production data, and
 Neon's history window can retain that data in the branch's own snapshots after the purge. This is
@@ -98,8 +98,8 @@ only mechanism that never materializes production rows.
 - Written atomically (temp file + rename, mode 0600). Parsed strictly: exactly the four keys,
   correct types, known status, and `projectId` equal to the configured `NEON_PROJECT_ID` — all
   checked **before** any Neon API call. No credentials in the file; `.neondb/` stays gitignored.
-- Old `.neondb/branch` / `.neondb/branch-check` are **detected and rejected**, never
-  interpreted. `neondb-branch adopt` converts them; nothing else does.
+- Old `.neondb/branch` / `.neondb/branch-check` are **detected and rejected**, never interpreted
+  and never converted — see "Scope" below.
 
 ### Lifecycle
 
@@ -126,14 +126,21 @@ Failure rules:
   vars from `.env.neondb` with **override** — no silent fallback to an ambient `DATABASE_URL`.
 - Only the provisioning migrator reaches a `pending` branch, via the URI passed directly in its
   child-process environment; nothing is published to `.env.neondb` until purge is verified.
-- `adopt` converts an existing workspace: verifies the recorded project, finds the branch by its
-  recorded name, confirms the `.env.neondb` URL's host matches one of that branch's endpoints,
-  then records the actual id. It also sweeps a leftover `tmp/*` record.
+### Scope: fresh installs only
+
+Confirmed 2026-09-09: this ships to repos that do not already have the skill installed, so no
+conversion path is built. An `adopt` command that would have verified project, branch and endpoint
+host before recording an id was designed and then cut rather than shipped unexercised.
+
+The detection half stays, because the failure mode without it is silent: with `.neondb/branch`
+ignored, provisioning would create a second branch alongside the old one and teardown would report
+"nothing to tear down", leaking a live branch and the root slot this change exists to reclaim. Every
+command therefore stops with manual-recovery instructions when either legacy file is present.
 
 ## Non-goals
 
-- No backward-compatible reading of the old state format. Detection and a one-shot `adopt`, or a
-  clear error.
+- No backward-compatible reading of the old state format, and no conversion command. Detection plus
+  a clear manual-recovery error is the whole of it.
 - No rename-following. A git branch change or workspace rename never switches database ownership;
   `sync` logs the divergence and continues against the recorded id.
 - `provision()` stays a deliberate full rebuild that discards workspace development data.

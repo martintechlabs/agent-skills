@@ -31,10 +31,9 @@
 //   provision → `tsx scripts/neondb-branch.ts provision`   full rebuild; DISCARDS workspace data
 //   sync      → `tsx scripts/neondb-branch.ts sync`        chained in front of the dev server
 //   teardown  → `tsx scripts/neondb-branch.ts teardown`
-//   adopt     → `tsx scripts/neondb-branch.ts adopt`       one-shot: old .neondb/branch → state.json
 //
 // Requires (set in .env.neondb, your shell, or your orchestrator's env config — see SKILL.md):
-//   NEON_API_KEY       – Neon API key; required by provision, sync, teardown and adopt
+//   NEON_API_KEY       – Neon API key; required by provision, sync and teardown
 //   NEON_PROJECT_ID    – Neon project to branch within; same
 //   NEON_PARENT_BRANCH – REQUIRED by provision; the production branch NAME or `br-…` id
 //   NEON_DATABASE_NAME / NEON_ROLE_NAME – optional; only needed when the branch hosts more than
@@ -293,26 +292,30 @@ function fileExists(path: string): boolean {
 }
 
 /**
- * Refuse to run while an unconverted record from the previous design is present. Silently ignoring
- * either file would abandon a live Neon branch: `.neondb/branch` names a workspace branch this
- * script can no longer find by id, and `.neondb/branch-check` names a leaked disposable clone that
- * nothing else will ever sweep up.
+ * Refuse to run while a record from the pre-0.2 format is present.
+ *
+ * There is no conversion path — this skill targets fresh installs, and a branch NAME cannot prove
+ * which branch a workspace owns, so adopting one automatically is exactly the ownership mistake the
+ * rest of this file exists to avoid. The guard remains because the alternative is worse than an
+ * error: with these files silently ignored, provisioning would create a second branch alongside the
+ * old one and teardown would report "nothing to tear down", leaking a live branch (and, for
+ * `.neondb/branch`, a root-branch slot) that nothing tracks any more.
  */
 export function assertNoLegacyState(): void {
   const { branch, check } = legacyStateFiles()
   if (fileExists(branch)) {
     throw new FatalError(
-      `Found the previous format's ${branch}. Run \`tsx scripts/neondb-branch.ts adopt\` once to ` +
-        'convert it into .neondb/state.json (it verifies the branch, project and endpoint before ' +
-        'recording an id). This is not read automatically, because a branch NAME cannot prove ' +
-        'which branch this workspace owns.',
+      `Found ${branch}, a workspace record from before .neondb/state.json. This version does not ` +
+        'read it — a branch name is not proof of ownership. Delete the branch it names from the ' +
+        `Neon console (it is a schema-only root branch, so this also frees a root-branch slot), ` +
+        `then remove ${branch} and run provision for a fresh workspace database.`,
     )
   }
   if (fileExists(check)) {
     throw new FatalError(
-      `Found the previous format's ${check}, which names a leaked disposable clone of production. ` +
-        'Run `tsx scripts/neondb-branch.ts adopt` to delete it and clear the record, or delete the ' +
-        'branch named in that file from the Neon console and remove the file.',
+      `Found ${check}, which names a leaked disposable clone of production left by an interrupted ` +
+        'run of an earlier version. Delete the branch it names from the Neon console, then remove ' +
+        `${check}.`,
     )
   }
 }
@@ -328,7 +331,7 @@ export function parseState(raw: string): WorkspaceState {
   try {
     parsed = JSON.parse(raw)
   } catch {
-    throw new FatalError(`${stateFilePath()} is not valid JSON. Delete it and re-run provision, or run adopt.`)
+    throw new FatalError(`${stateFilePath()} is not valid JSON. Delete it and re-run provision.`)
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     throw new FatalError(`${stateFilePath()} must contain a JSON object.`)
@@ -423,7 +426,7 @@ export function removeStateDirIfEmpty(): boolean {
 // ── Lifecycle lock ───────────────────────────────────────────────────────────
 
 /**
- * Serialize provision/sync/teardown/adopt against each other. Exclusive create ('wx') is the whole
+ * Serialize provision/sync/teardown against each other. Exclusive create ('wx') is the whole
  * mechanism; the PID inside exists only so a lock left behind by a killed process can be reclaimed
  * instead of bricking the workspace forever.
  */
@@ -633,7 +636,6 @@ export interface NeonClient {
   /** 'absent' when the branch was already gone. */
   deleteBranch(projectId: string, branchId: string): Promise<'deleted' | 'absent'>
   connectionUri(projectId: string, branchId: string): Promise<string>
-  branchEndpointHosts(projectId: string, branchId: string): Promise<string[]>
 }
 
 const NEON_API_BASE = process.env.NEON_API_BASE ?? 'https://console.neon.tech/api/v2'
@@ -797,13 +799,6 @@ export function createNeonRestClient(apiKey: string, fetchImpl: typeof fetch = f
       return uri
     },
 
-    async branchEndpointHosts(projectId, branchId) {
-      const { data } = await request<{ endpoints?: Array<{ host?: string }> }>(
-        'GET',
-        `/projects/${encodeURIComponent(projectId)}/branches/${encodeURIComponent(branchId)}/endpoints`,
-      )
-      return (data?.endpoints ?? []).map((endpoint) => endpoint.host).filter((host): host is string => typeof host === 'string')
-    },
   }
 }
 
@@ -1150,7 +1145,6 @@ function lazyNeonClient(): NeonClient {
     createBranch: (projectId, opts) => client().createBranch(projectId, opts),
     deleteBranch: (projectId, branchId) => client().deleteBranch(projectId, branchId),
     connectionUri: (projectId, branchId) => client().connectionUri(projectId, branchId),
-    branchEndpointHosts: (projectId, branchId) => client().branchEndpointHosts(projectId, branchId),
   }
 }
 
@@ -1481,112 +1475,6 @@ export async function teardown(deps: Deps = defaultDeps()): Promise<void> {
   }
 }
 
-/**
- * One-shot conversion of the previous design's `.neondb/branch` (a branch NAME) into
- * `.neondb/state.json` (a branch ID) — and cleanup of a leaked `tmp/*` clone recorded in
- * `.neondb/branch-check`.
- *
- * Ownership is established, never assumed: the recorded project must match, the named branch must
- * exist in it, and the connection URL this workspace is already using must point at one of that
- * branch's endpoints. Without that last check, a name freed and reused by another workspace would
- * be adopted here.
- */
-export async function adopt(deps: Deps = defaultDeps()): Promise<void> {
-  const projectId = requireEnv('NEON_PROJECT_ID')
-  requireEnv('NEON_API_KEY')
-  const { branch: legacyBranchFile, check: legacyCheckFile } = legacyStateFiles()
-
-  const releaseLock = acquireLock('adopt')
-  try {
-    if (fileExists(stateFilePath()) && !fileExists(legacyBranchFile) && !fileExists(legacyCheckFile)) {
-      deps.log('[neondb-branch] already on the current state format — nothing to adopt.')
-      return
-    }
-
-    // Sweep the leaked disposable clone first: it is prefix-guarded, disposable by construction, and
-    // nothing else will ever find it once its record is gone.
-    if (fileExists(legacyCheckFile)) {
-      const checkName = readFileSync(legacyCheckFile, 'utf8').trim()
-      if (!checkName.startsWith('tmp/')) {
-        throw new FatalError(`${legacyCheckFile} records "${checkName}", which is not a "tmp/" disposable clone. Refusing to delete it; resolve this by hand.`)
-      }
-      const leaked = await withRetry('find leaked check branch', () => deps.neon.findBranchByName(projectId, checkName), idempotent(deps, 3))
-      if (leaked) {
-        if (leaked.default === true || leaked.primary === true || leaked.protected === true) {
-          throw new FatalError(`Branch "${checkName}" is default/primary/protected — refusing to delete it.`)
-        }
-        deps.log(`[neon] deleting leaked disposable clone ${leaked.id} (${checkName})…`)
-        await withRetry('delete leaked check branch', () => deps.neon.deleteBranch(projectId, leaked.id), idempotent(deps, 3))
-      } else {
-        deps.log(`[neondb-branch] leaked clone "${checkName}" is already gone.`)
-      }
-      rmSync(legacyCheckFile, { force: true })
-    }
-
-    if (!fileExists(legacyBranchFile)) {
-      deps.log('[neondb-branch] no legacy workspace-branch record to convert.')
-      return
-    }
-
-    const lines = readFileSync(legacyBranchFile, 'utf8').split('\n')
-    const recordedName = lines[0].trim()
-    const recordedPhase = lines[1]?.trim()
-    if (!recordedName) throw new FatalError(`${legacyBranchFile} is empty — delete it and re-run provision.`)
-    if (recordedPhase === 'pending') {
-      throw new FatalError(
-        `${legacyBranchFile} records an interrupted setup (phase "pending") for "${recordedName}". ` +
-          'That branch was never finished, so there is nothing worth preserving: delete it in the ' +
-          `Neon console, remove ${legacyBranchFile}, and run provision.`,
-      )
-    }
-
-    const branch = await withRetry('find recorded branch', () => deps.neon.findBranchByName(projectId, recordedName), idempotent(deps, 3))
-    if (!branch) {
-      throw new FatalError(
-        `No branch named "${recordedName}" exists in project ${projectId}. Nothing to adopt — ` +
-          `delete ${legacyBranchFile} and run provision to create a fresh workspace database.`,
-      )
-    }
-    if (branch.project_id !== projectId) {
-      throw new FatalError(`Branch "${recordedName}" belongs to project "${branch.project_id}", not "${projectId}".`)
-    }
-    if (branch.default === true || branch.primary === true || branch.protected === true) {
-      throw new FatalError(`Branch "${recordedName}" is default/primary/protected — refusing to adopt it as a disposable workspace branch.`)
-    }
-
-    // The decisive check: is this actually the database this workspace has been talking to?
-    const configuredUrl = process.env[DB_ENV_VARS[0]]
-    if (!configuredUrl) {
-      throw new FatalError(
-        `${ENV_FILE} does not define ${DB_ENV_VARS[0]}, so there is no way to confirm that ` +
-          `"${recordedName}" is the branch this workspace has been using. Delete ${legacyBranchFile} ` +
-          'and run provision instead.',
-      )
-    }
-    const configuredHost = new URL(configuredUrl).hostname
-    const hosts = await withRetry('list branch endpoints', () => deps.neon.branchEndpointHosts(projectId, branch.id), idempotent(deps, 3))
-    const matches = hosts.some((host) => host === configuredHost || configuredHost === `${host.split('.')[0]}-pooler.${host.split('.').slice(1).join('.')}`)
-    if (!matches) {
-      throw new FatalError(
-        `${ENV_FILE}'s ${DB_ENV_VARS[0]} points at "${configuredHost}", which is not an endpoint of ` +
-          `branch "${recordedName}" (${branch.id}; endpoints: ${hosts.join(', ') || 'none'}). This is ` +
-          'not this workspace\'s branch — the name was probably reused. Refusing to adopt it.',
-      )
-    }
-
-    writeState({ branchId: branch.id, branchName: branch.name, projectId, status: 'ready' })
-    rmSync(legacyBranchFile, { force: true })
-    deps.log(`✅ [neondb-branch] adopted ${branch.id} ("${branch.name}") into ${stateFilePath()}.`)
-    deps.warn(
-      '[neondb-branch] NOTE: this branch is a schema-only ROOT branch created by the previous ' +
-        'design. It still consumes a root-branch slot until you re-run `db:provision`, which ' +
-        'rebuilds it as an ordinary child (and discards this workspace\'s development data).',
-    )
-  } finally {
-    releaseLock()
-  }
-}
-
 async function main(): Promise<void> {
   loadEnvFile() // .env.neondb, never overriding an already-set var
   const mode = process.argv[2]
@@ -1594,9 +1482,8 @@ async function main(): Promise<void> {
     if (mode === 'provision') await provision()
     else if (mode === 'teardown') await teardown()
     else if (mode === 'sync') await sync()
-    else if (mode === 'adopt') await adopt()
     else {
-      console.error('Usage: tsx scripts/neondb-branch.ts <provision|sync|teardown|adopt>')
+      console.error('Usage: tsx scripts/neondb-branch.ts <provision|sync|teardown>')
       process.exit(2)
     }
   } catch (error) {

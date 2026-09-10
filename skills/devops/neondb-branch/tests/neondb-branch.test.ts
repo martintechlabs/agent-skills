@@ -11,7 +11,6 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   acquireLock,
-  adopt,
   assertNoLegacyState,
   assertOwnedDisposableBranch,
   assertProjectMatches,
@@ -79,7 +78,7 @@ interface FakeNeon extends NeonClient {
   failCreateWith?: Error
 }
 
-function fakeNeon(options: { branches?: NeonBranch[]; created?: NeonBranch; connectionUri?: string; endpointHosts?: string[] } = {}): FakeNeon {
+function fakeNeon(options: { branches?: NeonBranch[]; created?: NeonBranch; connectionUri?: string } = {}): FakeNeon {
   const branches = new Map<string, NeonBranch>((options.branches ?? [parentBranch()]).map((b) => [b.id, b]))
   const client: FakeNeon = {
     calls: [],
@@ -108,10 +107,6 @@ function fakeNeon(options: { branches?: NeonBranch[]; created?: NeonBranch; conn
     async connectionUri(projectId, branchId) {
       client.calls.push(`connectionUri(${projectId},${branchId})`)
       return `postgres://u:p@ep-${branchId}.us-east-2.aws.neon.tech/appdb`
-    },
-    async branchEndpointHosts(projectId, branchId) {
-      client.calls.push(`branchEndpointHosts(${projectId},${branchId})`)
-      return options.endpointHosts ?? [`ep-${branchId}.us-east-2.aws.neon.tech`]
     },
   }
   return client
@@ -256,8 +251,8 @@ describe('legacy state detection (no compatibility path)', () => {
   it('refuses to run while the old .neondb/branch record is present', () => {
     mkdirSync(join(sandbox, '.neondb'), { recursive: true })
     writeFileSync(join(sandbox, '.neondb', 'branch'), 'workspace/feature-x\nready\n')
-    expect(() => assertNoLegacyState()).toThrow(/adopt/)
-    expect(() => readState()).toThrow(/previous format/)
+    expect(() => assertNoLegacyState()).toThrow(/is not proof of ownership/)
+    expect(() => readState()).toThrow(/Delete the branch it names/)
   })
 
   it('refuses to run while a leaked temporary-branch record is present, so teardown cannot abandon it', () => {
@@ -269,8 +264,8 @@ describe('legacy state detection (no compatibility path)', () => {
   it('teardown refuses rather than silently skipping a legacy record', async () => {
     mkdirSync(join(sandbox, '.neondb'), { recursive: true })
     writeFileSync(join(sandbox, '.neondb', 'branch'), 'workspace/feature-x\nready\n')
-    await expect(teardown(makeDeps())).rejects.toThrow(/previous format/)
-    expect(neon.calls).toEqual([])
+    await expect(teardown(makeDeps())).rejects.toThrow(/is not proof of ownership/)
+    expect(neon.calls).toEqual([]) // and it never quietly reports "nothing to tear down"
   })
 })
 
@@ -628,60 +623,6 @@ describe('teardown', () => {
     writeState({ branchId: null, branchName: 'workspace/feature-x', projectId: PROJECT, status: 'creating' })
     await expect(teardown(makeDeps())).rejects.toThrow(/UNRESOLVED branch creation/)
     expect(neon.calls).toEqual([])
-  })
-})
-
-describe('adopt (one-shot conversion of an existing workspace)', () => {
-  function legacy(name = 'workspace/feature-x', phase = 'ready') {
-    mkdirSync(join(sandbox, '.neondb'), { recursive: true })
-    writeFileSync(join(sandbox, '.neondb', 'branch'), `${name}\n${phase}\n`)
-  }
-
-  it('records the actual branch ID after verifying project, branch and endpoint', async () => {
-    legacy()
-    neon = fakeNeon({ branches: [parentBranch(), childBranch()], endpointHosts: ['ep-child-123.us-east-2.aws.neon.tech'] })
-    vi.stubEnv('DATABASE_URL', 'postgres://u:p@ep-child-123.us-east-2.aws.neon.tech/appdb')
-    await adopt(makeDeps())
-    expect(readStateFile()).toEqual({ branchId: 'br-dawn-river-arrz6rux', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' })
-    expect(existsSync(join(sandbox, '.neondb', 'branch'))).toBe(false)
-    expect(warnings.join('\n')).toMatch(/still consumes a root-branch slot/)
-  })
-
-  it('accepts a pooled endpoint host for the same branch', async () => {
-    legacy()
-    neon = fakeNeon({ branches: [parentBranch(), childBranch()], endpointHosts: ['ep-child-123.us-east-2.aws.neon.tech'] })
-    vi.stubEnv('DATABASE_URL', 'postgres://u:p@ep-child-123-pooler.us-east-2.aws.neon.tech/appdb')
-    await adopt(makeDeps())
-    expect(readStateFile().branchId).toBe('br-dawn-river-arrz6rux')
-  })
-
-  it('refuses when the configured URL points somewhere else — the name was reused', async () => {
-    legacy()
-    neon = fakeNeon({ branches: [parentBranch(), childBranch()], endpointHosts: ['ep-child-123.us-east-2.aws.neon.tech'] })
-    vi.stubEnv('DATABASE_URL', 'postgres://u:p@ep-somebody-else.us-east-2.aws.neon.tech/appdb')
-    await expect(adopt(makeDeps())).rejects.toThrow(/name was probably reused/)
-    expect(existsSync(stateFile())).toBe(false)
-    expect(existsSync(join(sandbox, '.neondb', 'branch'))).toBe(true) // nothing thrown away
-  })
-
-  it('refuses an interrupted legacy setup rather than adopting a half-built branch', async () => {
-    legacy('workspace/feature-x', 'pending')
-    await expect(adopt(makeDeps())).rejects.toThrow(/interrupted setup/)
-  })
-
-  it('sweeps a leaked temporary clone and clears its record', async () => {
-    mkdirSync(join(sandbox, '.neondb'), { recursive: true })
-    writeFileSync(join(sandbox, '.neondb', 'branch-check'), 'tmp/feature-x\n')
-    neon = fakeNeon({ branches: [parentBranch(), childBranch({ id: 'br-leaked', name: 'tmp/feature-x' })] })
-    await adopt(makeDeps())
-    expect(neon.calls).toContain(`deleteBranch(${PROJECT},br-leaked)`)
-    expect(existsSync(join(sandbox, '.neondb', 'branch-check'))).toBe(false)
-  })
-
-  it('refuses to delete a non-tmp branch recorded in the check file', async () => {
-    mkdirSync(join(sandbox, '.neondb'), { recursive: true })
-    writeFileSync(join(sandbox, '.neondb', 'branch-check'), 'production\n')
-    await expect(adopt(makeDeps())).rejects.toThrow(/not a "tmp\/" disposable clone/)
   })
 })
 

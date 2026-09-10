@@ -103,7 +103,7 @@ baseline INSERT are all gone.
 | `ready` | Purged, migrated, seeded | The app |
 | `deleting` | Teardown in flight | Only teardown |
 
-`provision`, `sync`, `teardown` and `adopt` serialize on `.neondb/lock`.
+`provision`, `sync` and `teardown` serialize on `.neondb/lock`.
 
 ### Renaming never moves a database
 
@@ -202,7 +202,6 @@ ownership by id, the fail-closed purge, and the rollback.
     "db:provision": "tsx scripts/neondb-branch.ts provision",
     "db:sync": "tsx scripts/neondb-branch.ts sync",
     "db:teardown": "tsx scripts/neondb-branch.ts teardown",
-    "db:adopt": "tsx scripts/neondb-branch.ts adopt",
 
     "worktree:setup": "<pm install> && <orm generate, if prisma> && tsx scripts/neondb-branch.ts provision",
     "worktree:sync": "tsx scripts/neondb-branch.ts sync",
@@ -289,30 +288,19 @@ only**, never production. If there's no seed, delete `seedWorkspace()` and its c
 - Confirm the production branch is **protected** in Neon.
 - For end-to-end confidence against real Neon, follow `references/verify.md`.
 
-## Migrating an existing workspace
+## Fresh installs only
 
-Workspaces provisioned by version 0.1.x have a `.neondb/branch` file holding a branch **name**, and
-possibly a `.neondb/branch-check` file naming a leaked `tmp/*` clone. Neither is read automatically:
-a name cannot prove which branch a workspace owns, and silently ignoring either file would abandon a
-live Neon branch. Every command fails with instructions until they are resolved.
+This version targets repos that do not already have the skill installed. There is **no migration
+path** from 0.1.x and no conversion command: a branch *name* is not proof of ownership, so adopting
+one automatically would be the exact mistake the rest of the design avoids.
 
-Run once, per workspace:
-
-```bash
-pnpm db:adopt
-```
-
-`adopt` verifies before it records anything: the recorded project must match `NEON_PROJECT_ID`, the
-named branch must exist in it, it must not be default/primary/protected, and **`.env.neondb`'s
-`DATABASE_URL` host must be one of that branch's endpoints**. Only then does it write
-`.neondb/state.json` with the branch's actual id and delete the old file. If the name was reused by
-another workspace, the endpoint check fails and nothing is adopted. It also deletes any leaked
-`tmp/*` clone and clears its record.
-
-**`adopt` preserves the workspace's data but not the root-branch slot.** The adopted branch is still
-the schema-only root branch 0.1.x created. Run `db:provision` when convenient to rebuild it as an
-ordinary child — that frees the slot and discards the workspace's development data, which is the
-normal `provision()` contract.
+If you do drop it into a repo that already ran 0.1.x, every command stops with an error rather than
+proceeding, because `.neondb/branch` (and possibly `.neondb/branch-check`) is still there. Silently
+ignoring those files would create a second branch alongside the old one and make teardown report
+"nothing to tear down", leaking a live branch — and, for `.neondb/branch`, the root-branch slot this
+change exists to reclaim. Resolve it by hand, per workspace: delete the branch named in the file from
+the Neon console, remove the file, and run `db:provision` for a fresh workspace database. That
+discards the workspace's development data, which is the normal `provision()` contract anyway.
 
 ## Safety model
 
