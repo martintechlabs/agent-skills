@@ -38,9 +38,8 @@ Each `provision()` run:
    default/primary/protected) before running a single destructive statement against it.
 4. **Purges** every application row in one transaction, preserving the inherited migration ledger and
    every extension-owned table, then confirms the application tables are empty.
-5. Publishes `DATABASE_URL` (and any other `DB_ENV_VARS`) to `.env.neondb` — only now, after the
-   purge is verified.
-6. Applies migrations this checkout has that production did not, then **seeds** test fixtures.
+5. Applies migrations this checkout has that production did not, then **seeds** test fixtures.
+6. Publishes `DATABASE_URL` (and any other `DB_ENV_VARS`) to `.env.neondb` after those steps succeed.
 7. Records `status: "ready"` in `.neondb/state.json`.
 
 ## Why an ordinary child, and what it costs you
@@ -103,7 +102,9 @@ baseline INSERT are all gone.
 | `ready` | Purged, migrated, seeded | The app |
 | `deleting` | Teardown in flight | Only teardown |
 
-`provision`, `sync` and `teardown` serialize on `.neondb/lock`.
+`provision`, `sync` and `teardown` serialize on `.neondb/lock`. A short-lived `.neondb/lock-guard`
+serializes acquisition and stale-lock reclamation. An unreadable lock or a leftover guard stops
+the command: stop all lifecycle commands and inspect it before manually removing a stale file.
 
 ### Renaming never moves a database
 
@@ -138,7 +139,7 @@ Set it in your shell, CI config, or orchestrator env instead.
 | `NEON_API_KEY` | all commands | Mirrored into `.env.neondb` so an orchestrator's archive hook is self-sufficient |
 | `NEON_PROJECT_ID` | all commands | Must match `state.json`'s `projectId`, or the command refuses before calling Neon |
 | `NEON_PARENT_BRANCH` | `provision` | The production branch **name or `br-…` id**. Prefer the id: it is resolved with a direct lookup, skipping the branch listing entirely, and it cannot be pointed at the wrong branch by a rename. |
-| `NEON_DATABASE_NAME` / `NEON_ROLE_NAME` | optional | Only needed when a branch hosts more than one database and the first is not the app's |
+| `NEON_DATABASE_NAME` / `NEON_ROLE_NAME` | conditional | Multiple databases require `NEON_DATABASE_NAME`; otherwise the sole database is selected. The role defaults to the selected database's owner. Set `NEON_ROLE_NAME` to use a different role. |
 | seed credentials | `provision` | Whatever the project's seed needs; absent means "skip seeding" |
 
 `WORKSPACE_NAME` is read from the process environment only, never from `.env.neondb`.
@@ -379,17 +380,22 @@ root-branch slot.
   ledger, extension-owned, nor explicitly preserved stops provisioning. A schema outside
   `APP_SCHEMAS` does the same. Known tables that are *absent* are fine — that is production being
   behind this checkout, and migrate-deploy creates them after the purge.
-- **Purge is database-only.** One transaction, `TRUNCATE … RESTART IDENTITY CASCADE`, rolled back on
-  any error. It never calls the application's own deletion paths — no Blob deletes, no billing
+- **Purge is database-only.** One transaction, `TRUNCATE … RESTART IDENTITY RESTRICT`, rolled back on
+  any error. Foreign keys within the application table set work; references from preserved tables
+  fail rather than silently emptying those tables. It never calls the application's own deletion paths — no Blob deletes, no billing
   calls, no worker dispatch — because it runs against a copy of production and those would reach out
-  and mutate shared systems.
+  and mutate shared systems. Enabled application `ON TRUNCATE` triggers on purge targets or their
+  descendants stop provisioning before those hooks can run. Materialized views are classified too:
+  their stored rows require explicit preservation or a project-specific purge design.
 - **URLs publish only after the purge is verified.** Until then the branch is reachable solely by the
   provisioning migrator, through the URI in its child-process environment.
 - **No blind retries on creation.** Only failures provably raised before the request reached Neon are
   retried. An ambiguous outcome leaves `status: "creating"` and fails loudly; the branch is never
   looked up, adopted, or deleted by name.
 - **Failed cleanup keeps recovery state.** A teardown that cannot delete stays at `deleting` with the
-  id intact. A provision whose cleanup fails keeps the record and warns.
+  id intact. Rebuild and failed-setup cleanup use the same rule: recheck the branch's identity and
+  disposable status, record `deleting`, and confirm absence before clearing state. An unverifiable
+  creation response retains `creating` for manual recovery and never authorizes deletion.
 - **`.neondb` is never removed recursively.** Teardown releases the lock, then removes the directory
   only if it is empty.
 - **The only statement sent to production** is a read-only `SELECT pg_current_wal_lsn()`.

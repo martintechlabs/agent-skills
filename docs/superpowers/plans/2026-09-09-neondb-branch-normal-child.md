@@ -81,3 +81,14 @@ Vitest + `@electric-sql/pglite` in a throwaway scratch harness for this repo's o
 - [ ] `tests/run.sh` harness; `tsc --noEmit`; Vitest.
 - [ ] All regression cases from the spec's Testing section green.
 - [ ] `AGENTS.md` run.sh list updated.
+
+## Ship-readiness fix pass
+
+1. Add failing regressions for HTTP body interruption/malformed lookup, rejected creates,
+   protected or parent branch deletion, delayed cleanup, wrong database selection, lock races,
+   and a preserved table referencing an application table.
+2. Fix REST classification and database selection; consolidate verified deletion and recovery;
+   serialize lock reclamation; restrict the purge to its table plan.
+3. Update the day-to-day safety documentation and retain the unreleased `0.2.0` version bump.
+4. Run strict TypeScript and the full Vitest/PGlite harness, review the complete branch again,
+   create/update its PR, and run Greploop. Record live-validation limitations in the PR.

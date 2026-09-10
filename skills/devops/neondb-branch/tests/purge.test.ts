@@ -1,6 +1,6 @@
 // Purge tests against REAL Postgres, in-process, via PGlite — no server, no network, no Neon.
 // The purge is the one part of provisioning whose correctness is a property of Postgres itself
-// (transaction semantics, TRUNCATE … CASCADE, catalog introspection), so faking it would test
+// (transaction semantics, TRUNCATE … RESTRICT, catalog introspection), so faking it would test
 // nothing. When you copy this into a project, adjust the import path to your layout.
 import { PGlite } from '@electric-sql/pglite'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -88,6 +88,23 @@ describe('discoverTables', () => {
 })
 
 describe('purgeApplicationRows', () => {
+  it('refuses application TRUNCATE hooks before they can run', async () => {
+    await db.exec(`
+      CREATE FUNCTION public.notify_purge() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'application hook ran'; END $$;
+      CREATE TRIGGER notify_purge AFTER TRUNCATE ON public.users FOR EACH STATEMENT EXECUTE FUNCTION public.notify_purge();
+    `)
+    await expect(purgeApplicationRows(client, planPurge(await discoverTables(client), KNOWN))).rejects.toThrow(/TRUNCATE trigger/)
+    expect(await rowCount('public.users')).toBe(2)
+  })
+  it('rolls back instead of cascading into a preserved table that references application rows', async () => {
+    await db.exec(`CREATE TABLE public.keep (user_id integer REFERENCES public.users(id)); INSERT INTO public.keep VALUES (1)`)
+    const plan = planPurge(await discoverTables(client), KNOWN, { preserved: ['public.keep'] })
+    await expect(purgeApplicationRows(client, plan)).rejects.toThrow(/foreign key/)
+    expect(await rowCount('public.keep')).toBe(1)
+    expect(await rowCount('public.users')).toBe(2)
+    expect(await rowCount('public.orders')).toBe(3)
+  })
   it('empties every application table while leaving the inherited migration ledger intact', async () => {
     const plan = planPurge(await discoverTables(client), KNOWN)
     await purgeApplicationRows(client, plan)
@@ -98,7 +115,7 @@ describe('purgeApplicationRows', () => {
     await expect(verifyTablesEmpty(client, plan.truncate)).resolves.toBeUndefined()
   })
 
-  it('empties tables in any foreign-key direction — a single CASCADE truncate cannot deadlock on order', async () => {
+  it('empties tables in any foreign-key direction — a single multi-table truncate handles references in either direction', async () => {
     // users is referenced BY orders; truncating it alone would fail without the combined statement.
     const plan = planPurge(await discoverTables(client), KNOWN)
     expect(plan.truncate).toEqual(['public.orders', 'public.users'])
@@ -124,7 +141,7 @@ describe('purgeApplicationRows', () => {
     const plan = planPurge(await discoverTables(client), KNOWN)
     await expect(purgeApplicationRows(failingAtCommit, plan)).rejects.toThrow('connection reset before commit')
 
-    expect(statements).toEqual(['BEGIN', 'TRUNCATE TABLE "public"."orders", "public"."users" RESTART IDENTITY CASCADE', 'COMMIT', 'ROLLBACK'])
+    expect(statements.filter((statement) => !statement.includes('pg_trigger'))).toEqual(['BEGIN', 'TRUNCATE TABLE "public"."orders", "public"."users" RESTART IDENTITY RESTRICT', 'COMMIT', 'ROLLBACK'])
     // The rows survive, which is the proof the TRUNCATE really was inside a transaction.
     expect(await rowCount('public.users')).toBe(2)
     expect(await rowCount('public.orders')).toBe(3)
@@ -153,6 +170,11 @@ describe('verifyTablesEmpty (the gate before any URL is published)', () => {
 })
 
 describe('fail-closed classification against a real catalog', () => {
+  it('refuses an unclassified materialized view that still contains production rows', async () => {
+    await db.exec('CREATE MATERIALIZED VIEW public.user_snapshot AS SELECT * FROM public.users')
+    const found = await discoverTables(client)
+    expect(() => planPurge(found, KNOWN)).toThrow(/public.user_snapshot/)
+  })
   it('refuses when production carries a table this checkout has never heard of', async () => {
     await db.exec('CREATE TABLE public.invoices (id serial PRIMARY KEY, total numeric NOT NULL)')
     const found = await discoverTables(client)

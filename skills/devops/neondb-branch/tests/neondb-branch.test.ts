@@ -18,6 +18,7 @@ import {
   backoffMs,
   buildCountSql,
   buildTruncateSql,
+  createNeonRestClient,
   DISCOVER_TABLES_SQL,
   FatalError,
   FIRST_CONNECTION_ATTEMPTS,
@@ -274,6 +275,24 @@ describe('legacy state detection (no compatibility path)', () => {
 })
 
 describe('lifecycle lock', () => {
+  it('does not reclaim a lock whose PID has not been written yet', () => {
+    mkdirSync(join(sandbox, '.neondb'), { recursive: true })
+    writeFileSync(join(sandbox, '.neondb', 'lock'), '')
+    expect(() => acquireLock('teardown')).toThrow(/cannot prove|Cannot prove/)
+    expect(readFileSync(join(sandbox, '.neondb', 'lock'), 'utf8')).toBe('')
+  })
+
+  it('blocks a competing stale-lock reclaimer until the first has acquired ownership', () => {
+    acquireLock('dead')
+    let competitorError: unknown
+    const release = acquireLock('first', () => {
+      try { acquireLock('competitor', () => false) } catch (error) { competitorError = error }
+      return false
+    })
+    expect(competitorError).toBeInstanceOf(FatalError)
+    expect(JSON.parse(readFileSync(join(sandbox, '.neondb', 'lock'), 'utf8')).label).toBe('first')
+    release()
+  })
   it('serializes commands: a second holder is refused while the first is alive', () => {
     const release = acquireLock('provision')
     expect(() => acquireLock('teardown')).toThrow(/Another neondb-branch command \(provision/)
@@ -305,6 +324,46 @@ describe('removeStateDirIfEmpty', () => {
 })
 
 describe('provision', () => {
+  it('clears creation intent after a definitively rejected POST', async () => {
+    neon.failCreateWith = new NeonRequestError('branch limit', 422, false)
+    await expect(provision(makeDeps())).rejects.toThrow('branch limit')
+    expect(readState()).toBeNull()
+  })
+
+  it('uses the selected child database instead of an arbitrary URI in the create response', async () => {
+    neon = fakeNeon({ connectionUri: 'postgres://u:p@wrong-db-host/wrong' })
+    const migrated: string[] = []
+    await provision(makeDeps({ deployMigrations: (uri) => { migrated.push(uri) } }))
+    expect(migrated).toEqual(['postgres://u:p@ep-br-dawn-river-arrz6rux.us-east-2.aws.neon.tech/appdb'])
+  })
+
+  it('refuses to delete its configured parent during a rebuild', async () => {
+    const parent = childBranch({ id: PARENT_ID, name: 'stand-in-parent', parent_id: 'br-grandparent' })
+    neon = fakeNeon({ branches: [parent] })
+    vi.stubEnv('NEON_PARENT_BRANCH', PARENT_ID)
+    writeState({ branchId: PARENT_ID, branchName: parent.name, projectId: PROJECT, status: 'ready' })
+    await expect(provision(makeDeps())).rejects.toThrow(/Refusing to delete/)
+    expect(neon.calls.some((call) => call.startsWith('deleteBranch'))).toBe(false)
+  })
+
+  it('keeps deleting state and does not create again while the old branch remains', async () => {
+    neon = fakeNeon({ branches: [parentBranch(), childBranch()] })
+    writeState({ branchId: childBranch().id, branchName: childBranch().name, projectId: PROJECT, status: 'ready' })
+    neon.deleteBranch = async () => {
+      expect(readStateFile().status).toBe('deleting')
+      return 'deleted'
+    }
+    await expect(provision(makeDeps())).rejects.toThrow(/still present/)
+    expect(readStateFile().status).toBe('deleting')
+    expect(neon.calls.some((call) => call.startsWith('createBranch'))).toBe(false)
+  })
+
+  it('retains the branch id when cleanup was accepted but never finished', async () => {
+    neon.deleteBranch = async () => 'deleted'
+    await expect(provision(makeDeps({ seed: () => { throw new Error('seed failed') } }))).rejects.toThrow('seed failed')
+    expect(readState()).toMatchObject({ branchId: childBranch().id, status: 'deleting' })
+    expect(warnings.join('\n')).toMatch(/still present/)
+  })
   it('walks creating → pending → ready, creating an ordinary child at the captured parent LSN', async () => {
     const transitions: string[] = []
     const deps = makeDeps({
@@ -345,7 +404,7 @@ describe('provision', () => {
     await provision(makeDeps())
 
     const purge = sql.statements.filter((s) => s === 'BEGIN' || s.startsWith('TRUNCATE') || s === 'COMMIT')
-    expect(purge).toEqual(['BEGIN', 'TRUNCATE TABLE "public"."users" RESTART IDENTITY CASCADE', 'COMMIT'])
+    expect(purge).toEqual(['BEGIN', 'TRUNCATE TABLE "public"."users" RESTART IDENTITY RESTRICT', 'COMMIT'])
     expect(envAtTruncate).toBe(false) // no URL was publishable while production rows were still there
     expect(readFileSync(join(sandbox, '.env.neondb'), 'utf8')).toMatch(/DATABASE_URL='postgres:\/\//)
   })
@@ -370,12 +429,11 @@ describe('provision', () => {
     expect(neon.calls.filter((c) => c.startsWith('deleteBranch'))).toHaveLength(1)
   })
 
-  it('refuses a branch whose parent_lsn is not the one this run captured, and deletes it again', async () => {
+  it('refuses a mismatched parent_lsn without deleting a branch it cannot prove it owns', async () => {
     neon = fakeNeon({ created: childBranch({ parent_lsn: '0/DEADBEEF' }) })
     await expect(provision(makeDeps())).rejects.toThrow(/parent_lsn .* not the captured/)
-    // It came from our own POST and is provably disposable, so it is cleaned up rather than leaked.
-    expect(neon.calls).toContain(`deleteBranch(${PROJECT},br-dawn-river-arrz6rux)`)
-    expect(existsSync(stateFile())).toBe(false)
+    expect(neon.calls.some((call) => call.startsWith('deleteBranch'))).toBe(false)
+    expect(readStateFile().status).toBe('creating')
   })
 
   it('leaves a non-disposable surprise response strictly alone', async () => {
@@ -509,7 +567,7 @@ describe('provision', () => {
       ),
     ).rejects.toThrow('migrate deploy exploded')
 
-    expect(readStateFile()).toMatchObject({ branchId: 'br-dawn-river-arrz6rux', status: 'pending' })
+    expect(readStateFile()).toMatchObject({ branchId: 'br-dawn-river-arrz6rux', status: 'deleting' })
     expect(warnings.join('\n')).toMatch(/could not delete branch br-dawn-river-arrz6rux/)
   })
 })
@@ -576,6 +634,12 @@ describe('sync', () => {
 })
 
 describe('teardown', () => {
+  it.each([{ default: true }, { primary: true }, { protected: true }, { parent_id: null }])('refuses to delete a recorded branch that is no longer disposable: %o', async (flags) => {
+    neon.branches.set(childBranch().id, childBranch(flags))
+    await expect(teardown(makeDeps())).rejects.toThrow(/Refusing to delete/)
+    expect(neon.calls.some((call) => call.startsWith('deleteBranch'))).toBe(false)
+    expect(readState()).not.toBeNull()
+  })
   beforeEach(() => {
     writeState({ branchId: 'br-dawn-river-arrz6rux', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' })
     neon = fakeNeon({ branches: [parentBranch(), childBranch()] })
@@ -584,7 +648,7 @@ describe('teardown', () => {
 
   it('records deleting, deletes by ID, confirms absence, then clears state and URLs', async () => {
     await teardown(makeDeps())
-    expect(neon.calls).toEqual([`deleteBranch(${PROJECT},br-dawn-river-arrz6rux)`, `getBranchById(${PROJECT},br-dawn-river-arrz6rux)`])
+    expect(neon.calls).toEqual([`getBranchById(${PROJECT},br-dawn-river-arrz6rux)`, `deleteBranch(${PROJECT},br-dawn-river-arrz6rux)`, `getBranchById(${PROJECT},br-dawn-river-arrz6rux)`])
     expect(existsSync(stateFile())).toBe(false)
     expect(readFileSync(join(sandbox, '.env.neondb'), 'utf8')).not.toMatch(/DATABASE_URL/)
     expect(existsSync(join(sandbox, '.neondb'))).toBe(false) // empty, so removed
@@ -670,7 +734,7 @@ describe('SQL construction', () => {
   })
 
   it('builds a single multi-table TRUNCATE so foreign-key order cannot matter', () => {
-    expect(buildTruncateSql(['public.users', 'public.orders'])).toBe('TRUNCATE TABLE "public"."users", "public"."orders" RESTART IDENTITY CASCADE')
+    expect(buildTruncateSql(['public.users', 'public.orders'])).toBe('TRUNCATE TABLE "public"."users", "public"."orders" RESTART IDENTITY RESTRICT')
   })
 
   it('builds one round-trip emptiness check', () => {
@@ -758,6 +822,52 @@ describe('withRetry', () => {
       ),
     ).rejects.toThrow('HTTP 503')
     expect(idempotentCalls).toBe(3)
+  })
+})
+
+describe('Neon REST boundary', () => {
+  it('never retries POST after headers arrive but reading the response body fails', async () => {
+    let posts = 0
+    const client = createNeonRestClient('test', async () => {
+      posts++
+      return { text: async () => { throw new Error('socket reset') }, status: 201, ok: true } as unknown as Response
+    })
+    await expect(withRetry('create', () => client.createBranch(PROJECT, { name: 'workspace/test', parentId: PARENT_ID, parentLsn: PARENT_LSN }), {
+      attempts: 3, sleep: () => undefined, log: () => undefined,
+    })).rejects.toMatchObject({ ambiguous: true })
+    expect(posts).toBe(1)
+  })
+
+  it.each(['{}', 'null', '{bad', '{"branch":{"id":"br-other"}}'])('does not interpret malformed HTTP 200 lookup as absence: %s', async (body) => {
+    const client = createNeonRestClient('test', async () => new Response(body, { status: 200 }))
+    await expect(client.getBranchById(PROJECT, 'br-requested')).rejects.toThrow(/Unexpected Neon/)
+  })
+
+  it('uses only HTTP 404 as proof a branch is absent', async () => {
+    const client = createNeonRestClient('test', async () => new Response('{"message":"not found"}', { status: 404 }))
+    await expect(client.getBranchById(PROJECT, 'br-requested')).resolves.toBeNull()
+  })
+
+  it('requires database selection when the branch has multiple databases', async () => {
+    vi.stubEnv('NEON_DATABASE_NAME', '')
+    vi.stubEnv('NEON_ROLE_NAME', '')
+    const client = createNeonRestClient('test', async (url) => new Response(JSON.stringify(String(url).includes('/databases')
+      ? { databases: [{ name: 'first', owner_name: 'first_owner' }, { name: 'app', owner_name: 'app_owner' }] }
+      : { uri: 'postgres://first_owner:p@child/first' })))
+    await expect(client.connectionUri(PROJECT, 'br-child')).rejects.toThrow(/NEON_DATABASE_NAME/)
+  })
+
+  it('derives the role from the selected database rather than the first database', async () => {
+    vi.stubEnv('NEON_DATABASE_NAME', 'app')
+    vi.stubEnv('NEON_ROLE_NAME', '')
+    let requestedRole: string | null = null
+    const client = createNeonRestClient('test', async (url) => {
+      if (String(url).includes('/databases')) return new Response(JSON.stringify({ databases: [{ name: 'first', owner_name: 'first_owner' }, { name: 'app', owner_name: 'app_owner' }] }))
+      requestedRole = new URL(String(url)).searchParams.get('role_name')
+      return new Response(JSON.stringify({ uri: 'postgres://app_owner:p@child/app' }))
+    })
+    await client.connectionUri(PROJECT, 'br-child')
+    expect(requestedRole).toBe('app_owner')
   })
 })
 

@@ -71,9 +71,8 @@ normal, full-data child of the configured production branch.
   Verify emptiness before publishing connection URLs. Then apply migrations the checkout has and
   production does not.
 
-The captured LSN doubles as an ownership nonce: `name + parent_id + parent_lsn` together
-distinguish the branch *we* created from a same-named branch created by someone else — the check
-that lets provisioning delete an unverifiable response instead of leaking it.
+The captured LSN doubles as an ownership check: `name + parent_id + parent_lsn` together must match
+the creation request. A failed check requires manual recovery; it never authorizes deletion.
 
 **Trade-off, accepted and documented:** a normal child initially contains production data, and
 Neon's history window can retain that data in the branch's own snapshots after the purge. This is
@@ -105,7 +104,7 @@ only mechanism that never materializes production rows.
 
 | Command | Transitions |
 |---|---|
-| `provision` | delete recorded branch → `creating` (`branchId: null`) → create → verify → `pending` → purge → verify empty → publish URLs → migrate → seed → `ready` |
+| `provision` | delete recorded branch → `creating` (`branchId: null`) → create → verify → `pending` → purge → verify empty → migrate → seed → publish URLs → `ready` |
 | `sync` | requires `ready` + managed URLs present; `getBranchById` (never by name); refreshes `branchName` |
 | `teardown` | `deleting` → delete by id → confirm absent → strip URLs → remove state file → release lock → `rmdir .neondb` only if empty |
 
@@ -157,3 +156,27 @@ Purge behavior is tested against **PGlite** (in-process Postgres) rather than a 
 the transaction, the ledger preservation, and the rollback are exercised for real. The Neon
 control plane is a fake implementing the same `NeonClient` interface the production code uses,
 with response shapes taken from the live API output recorded above.
+
+## Ship-readiness corrections
+
+The review found gaps in the implementation of the safety rules above. Harden them as follows:
+
+- Treat interrupted HTTP response bodies as ambiguous requests, and treat a malformed successful
+  branch lookup as an error, never proof of absence. A definitively rejected create clears its
+  intent; an uncertain response keeps it.
+- Re-read recorded branch identity and disposable flags before deletion. Record `deleting` and
+  confirm absence before clearing state on every deletion path, including rebuild and setup failure.
+  A creation response that fails ownership verification must be left for manual recovery; a returned
+  id alone cannot override the failed name/parent/LSN check.
+- Fetch the child's connection URI with the configured database and role. Infer these only from an
+  unambiguous database listing; multiple databases require an explicit selection.
+- Serialize stale-lock reclamation with an exclusive short-lived guard. An unreadable lock or a
+  leftover guard requires manual inspection, rather than assuming its holder is dead.
+- Use one multi-table `TRUNCATE ... RESTRICT`. Cross-table application foreign keys still work,
+  while references from preserved tables fail and roll back instead of cascading into those tables.
+- Reject enabled application `ON TRUNCATE` hooks on purge targets (including descendants) before
+  truncating. Include materialized views in discovery so their stored production rows cannot pass
+  unnoticed; they require explicit preservation or a project-specific purge design.
+
+These corrections keep the fresh-install scope and ordinary-child design. No live Neon resources
+are needed to reproduce them: REST response fixtures, lifecycle fakes, and PGlite cover the failures.

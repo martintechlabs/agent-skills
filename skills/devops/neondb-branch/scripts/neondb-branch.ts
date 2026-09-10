@@ -37,7 +37,7 @@
 //   NEON_PROJECT_ID    – Neon project to branch within; same
 //   NEON_PARENT_BRANCH – REQUIRED by provision; the production branch NAME or `br-…` id
 //   NEON_DATABASE_NAME / NEON_ROLE_NAME – optional; only needed when the branch hosts more than
-//                        one database and the first one is not the app's
+//                        one database; select the app database explicitly
 //   (seed credentials) – whatever your seed needs; provision-only — see seedWorkspace() below
 //
 // SAFETY: every destructive control-plane call goes by branch id, and only after the branch has been
@@ -434,31 +434,50 @@ export function removeStateDirIfEmpty(): boolean {
 export function acquireLock(label: string, isAlive: (pid: number) => boolean = defaultIsAlive): () => void {
   mkdirSync(stateDir(), { recursive: true })
   const file = lockFilePath()
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fd = openSync(file, 'wx', 0o600)
-      writeSync(fd, `${JSON.stringify({ pid: process.pid, label, at: new Date().toISOString() })}\n`)
-      closeSync(fd)
-      return () => rmSync(file, { force: true })
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-      const holder = readLockHolder(file)
-      if (holder !== null && isAlive(holder.pid)) {
-        throw new FatalError(
-          `Another neondb-branch command (${holder.label}, pid ${holder.pid}) is running for this ` +
-            `workspace. Wait for it to finish, or remove ${file} if you are certain it is stale.`,
-        )
-      }
-      rmSync(file, { force: true }) // stale: the recorded process is gone (or the file is garbage)
-    }
+  // All contenders must hold this guard while inspecting/reclaiming the lifecycle lock. Otherwise
+  // two readers of a dead PID can each unlink the other's newly acquired lock. A crashed guard is
+  // deliberately not reclaimed automatically: that would just recreate the same race one level up.
+  const guard = `${file}-guard`
+  let guardFd: number
+  try {
+    guardFd = openSync(guard, 'wx', 0o600)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    throw new FatalError(`Another command is acquiring ${file}. Retry when it finishes. If ${guard} remains after all commands stop, inspect and remove that stale guard manually.`)
   }
-  throw new FatalError(`Could not acquire ${file}.`)
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const fd = openSync(file, 'wx', 0o600)
+        writeSync(fd, `${JSON.stringify({ pid: process.pid, label, at: new Date().toISOString() })}\n`)
+        closeSync(fd)
+        return () => rmSync(file, { force: true })
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+        const holder = readLockHolder(file)
+        if (holder === null) {
+          throw new FatalError(`Cannot prove the holder of ${file} is dead. Stop all neondb-branch commands, inspect the lock, then remove it manually if stale.`)
+        }
+        if (isAlive(holder.pid)) {
+          throw new FatalError(
+            `Another neondb-branch command (${holder.label}, pid ${holder.pid}) is running for this ` +
+              `workspace. Wait for it to finish, or remove ${file} if you are certain it is stale.`,
+          )
+        }
+        rmSync(file, { force: true }) // the recorded process is provably gone; guard excludes other reclaimers
+      }
+    }
+    throw new FatalError(`Could not acquire ${file}.`)
+  } finally {
+    closeSync(guardFd)
+    rmSync(guard, { force: true })
+  }
 }
 
 function readLockHolder(file: string): { pid: number; label: string } | null {
   try {
     const parsed = JSON.parse(readFileSync(file, 'utf8')) as { pid?: unknown; label?: unknown }
-    if (typeof parsed.pid !== 'number' || !Number.isInteger(parsed.pid)) return null
+    if (typeof parsed.pid !== 'number' || !Number.isSafeInteger(parsed.pid) || parsed.pid <= 0) return null
     return { pid: parsed.pid, label: typeof parsed.label === 'string' ? parsed.label : 'unknown' }
   } catch {
     return null
@@ -470,7 +489,7 @@ function defaultIsAlive(pid: number): boolean {
     process.kill(pid, 0)
     return true
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM' // alive, just not ours to signal
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH' // only ESRCH proves the process is gone
   }
 }
 
@@ -685,7 +704,14 @@ export function createNeonRestClient(apiKey: string, fetchImpl: typeof fetch = f
         !preRequest,
       )
     }
-    const text = await response.text()
+    let text: string
+    try {
+      text = await response.text()
+    } catch (error) {
+      throw new NeonRequestError(
+        `${method} ${path} response body could not be read (${(error as Error).message})`, null, true,
+      )
+    }
     let data: unknown = null
     if (text) {
       try {
@@ -740,7 +766,11 @@ export function createNeonRestClient(apiKey: string, fetchImpl: typeof fetch = f
     async getBranchById(projectId, branchId) {
       try {
         const { data } = await request<{ branch?: NeonBranch }>('GET', `/projects/${encodeURIComponent(projectId)}/branches/${encodeURIComponent(branchId)}`)
-        return data?.branch ?? null
+        const branch = data?.branch
+        if (!branch || branch.id !== branchId || branch.project_id !== projectId || typeof branch.name !== 'string' || !branch.name) {
+          throw new FatalError('Unexpected Neon branch response shape or identity; cannot establish branch presence or absence.')
+        }
+        return branch
       } catch (error) {
         if (error instanceof NeonRequestError && error.status === 404) return null
         throw error
@@ -779,14 +809,17 @@ export function createNeonRestClient(apiKey: string, fetchImpl: typeof fetch = f
           'GET',
           `/projects/${encodeURIComponent(projectId)}/branches/${encodeURIComponent(branchId)}/databases`,
         )
-        const first = data?.databases?.[0]
-        if (!first?.name || !first.owner_name) {
+        const databases = data?.databases
+        const selected = Array.isArray(databases)
+          ? (database ? databases.find((entry) => entry.name === database) : databases.length === 1 ? databases[0] : undefined)
+          : undefined
+        if (!selected?.name || (!role && !selected.owner_name)) {
           throw new FatalError(
             `Could not determine the database/role for branch ${branchId}. Set NEON_DATABASE_NAME and NEON_ROLE_NAME explicitly.`,
           )
         }
-        database = database || first.name
-        role = role || first.owner_name
+        database = database || selected.name
+        role = role || selected.owner_name!
       }
       const query = new URLSearchParams({ branch_id: branchId, database_name: database, role_name: role })
       const { data } = await request<{ uri?: string; connection_uri?: string }>(
@@ -911,14 +944,14 @@ export function planPurge(
   return { truncate: truncate.sort(), preserved: preserved.sort() }
 }
 
-/** SQL that lists every non-system base table, flagging the ones an extension owns. */
+/** Include stored materialized views too: ignoring them would publish inherited production rows. */
 export const DISCOVER_TABLES_SQL = `
 SELECT n.nspname AS schema,
        c.relname AS name,
        EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e') AS extension_owned
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE c.relkind IN ('r', 'p')
+WHERE c.relkind IN ('r', 'p', 'm')
   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
   AND n.nspname NOT LIKE 'pg\\_toast%'
   AND n.nspname NOT LIKE 'pg\\_temp%'
@@ -941,7 +974,7 @@ export function buildTruncateSql(tables: string[]): string {
       return `${quoteIdent(qualified.slice(0, separator))}.${quoteIdent(qualified.slice(separator + 1))}`
     })
     .join(', ')
-  return `TRUNCATE TABLE ${list} RESTART IDENTITY CASCADE`
+  return `TRUNCATE TABLE ${list} RESTART IDENTITY RESTRICT`
 }
 
 export function buildCountSql(tables: string[]): string {
@@ -971,6 +1004,20 @@ export async function purgeApplicationRows(client: SqlClient, plan: PurgePlan): 
   if (plan.truncate.length === 0) return
   await client.query('BEGIN')
   try {
+    // TRUNCATE fires database hooks even though it avoids DELETE hooks. Reject application hooks
+    // rather than invoking copied production integrations. Descendants are truncated implicitly.
+    const triggers = await client.query<{ name: string }>(`
+WITH RECURSIVE targets(oid) AS (
+  SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE n.nspname || '.' || c.relname = ANY($1::text[])
+  UNION
+  SELECT i.inhrelid FROM pg_inherits i JOIN targets t ON i.inhparent = t.oid
+)
+SELECT tg.tgname AS name FROM pg_trigger tg JOIN targets t ON tg.tgrelid = t.oid
+WHERE NOT tg.tgisinternal AND tg.tgenabled <> 'D' AND (tg.tgtype & 32) <> 0`, [plan.truncate])
+    if (triggers.length > 0) {
+      throw new FatalError(`Refusing to run application TRUNCATE trigger(s): ${triggers.map((trigger) => trigger.name).join(', ')}. Review and remove those hooks from the disposable child before designing a project-specific purge.`)
+    }
     await client.query(buildTruncateSql(plan.truncate))
     await client.query('COMMIT')
   } catch (error) {
@@ -1202,6 +1249,31 @@ async function waitForFirstConnection(deps: Deps, uri: string): Promise<void> {
   })
 }
 
+/** Delete only a still-disposable recorded id, retaining recovery state until absence is proven. */
+async function deleteRecordedBranch(deps: Deps, state: WorkspaceState, parentId?: string): Promise<void> {
+  const branchId = state.branchId
+  if (!branchId) throw new FatalError('Cannot delete an unresolved branch creation; inspect Neon manually.')
+  writeState({ ...state, status: 'deleting' })
+  const branch = await withRetry('inspect branch before deletion', () => deps.neon.getBranchById(state.projectId, branchId), idempotent(deps, 4))
+  if (branch) {
+    const parentRef = process.env.NEON_PARENT_BRANCH
+    if (branch.id !== branchId || branch.project_id !== state.projectId ||
+        branch.id === parentId || branch.id === parentRef || branch.name === parentRef ||
+        !branch.parent_id?.startsWith('br-') || branch.default === true || branch.primary === true || branch.protected === true) {
+      throw new FatalError(`Refusing to delete branch ${branchId}: identity mismatch or branch is a parent, root, default, primary, or protected branch. Inspect it in Neon before manual recovery.`)
+    }
+    await withRetry('delete branch', () => deps.neon.deleteBranch(state.projectId, branchId), idempotent(deps, 4))
+    await withRetry('confirm branch deletion', async () => {
+      const still = await deps.neon.getBranchById(state.projectId, branchId)
+      if (still) throw new Error(`branch ${branchId} still present (state: ${still.current_state ?? 'unknown'})`)
+    }, idempotent(deps, 5))
+  } else {
+    deps.log(`[neondb-branch] branch ${branchId} was already gone — treating as torn down.`)
+  }
+  stripEnvVars(envFilePath(), DB_ENV_VARS)
+  clearState()
+}
+
 export async function provision(deps: Deps = defaultDeps()): Promise<void> {
   const projectId = requireEnv('NEON_PROJECT_ID')
   const apiKey = requireEnv('NEON_API_KEY')
@@ -1248,9 +1320,7 @@ export async function provision(deps: Deps = defaultDeps()): Promise<void> {
       // Every run is a full rebuild. Delete by ID: the recorded name may be stale, and a name is
       // never proof of ownership.
       deps.log(`[neon] deleting recorded branch ${existing.branchId} (${existing.branchName}) to rebuild from scratch…`)
-      await withRetry('delete recorded branch', () => deps.neon.deleteBranch(projectId, existing.branchId as string), idempotent(deps, 3))
-      stripEnvVars(envFilePath(), DB_ENV_VARS)
-      clearState()
+      await deleteRecordedBranch(deps, existing, parent.id)
     }
 
     // Creation intent is recorded BEFORE the POST, so an interrupted or ambiguous creation is always
@@ -1271,6 +1341,7 @@ export async function provision(deps: Deps = defaultDeps()): Promise<void> {
             `"${branchName}" if it is yours, then delete ${stateFilePath()} and re-run provision.`,
         )
       }
+      if (error instanceof NeonRequestError && !error.ambiguous) clearState()
       throw error
     }
 
@@ -1278,31 +1349,12 @@ export async function provision(deps: Deps = defaultDeps()): Promise<void> {
     try {
       assertOwnedDisposableBranch(created.branch, { projectId, name: branchName, parentId: parent.id, parentLsn })
     } catch (error) {
-      // The id came back from our own POST, so this branch IS ours — but it is not what we asked
-      // for. Clean it up when it is provably disposable; when it is not (it came back flagged
-      // default/primary/protected, or in another project) leave it strictly alone and hand the
-      // problem to a human.
-      const disposable =
-        created.branch.project_id === projectId &&
-        typeof created.branch.name === 'string' &&
-        created.branch.name.startsWith(BRANCH_PREFIX) &&
-        created.branch.default !== true &&
-        created.branch.primary !== true &&
-        created.branch.protected !== true &&
-        typeof created.branch.id === 'string' &&
-        created.branch.id.startsWith('br-')
-      if (disposable) {
-        try {
-          await withRetry('delete unverifiable branch', () => deps.neon.deleteBranch(projectId, created.branch.id), idempotent(deps, 3))
-          clearState()
-        } catch (cleanupError) {
-          deps.warn(`[neondb-branch] WARNING: could not delete unverifiable branch ${created.branch.id} (${cleanupError instanceof Error ? cleanupError.message : cleanupError}).`)
-        }
-      }
+      // A response that failed ownership verification cannot authorize deletion either. Preserve
+      // creating intent for manual recovery, even when the reported id looks disposable.
       throw new FatalError(
         `${error instanceof Error ? error.message : error} — Neon reported creating branch ` +
-          `${created.branch.id ?? '(no id)'}${disposable ? ', which has been deleted again' : '; delete it in the console if it is yours'}. ` +
-          `Re-run provision once the cause is understood.`,
+          `${created.branch.id ?? '(no id)'}; delete it in the console only if it is yours, then remove ${stateFilePath()}. ` +
+          'Creation intent has been retained. Re-run provision once the cause is understood.',
       )
     }
     const branchId = created.branch.id
@@ -1310,7 +1362,9 @@ export async function provision(deps: Deps = defaultDeps()): Promise<void> {
     deps.log(`[neon] created ${branchId} (parent ${created.branch.parent_id} @ ${created.branch.parent_lsn})`)
 
     try {
-      const uri = created.connectionUri ?? (await withRetry('fetch connection string', () => deps.neon.connectionUri(projectId, branchId), idempotent(deps, 5)))
+      // The create response may list a different database/role first. Resolve the selected database
+      // for this verified child explicitly, exactly as for the parent.
+      const uri = await withRetry('fetch connection string', () => deps.neon.connectionUri(projectId, branchId), idempotent(deps, 5))
       await waitForFirstConnection(deps, uri)
 
       const known = await deps.knownTables()
@@ -1345,9 +1399,7 @@ export async function provision(deps: Deps = defaultDeps()): Promise<void> {
     } catch (error) {
       deps.warn('[neondb-branch] setup failed after the branch was created — deleting it so the next attempt starts clean.')
       try {
-        await withRetry('delete branch after failed setup', () => deps.neon.deleteBranch(projectId, branchId), idempotent(deps, 3))
-        stripEnvVars(envFilePath(), DB_ENV_VARS)
-        clearState()
+        await deleteRecordedBranch(deps, { branchId, branchName, projectId, status: 'pending' }, parent.id)
       } catch (cleanupError) {
         // Cleanup failed: KEEP the recovery state so teardown can still find the branch by id, and
         // say so loudly. Silently dropping the record is how a branch leaks forever.
@@ -1446,25 +1498,8 @@ export async function teardown(deps: Deps = defaultDeps()): Promise<void> {
     }
 
     const branchId = state.branchId as string
-    writeState({ ...state, status: 'deleting' })
-
     deps.log(`[neon] deleting branch ${branchId} (${state.branchName})…`)
-    const outcome = await withRetry('delete branch', () => deps.neon.deleteBranch(projectId, branchId), idempotent(deps, 4))
-    if (outcome === 'absent') deps.log(`[neondb-branch] branch ${branchId} was already gone — treating as torn down.`)
-
-    // Neon deletes are asynchronous, and a lost or delayed response says nothing about whether the
-    // branch is gone: confirm by reading it back, and keep the `deleting` record until it is absent.
-    await withRetry(
-      'confirm branch deletion',
-      async () => {
-        const still = await deps.neon.getBranchById(projectId, branchId)
-        if (still) throw new Error(`branch ${branchId} still present (state: ${still.current_state ?? 'unknown'})`)
-      },
-      idempotent(deps, 5),
-    )
-
-    stripEnvVars(envFilePath(), DB_ENV_VARS)
-    clearState()
+    await deleteRecordedBranch(deps, state)
     releaseLock()
     released = true
     // Only after the lock file itself is gone can the directory be empty. Never recursive: anything
