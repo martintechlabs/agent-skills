@@ -1,272 +1,531 @@
 // scripts/neondb-branch.ts
 //
 // Per-workspace ISOLATED Neon database branch — for any git repo, with no orchestration tool
-// required at this layer. Each workspace gets its own SCHEMA-ONLY Neon branch off the parent
-// (production) branch: full schema + extensions (e.g. PostGIS's spatial_ref_sys data), ZERO
-// production rows, created instantly (Neon copies no data).
+// required at this layer. Each workspace gets its own ORDINARY, FULL-DATA child of the configured
+// production branch, pinned at a captured parent WAL LSN, whose application rows are then purged
+// in a single transaction before the connection URLs are published.
 //
-// provision() is a full, deterministic rebuild — EVERY run, not just the first, deletes whatever
-// branch is currently recorded for this workspace (if any) and creates a fresh one. Any data
-// written into the workspace branch through normal app usage is discarded on every re-run — the
-// branch is disposable by design; there is no "reuse an existing branch" path.
+// WHY AN ORDINARY CHILD, NOT A SCHEMA-ONLY BRANCH
+// Neon schema-only branches are ROOT branches: they have no parent, and `--parent` only names the
+// schema donor. Every schema-only workspace branch therefore burns one of the project's root-branch
+// slots (3 on Free, 5 on Launch, 25 on Scale) and a handful of parallel workspaces is enough to hit
+// ROOT_BRANCHES_LIMIT_EXCEEDED and block all provisioning. An ordinary child consumes no root slot,
+// and — because it inherits the parent's rows — it inherits the ORM's migration ledger as ordinary
+// row data, which removes the whole reason the previous design needed a second, disposable `tmp/*`
+// full-data clone to learn the parent's true applied-migration state.
 //
-// A schema-only branch starts with an EMPTY migrations table (even if the parent's isn't), which
-// would otherwise make the migrator either re-run every migration against tables that already
-// exist (if the parent has real schema) and fail, or silently believe a falsely assumed history is
-// real. So before deploying migrations, provision() learns the parent's TRUE applied-migration set:
-// it clones the parent again — this time WITH data, into a second, equally disposable `tmp/*`
-// branch — reads that clone's real migration-ledger rows (row data is the only source of truth for
-// "what really ran"; a schema-only clone strips it, even for this table), deletes the clone, and
-// seeds the workspace branch's ledger with exactly those rows. The ORM's migrate-deploy then
-// applies whatever's genuinely still missing — correct whether the parent has every migration, none
-// of them, or is only partway caught up.
+// PRIVACY: NOT A BOUNDARY. An ordinary child initially CONTAINS production data, and Neon's history
+// window can retain that data in the branch's own snapshots even after the purge below. This design
+// trades the schema-only privacy property for root-slot correctness. Do NOT treat a workspace branch
+// as a redacted environment, do not "reset from parent" or restore it from production, and never
+// start the app against it before provisioning completes — the purge is the only thing that removes
+// production rows, and `load-env.cjs` refuses to boot until state reaches `ready`.
 //
-// Workspace identity resolves through a precedence chain (see resolveWorkspaceName()):
-// CONDUCTOR_WORKSPACE_NAME > ORCA_WORKSPACE_NAME > WORKSPACE_NAME > worktree-directory basename >
-// current git branch. `sync()` hard-gates unsafe states (never provisioned, setup interrupted, the
-// recorded branch is gone) and, once past those, best-effort RENAMES the live Neon branch when the
-// resolved identity has moved on from what's recorded (e.g. a Conductor/Orca workspace rename) —
-// but refuses (hard gate) if the target name is already a DIFFERENT live branch, since that's two
-// workspaces colliding, not a rename.
+// LIFECYCLE STATE lives in .neondb/state.json (gitignored, credential-free, written atomically):
+//   { "branchId": "br-…", "branchName": "workspace/…", "projectId": "…", "status": "ready" }
+// branchId + projectId are IDENTITY; branchName is a display value only. Nothing is ever looked up,
+// renamed or deleted by name — so a git branch change or a workspace rename never switches which
+// database this workspace owns, and a name freed by one workspace and reused by another can never
+// be mistaken for "our branch, renamed".
 //
-//   provision → `tsx scripts/neondb-branch.ts provision`
-//   sync      → `tsx scripts/neondb-branch.ts sync` (chained in front of the dev server command)
+//   provision → `tsx scripts/neondb-branch.ts provision`   full rebuild; DISCARDS workspace data
+//   sync      → `tsx scripts/neondb-branch.ts sync`        chained in front of the dev server
 //   teardown  → `tsx scripts/neondb-branch.ts teardown`
 //
 // Requires (set in .env.neondb, your shell, or your orchestrator's env config — see SKILL.md):
-//   NEON_API_KEY       – Neon API key (read by neonctl); required by provision AND teardown
-//   NEON_PROJECT_ID    – Neon project to branch within; required by provision AND teardown
-//   NEON_PARENT_BRANCH – REQUIRED by provision (no default); branch to clone, e.g. "production".
-//                        teardown/sync only use it for the production-safety guard, if set.
+//   NEON_API_KEY       – Neon API key; required by provision, sync and teardown
+//   NEON_PROJECT_ID    – Neon project to branch within; same
+//   NEON_PARENT_BRANCH – REQUIRED by provision; the production branch NAME or `br-…` id
+//   NEON_DATABASE_NAME / NEON_ROLE_NAME – optional; only needed when the branch hosts more than
+//                        one database; select the app database explicitly
 //   (seed credentials) – whatever your seed needs; provision-only — see seedWorkspace() below
 //
-// provision() mirrors NEON_API_KEY/NEON_PROJECT_ID/NEON_PARENT_BRANCH into .env.neondb (alongside
-// DATABASE_URL) so sync/teardown are self-sufficient regardless of how they're invoked (a bare
-// terminal, Conductor archive, Orca archive) — see the .env.neondb upsert helpers below.
-//
-// Assumes Neon (Postgres) with migrations managed by EITHER Prisma OR Drizzle (set ORM below),
-// with `neonctl` and `tsx` available as project-local binaries. BOTH ORMs need the project's own
-// Postgres driver wired into execSql() — reading the parent's true migration ledger back needs a
-// real query result, which neither `prisma db execute` nor `drizzle-kit` gives you. Adjust the
-// PORTING KNOBS just below for your project.
-//
-// SAFETY: every destructive op (branch delete/rename) is guarded to only ever run against a
-// disposable `workspace/*` workspace branch or a disposable `tmp/*` check branch — never the
-// parent/production branch. provision() never opens a connection to the parent directly, only to
-// the disposable check branch cloned from it.
+// SAFETY: every destructive control-plane call goes by branch id, and only after the branch has been
+// verified disposable (not default, not primary, not protected, not the parent). The one connection
+// this script opens to the parent is a single read-only `SELECT pg_current_wal_lsn()`.
 
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-import { basename, dirname } from 'node:path'
-import { config as dotenvConfig } from 'dotenv'
+import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, writeFileSync, writeSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
+import { createRequire } from 'node:module'
+import { config as dotenvConfig, parse as parseEnv } from 'dotenv'
+
+const workspaceState = createRequire(import.meta.url)('./workspace-state.cjs')
 
 // ── PORTING KNOBS ────────────────────────────────────────────────────────────
-// Which ORM manages migrations. Switches the ledger table + baseline SQL shape throughout.
+// Which ORM manages migrations. Switches the migration-ledger table that the purge preserves and
+// the migrate-deploy command.
 const ORM: 'prisma' | 'drizzle' = 'prisma'
 
-// How to run a project-local CLI (neonctl/prisma/drizzle-kit/tsx). Match your package manager:
+// How to run a project-local CLI (prisma/drizzle-kit/tsx). Match your package manager:
 //   pnpm → ['pnpm', 'exec']   npm → ['npx']   yarn → ['yarn']
 const PM_EXEC = ['pnpm', 'exec']
+
 // DATABASE_URL lands in its OWN file, not .env, so the project's real .env is never clobbered.
-// NOTHING auto-loads .env.neondb — the run script loads it explicitly with override
-// (dotenv -e .env.neondb -o --; without -o an ambient DATABASE_URL would silently win) and this
-// script passes the DB vars to every child process itself. Anything else that needs the
-// workspace DB (a manual `prisma studio`, an e2e runner) must load it the same way.
+// NOTHING auto-loads .env.neondb — `load-env.cjs` loads it explicitly WITH OVERRIDE (an ambient
+// DATABASE_URL from a shared .env would otherwise silently win) and this script passes the DB vars
+// to every child process itself.
 const ENV_FILE = '.env.neondb'
+
 // EVERY env var that must point at the per-workspace branch. The project's real .env still gets
-// auto-loaded by the ORM CLI/dev server, so any DB URL var it defines that is NOT listed here
-// leaks the shared database into this workspace. If schema.prisma uses
-// `directUrl = env("DIRECT_URL")` or `shadowDatabaseUrl = env(...)`, add those names.
+// auto-loaded by the ORM CLI/dev server, so any DB URL var it defines that is NOT listed here leaks
+// the shared database into this workspace. If schema.prisma uses `directUrl = env("DIRECT_URL")` or
+// `shadowDatabaseUrl = env(…)`, add those names.
 const DB_ENV_VARS = ['DATABASE_URL']
-// ENV_FILE also carries a copy of the Neon control-plane creds (NEON_API_KEY/NEON_PROJECT_ID/
-// NEON_PARENT_BRANCH — see the requireEnv calls in provision()) alongside the DB_ENV_VARS. This
-// lets archive load ENV_FILE itself (see the `archive` line in .conductor/settings.toml) as a
-// fallback that doesn't depend on Conductor's archive-time env injection — see the header
-// comment above for why that fallback exists. Tradeoff accepted deliberately: `run` already loads
-// ENV_FILE into the dev server's own environment too, so these become reachable from the dev
-// server as well, not just from archive — acceptable since Conductor already injects the same
-// NEON_API_KEY into every agent process in this workspace, so this doesn't cross a new trust
-// boundary, only extends an existing one.
-const BRANCH_PREFIX = 'workspace/' // workspace-branch namespace (matches Neon's preview/)
-const CHECK_BRANCH_PREFIX = 'tmp/' // disposable per-run branch used only to read the parent's true migration ledger
-const MAX_SLUG = 48 // Neon-safe branch-name length budget (excluding either prefix)
+
+const BRANCH_PREFIX = 'workspace/' // workspace-branch namespace
+const MAX_SLUG = 48 // Neon-safe branch-name length budget (excluding the prefix)
 const SEED_SCRIPT = 'prisma/seed.ts' // project's seed entrypoint (see seedWorkspace)
 
+// Schemas whose BASE TABLES are application data the purge is allowed to empty. A base table in any
+// other non-system schema that is not extension-owned makes provisioning FAIL CLOSED rather than
+// publish a database this script cannot fully account for.
+const APP_SCHEMAS = ['public']
+
+// Tables the purge must never touch, beyond the migration ledger and extension-owned tables (which
+// are detected automatically). Qualify them: 'public.some_reference_table'.
+const PRESERVED_TABLES: string[] = []
+
 // ── Drizzle-only knob (used when ORM === 'drizzle') ──────────────────────────
-// Where drizzle records applied migrations. Defaults match drizzle-kit; override only if you set
-// a custom migrationsSchema/migrationsTable in drizzle.config. (Prisma's `_prisma_migrations`
-// table name is fixed by Prisma itself — nothing to knob there.)
+// Where drizzle records applied migrations. Defaults match drizzle-kit; override only if you set a
+// custom migrationsSchema/migrationsTable in drizzle.config. (Prisma's `_prisma_migrations` table
+// name and schema are fixed by Prisma itself — nothing to knob there.)
 const DRIZZLE_MIGRATIONS_SCHEMA = 'drizzle'
 const DRIZZLE_MIGRATIONS_TABLE = '__drizzle_migrations'
 
+// A brand-new Neon compute can take a while to accept its FIRST connection. These attempts back off
+// 2s, 4s, 8s, … so the total budget is minutes, not seconds. If you route any provisioning SQL
+// through PrismaClient rather than the raw driver below, ALSO pass an explicit transaction maxWait:
+// `prisma.$transaction(fn, { maxWait: 30_000, timeout: 60_000 })`. Prisma's default maxWait is TWO
+// SECONDS, which a cold compute loses every time.
+export const FIRST_CONNECTION_ATTEMPTS = 8
+
+// If any provisioning or seeding SQL is routed through PrismaClient rather than the raw driver
+// below, pass this explicitly: `prisma.$transaction(fn, { maxWait: PRISMA_TX_MAXWAIT_MS, timeout:
+// 60_000 })`. Prisma's default maxWait is TWO SECONDS, which a cold Neon compute loses every time —
+// the resulting "Unable to start a transaction in the given time" is the single most common
+// first-run failure this skill has seen.
+export const PRISMA_TX_MAXWAIT_MS = 30_000
+
 /**
- * Execute SQL against a Neon branch and return whatever rows it produces. Used both to READ the
- * parent's true applied-migration ledger (via a disposable full-data clone; see
- * seedTrueBaseline) and to WRITE the baseline INSERT built from those rows — required for BOTH
- * ORMs, since reading a ledger back needs a real query result, not just a migration CLI. Wire
- * this to the Postgres driver the project ALREADY depends on; do not add a new one. Pick the
- * matching example, move its import to the top of the file, drop the body's throw:
+ * A single open connection to one Neon branch. `query` returns rows for a SELECT and an empty array
+ * otherwise. It MUST be one dedicated session, not a pool: the purge below issues BEGIN, TRUNCATE
+ * and COMMIT as separate calls, and a pool that hands each of them a different connection would
+ * silently run the TRUNCATE outside the transaction.
+ */
+export interface SqlClient {
+  query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]>
+}
+
+/**
+ * Open a connection to `uri`. Wire this to the Postgres driver the project ALREADY depends on; do
+ * not add a new one. Pick the matching example, move its import to the top of the file, and drop
+ * this body's throw. Note the generous connect timeout in each — a cold compute is the normal case
+ * here, not the exception — and that every example opens ONE session, never a pool.
  *
  *   // pg (node-postgres):
  *   //   import { Client } from 'pg'
- *   //   async function execSql(uri, sql) {
- *   //     const c = new Client({ connectionString: uri }); await c.connect()
- *   //     try { return (await c.query(sql)).rows } finally { await c.end() }
+ *   //   const connect: SqlConnect = async (uri) => {
+ *   //     const c = new Client({ connectionString: uri, connectionTimeoutMillis: 30_000 })
+ *   //     await c.connect()
+ *   //     return { client: { query: async (sql, params) => (await c.query(sql, params)).rows }, end: () => c.end() }
  *   //   }
  *
- *   // postgres (postgres-js):
+ *   // postgres (postgres-js) — `max: 1` keeps BEGIN/TRUNCATE/COMMIT on one connection:
  *   //   import postgres from 'postgres'
- *   //   async function execSql(uri, sql) {
- *   //     const c = postgres(uri); try { return await c.unsafe(sql) } finally { await c.end() }
+ *   //   const connect: SqlConnect = async (uri) => {
+ *   //     const sqlc = postgres(uri, { connect_timeout: 30, max: 1 })
+ *   //     return { client: { query: async (sql, params) => (await sqlc.unsafe(sql, params as never[])) as never }, end: () => sqlc.end() }
  *   //   }
  *
- *   // @neondatabase/serverless (Pool — wire-compatible with node-postgres):
- *   //   import { Pool } from '@neondatabase/serverless'
- *   //   async function execSql(uri, sql) {
- *   //     const p = new Pool({ connectionString: uri })
- *   //     try { return (await p.query(sql)).rows } finally { await p.end() }
+ *   // @neondatabase/serverless (Client, NOT Pool — a Pool would spread the transaction):
+ *   //   import { Client } from '@neondatabase/serverless'
+ *   //   const connect: SqlConnect = async (uri) => {
+ *   //     const c = new Client({ connectionString: uri, connectionTimeoutMillis: 30_000 })
+ *   //     await c.connect()
+ *   //     return { client: { query: async (sql, params) => (await c.query(sql, params)).rows }, end: () => c.end() }
  *   //   }
- *
- * Left unconfigured it raises a clear error rather than inventing a driver dependency.
  */
-async function execSql<T = Record<string, unknown>>(_uri: string, _sql: string): Promise<T[]> {
-  // FatalError so the retry wrapper surfaces this misconfiguration immediately instead of
-  // burning a minute of backoff on an error no retry can fix.
+export type SqlConnect = (uri: string) => Promise<{ client: SqlClient; end: () => Promise<void> }>
+
+const connect: SqlConnect = async (_uri) => {
+  // FatalError so withRetry surfaces this misconfiguration immediately instead of burning minutes
+  // of backoff on an error no retry can fix.
   throw new FatalError(
-    'execSql() is not configured. Wire it to the project\'s Postgres driver (pg / postgres / ' +
-      '@neondatabase/serverless) — see the example in the PORTING KNOBS block. Required for both ' +
-      'Prisma and Drizzle projects: reading back the true migration ledger needs a real query ' +
-      'result, not just a migration CLI.',
+    'connect() is not configured. Wire it to the project\'s Postgres driver (pg / postgres / ' +
+      '@neondatabase/serverless) — see the examples in the PORTING KNOBS block. Required: purging ' +
+      'the inherited production rows needs real query results, not just a migration CLI.',
   )
 }
 
 /**
- * The parent's true applied-migration set for Drizzle, read from a full-data clone of it (never
- * from the parent directly — see seedTrueBaseline). Row data — not schema — is the only source
- * of truth for "what really ran": a schema-only clone strips row data, even for this table
- * itself. A missing table (Postgres error code 42P01 — the parent has never had any migration
- * applied) is not an error: it means the true set is empty.
+ * Every base table this checkout knows about, as `schema.table`. Anything else found in APP_SCHEMAS
+ * that is neither the migration ledger nor extension-owned makes provisioning fail closed.
+ *
+ * ── ADAPT THIS to your project ────────────────────────────────────────────────
+ *  • Prisma — derive it from the generated client's DMMF so it can never drift from the schema:
+ *      import { Prisma } from '@prisma/client'
+ *      const knownApplicationTables = async () => prismaKnownTables(Prisma.dmmf.datamodel)
+ *    `prismaKnownTables` (exported below) includes implicit many-to-many join tables, which the
+ *    model list alone omits — miss those and every project using an implicit m2m relation fails
+ *    closed on its own join table.
+ *  • Drizzle — derive it from the schema module:
+ *      import * as schema from './src/db/schema'
+ *      import { getTableConfig, isPgTable } from 'drizzle-orm/pg-core'
+ *      const knownApplicationTables = async () =>
+ *        Object.values(schema).filter(isPgTable).map((t) => {
+ *          const c = getTableConfig(t)
+ *          return `${c.schema ?? 'public'}.${c.name}`
+ *        })
  */
-async function readTrueDrizzleLedger(uri: string): Promise<Array<{ hash: string; created_at: string | number }>> {
-  try {
-    return await execSql<{ hash: string; created_at: string | number }>(
-      uri,
-      `SELECT hash, created_at FROM "${DRIZZLE_MIGRATIONS_SCHEMA}"."${DRIZZLE_MIGRATIONS_TABLE}" ORDER BY created_at`,
-    )
-  } catch (error) {
-    if ((error as { code?: string }).code === '42P01') return []
-    throw error
-  }
+const knownApplicationTables: () => Promise<string[]> = async () => {
+  throw new FatalError(
+    'knownApplicationTables() is not configured. Point it at your ORM\'s model list — see the ' +
+      'example in the PORTING KNOBS block. The purge refuses to run without a known-table set, ' +
+      'because it cannot otherwise tell an application table from something it must not empty.',
+  )
 }
 
 /**
- * The parent's true applied-migration set for Prisma, read the same way. Only rows Prisma itself
- * considers genuinely applied — `finished_at` set, never rolled back — count, mirroring what
- * `prisma migrate status` uses, so a partially-applied or rolled-back migration on the parent
- * isn't falsely baselined as done.
+ * The table names Prisma actually creates for a datamodel: one per model (honouring `@@map`) plus
+ * one per IMPLICIT many-to-many relation, which Prisma materializes as `_<RelationName>` and does
+ * not list as a model. Pure, so it is unit-tested directly.
  */
-async function readTruePrismaLedger(uri: string): Promise<Array<{ checksum: string; migration_name: string }>> {
-  try {
-    return await execSql<{ checksum: string; migration_name: string }>(
-      uri,
-      'SELECT checksum, migration_name FROM "_prisma_migrations" ' +
-        'WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL ORDER BY started_at',
-    )
-  } catch (error) {
-    if ((error as { code?: string }).code === '42P01') return []
-    throw error
+export function prismaKnownTables(datamodel: {
+  models: Array<{ name: string; dbName?: string | null; schema?: string | null; fields: Array<{ isList?: boolean; relationName?: string; kind?: string }> }>
+}): string[] {
+  const tables = new Set<string>()
+  const listRelations = new Map<string, Array<{ name: string; schema: string }>>()
+  for (const model of datamodel.models) {
+    const schema = model.schema || APP_SCHEMAS[0]
+    tables.add(`${schema}.${model.dbName || model.name}`)
+    for (const field of model.fields) {
+      if (field.kind === 'object' && field.relationName && field.isList) {
+        const sides = listRelations.get(field.relationName) ?? []
+        sides.push({ name: model.name, schema })
+        listRelations.set(field.relationName, sides)
+      }
+    }
   }
+  // A relation whose BOTH sides are lists is many-to-many. When it is implicit, Prisma owns a join
+  // table named `_<relationName>`; when it is explicit, that join table is already a model above and
+  // the extra name is simply absent from the database — harmless, since known-but-absent tables are
+  // expected (the parent can legitimately be behind this checkout).
+  for (const [relationName, sides] of listRelations) {
+    if (sides.length >= 2) {
+      sides.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+      tables.add(`${sides[0].schema}._${relationName}`)
+    }
+  }
+  return [...tables]
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Where provision() records the branch it used. Resolved at call time so tests can point it at a
- * sandbox via NEONDB_BRANCH_STATE_FILE (test-only override — never set it in Conductor).
- */
-function stateFilePath(): string {
-  return process.env.NEONDB_BRANCH_STATE_FILE ?? '.neondb/branch'
+/** The qualified migration-ledger table the purge always preserves. */
+export function migrationLedgerTable(): string {
+  return ORM === 'prisma' ? 'public._prisma_migrations' : `${DRIZZLE_MIGRATIONS_SCHEMA}.${DRIZZLE_MIGRATIONS_TABLE}`
 }
 
-/** Where main() loads .env.neondb from. Test-only override via NEONDB_BRANCH_ENV_FILE — never set this in a real workspace. */
-function envFilePath(): string {
-  return process.env.NEONDB_BRANCH_ENV_FILE ?? ENV_FILE
-}
+// ── Errors ───────────────────────────────────────────────────────────────────
+
+/** An error retrying can never fix (misconfiguration, an impossible precondition). */
+export class FatalError extends Error {}
 
 /**
- * Load .env.neondb into process.env, never overriding an already-set var. Exported (and factored
- * out of main()) so tests can exercise the loading behavior directly without invoking the CLI
- * dispatch.
+ * A Neon control-plane call that failed. `ambiguous` means the request may or may not have been
+ * applied — a reset connection, a response timeout, a 5xx. For a POST that creates a branch, an
+ * ambiguous failure must NEVER be retried and must never be resolved by looking the name up: that
+ * is exactly how a branch belonging to someone else gets adopted or deleted.
  */
-export function loadEnvFile(): void {
-  dotenvConfig({ path: envFilePath() })
+export class NeonRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number | null,
+    readonly ambiguous: boolean,
+  ) {
+    super(message)
+  }
+
+  /**
+   * Whether re-sending could plausibly succeed. A 4xx other than 429 is Neon rejecting the request
+   * outright — ROOT_BRANCHES_LIMIT_EXCEEDED arrives this way — and retrying it just burns backoff on
+   * a verdict that will not change. 429 IS retryable and is NOT ambiguous: a rate-limited request
+   * was refused before it was processed, so it cannot have been half-applied.
+   */
+  get retryable(): boolean {
+    if (this.status === null) return true // a network-layer failure; ambiguity is tracked separately
+    return this.status >= 500 || this.status === 429
+  }
 }
 
-/** The child-process environment with every DB var pinned to the workspace branch. */
-function childDbEnv(uri: string): NodeJS.ProcessEnv {
-  return { ...process.env, ...Object.fromEntries(DB_ENV_VARS.map((name) => [name, uri])) }
+/** Creation intent that could not be resolved. Leaves `.neondb/state.json` at `creating`. */
+export class AmbiguousCreateError extends Error {}
+
+// ── State file ───────────────────────────────────────────────────────────────
+
+export type LifecycleStatus = 'creating' | 'pending' | 'ready' | 'deleting'
+
+export interface WorkspaceState {
+  branchId: string | null
+  branchName: string
+  projectId: string
+  status: LifecycleStatus
 }
+
+/** The workspace's state directory. NEONDB_STATE_DIR is a TEST-ONLY override — never set it for real. */
+export function stateDir(): string {
+  return process.env.NEONDB_STATE_DIR ?? '.neondb'
+}
+export function stateFilePath(): string {
+  return join(stateDir(), 'state.json')
+}
+function lockFilePath(): string {
+  return join(stateDir(), 'lock')
+}
+/** The two files the previous design used. Detected and rejected — never interpreted. */
+function legacyStateFiles(): { branch: string; check: string } {
+  return { branch: join(stateDir(), 'branch'), check: join(stateDir(), 'branch-check') }
+}
+
+function fileExists(path: string): boolean {
+  try {
+    readFileSync(path)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
+}
+
+/**
+ * Refuse to run while a record from the pre-0.2 format is present.
+ *
+ * There is no conversion path — this skill targets fresh installs, and a branch NAME cannot prove
+ * which branch a workspace owns, so adopting one automatically is exactly the ownership mistake the
+ * rest of this file exists to avoid. The guard remains because the alternative is worse than an
+ * error: with these files silently ignored, provisioning would create a second branch alongside the
+ * old one and teardown would report "nothing to tear down", leaking a live branch (and, for
+ * `.neondb/branch`, a root-branch slot) that nothing tracks any more.
+ */
+export function assertNoLegacyState(): void {
+  const { branch, check } = legacyStateFiles()
+  if (fileExists(branch)) {
+    throw new FatalError(
+      `Found ${branch}, a workspace record from before .neondb/state.json. This version does not ` +
+        'read it — a branch name is not proof of ownership. Clean up by hand (see "Fresh installs ' +
+        `only" in SKILL.md): delete the branch it names from the Neon console — it is a schema-only ` +
+        `root branch, so this frees a root-branch slot — then \`rm -rf ${stateDir()}\` and run ` +
+        'provision for a fresh workspace database.',
+    )
+  }
+  if (fileExists(check)) {
+    throw new FatalError(
+      `Found ${check}, which names a leaked disposable clone of production left by an interrupted ` +
+        'run of an earlier version. Delete the branch it names from the Neon console, then ' +
+        `\`rm -rf ${stateDir()}\` — see "Fresh installs only" in SKILL.md.`,
+    )
+  }
+}
+
+/**
+ * Parse and validate state-file contents. Strict on purpose: exactly the four documented keys, a
+ * known status, and a branchId that is null if and only if the status is `creating`. Anything else
+ * is a corrupted or foreign file, and interpreting it loosely is how the wrong database gets
+ * published or the wrong branch gets deleted.
+ */
+export function parseState(raw: string): WorkspaceState {
+  try { return workspaceState.parseState(raw, stateFilePath()) as WorkspaceState }
+  catch (error) { throw new FatalError((error as Error).message) }
+}
+
+interface OwnershipReceipt {
+  branchId: string
+  projectId: string
+  parentId: string
+  parentLsn: string
+  databaseTarget: string | null
+}
+
+function readOwnership(state: WorkspaceState): OwnershipReceipt {
+  try { return workspaceState.readOwnership(state) as OwnershipReceipt }
+  catch (error) { throw new FatalError((error as Error).message) }
+}
+
+function writeOwnership(receipt: OwnershipReceipt): void {
+  const file = workspaceState.ownershipFilePath() as string
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(`${file}.tmp`, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 })
+  renameSync(`${file}.tmp`, file)
+}
+
+/** Read state, or null when no state file exists. Rejects the legacy format before anything else. */
+export function readState(): WorkspaceState | null {
+  assertNoLegacyState()
+  let raw: string
+  try {
+    raw = readFileSync(stateFilePath(), 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  }
+  return parseState(raw)
+}
+
+/** Write state atomically (temp file + rename), so a crash mid-write can never leave a partial file. */
+export function writeState(state: WorkspaceState): void {
+  parseState(JSON.stringify(state)) // never persist something the reader would reject
+  mkdirSync(stateDir(), { recursive: true })
+  const file = stateFilePath()
+  const tmp = `${file}.tmp`
+  writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 })
+  renameSync(tmp, file)
+}
+
+export function clearState(): void {
+  rmSync(stateFilePath(), { force: true })
+  rmSync(workspaceState.ownershipFilePath(), { force: true })
+}
+
+/**
+ * Refuse to touch Neon when the recorded project is not the configured one — checked BEFORE any API
+ * call, so a state file copied between checkouts pointed at different projects can never make this
+ * script look a branch up, let alone delete one, in the wrong project.
+ */
+export function assertProjectMatches(state: WorkspaceState, projectId: string): void {
+  if (state.projectId !== projectId) {
+    throw new FatalError(
+      `${stateFilePath()} records project "${state.projectId}" but NEON_PROJECT_ID is "${projectId}". ` +
+        'Refusing to contact Neon. Point NEON_PROJECT_ID at the recorded project, or tear this ' +
+        'workspace down from the checkout that owns it.',
+    )
+  }
+}
+
+/**
+ * Remove the state directory only when it is empty — never recursively. Anything else a project
+ * chose to keep in .neondb/ is not this script's to delete.
+ */
+export function removeStateDirIfEmpty(): boolean {
+  try {
+    if (readdirSync(stateDir()).length > 0) return false
+    rmdirSync(stateDir())
+    return true
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'ENOTEMPTY') return false
+    throw error
+  }
+}
+
+// ── Lifecycle lock ───────────────────────────────────────────────────────────
+
+/**
+ * Serialize provision/sync/teardown against each other. Exclusive create ('wx') is the whole
+ * mechanism; the PID inside exists only so a lock left behind by a killed process can be reclaimed
+ * instead of bricking the workspace forever.
+ */
+export function acquireLock(label: string, isAlive: (pid: number) => boolean = defaultIsAlive): () => void {
+  mkdirSync(stateDir(), { recursive: true })
+  const file = lockFilePath()
+  // All contenders must hold this guard while inspecting/reclaiming the lifecycle lock. Otherwise
+  // two readers of a dead PID can each unlink the other's newly acquired lock. A crashed guard is
+  // deliberately not reclaimed automatically: that would just recreate the same race one level up.
+  const guard = `${file}-guard`
+  let guardFd: number
+  try {
+    guardFd = openSync(guard, 'wx', 0o600)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    throw new FatalError(`Another command is acquiring ${file}. Retry when it finishes. If ${guard} remains after all commands stop, inspect and remove that stale guard manually.`)
+  }
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const fd = openSync(file, 'wx', 0o600)
+        writeSync(fd, `${JSON.stringify({ pid: process.pid, label, at: new Date().toISOString() })}\n`)
+        closeSync(fd)
+        return () => rmSync(file, { force: true })
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+        const holder = readLockHolder(file)
+        if (holder === null) {
+          throw new FatalError(`Cannot prove the holder of ${file} is dead. Stop all neondb-branch commands, inspect the lock, then remove it manually if stale.`)
+        }
+        if (isAlive(holder.pid)) {
+          throw new FatalError(
+            `Another neondb-branch command (${holder.label}, pid ${holder.pid}) is running for this ` +
+              `workspace. Wait for it to finish, or remove ${file} if you are certain it is stale.`,
+          )
+        }
+        rmSync(file, { force: true }) // the recorded process is provably gone; guard excludes other reclaimers
+      }
+    }
+    throw new FatalError(`Could not acquire ${file}.`)
+  } finally {
+    closeSync(guardFd)
+    rmSync(guard, { force: true })
+  }
+}
+
+function readLockHolder(file: string): { pid: number; label: string } | null {
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as { pid?: unknown; label?: unknown }
+    if (typeof parsed.pid !== 'number' || !Number.isSafeInteger(parsed.pid) || parsed.pid <= 0) return null
+    return { pid: parsed.pid, label: typeof parsed.label === 'string' ? parsed.label : 'unknown' }
+  } catch {
+    return null
+  }
+}
+
+function defaultIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH' // only ESRCH proves the process is gone
+  }
+}
+
+// ── Workspace identity ───────────────────────────────────────────────────────
 
 function requireEnv(name: string): string {
   const value = process.env[name]
   if (!value) {
-    throw new Error(
-      `${name} is required for the per-workspace Neon branch. Set it in .env.neondb, your shell ` +
+    throw new FatalError(
+      `${name} is required for the per-workspace Neon branch. Set it in ${ENV_FILE}, your shell ` +
         `environment, or your orchestrator's environment config (e.g. Conductor's Environment tabs).`,
     )
   }
   return value
 }
 
-/**
- * What identifies "this workspace" — before slugify, before any Neon prefix. See
- * resolveWorkspaceName() for the precedence chain; this is only the pure slug/truncation logic
- * shared by workspaceBranchName() and checkBranchName().
- */
 function slugify(raw: string): string {
   const slug = raw
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
-  if (!slug) {
-    throw new Error(`Could not derive a branch name from workspace identity "${raw}".`)
-  }
+  if (!slug) throw new FatalError(`Could not derive a branch name from workspace identity "${raw}".`)
   return slug
 }
 
 /**
- * Shared by workspaceBranchName() and checkBranchName() — same slug/truncation/collision-hash
- * logic under a different disposable-branch prefix, given an already-resolved raw identity.
+ * Stable, Neon-safe branch name for a resolved workspace identity. Unchanged from the previous
+ * design on purpose — existing workspaces keep the names they already have. This is a DISPLAY name:
+ * nothing is looked up, renamed or deleted by it.
  */
-function branchNameWithPrefix(prefix: string, raw: string): string {
+export function workspaceBranchName(raw: string): string {
   let slug = slugify(raw)
   if (slug.length > MAX_SLUG) {
-    // Truncate, but keep distinct workspaces distinct: append a short hash of the FULL name so
-    // two long names that share a prefix don't collide onto the same branch (which would break
-    // isolation and let one workspace's teardown delete another's branch). Re-trim any separator
-    // the cut left dangling so the name never ends in "-".
+    // Truncate, but keep distinct workspaces distinct: append a short hash of the FULL name so two
+    // long names sharing a prefix don't collide onto one branch. Re-trim any separator the cut left
+    // dangling so the name never ends in "-".
     const suffix = createHash('sha256').update(raw).digest('hex').slice(0, 8)
     slug = `${slug.slice(0, MAX_SLUG - suffix.length - 1).replace(/-+$/, '')}-${suffix}`
   }
-  return `${prefix}${slug}`
+  return `${BRANCH_PREFIX}${slug}`
 }
 
-/** Stable, Neon-safe branch name derived from an already-resolved raw workspace identity. */
-export function workspaceBranchName(raw: string): string {
-  return branchNameWithPrefix(BRANCH_PREFIX, raw)
-}
-
-/**
- * The disposable branch used once per provision() run to learn the parent's true
- * applied-migration state (see seedTrueBaseline). Same derivation as workspaceBranchName(),
- * under CHECK_BRANCH_PREFIX — deterministic, not random, so a leftover from a killed run is found
- * by name and replaced rather than accumulating orphans.
- */
-export function checkBranchName(raw: string): string {
-  return branchNameWithPrefix(CHECK_BRANCH_PREFIX, raw)
-}
-
-/** What resolveWorkspaceName() needs to know about the current checkout, gathered by the caller. */
 export interface GitContext {
   /** true when this checkout is a linked git worktree (not the main/primary checkout) */
   isSecondaryWorktree: boolean
@@ -276,24 +535,20 @@ export interface GitContext {
 
 /**
  * Workspace identity, before slugify. First match wins:
- *   1. CONDUCTOR_WORKSPACE_NAME — Conductor injects this per workspace.
- *   2. ORCA_WORKSPACE_NAME — Orca's own identity, when the project/tool sets it.
- *   3. WORKSPACE_NAME — general ambient override for custom tools, tests, or a project that
- *      exports one name for every tool. Only read from process env — NEVER from .env.neondb,
- *      which can be copied across workspaces and would collide them onto the same Neon branch.
- *   4. basename(cwd) for a secondary git worktree with none of the above set — each worktree is
- *      its own directory, so this is stable across a `git checkout` inside it.
- *   5. The current git branch, for a plain single-clone checkout with none of the above set —
- *      here "the workspace" genuinely IS the branch, so switching branches IS switching identity.
- * Throws when nothing resolves (detached HEAD / not a git repo, and no env var set) — there is no
- * derivable identity in that case.
+ *   1. CONDUCTOR_WORKSPACE_NAME  2. ORCA_WORKSPACE_NAME  3. WORKSPACE_NAME
+ *   4. basename(cwd) for a secondary git worktree  5. the current git branch
+ * WORKSPACE_NAME is only ever read from process env, NEVER from .env.neondb — that file can be
+ * copied across workspaces.
+ *
+ * Identity decides what a NEW branch is called. It never decides which branch this workspace owns:
+ * that comes from .neondb/state.json's branchId alone.
  */
 export function resolveWorkspaceName(env: NodeJS.ProcessEnv, cwd: string, git: GitContext): string {
   const fromEnv = env.CONDUCTOR_WORKSPACE_NAME || env.ORCA_WORKSPACE_NAME || env.WORKSPACE_NAME
   if (fromEnv) return fromEnv
   if (git.isSecondaryWorktree) return basename(cwd)
   if (git.branch) return git.branch
-  throw new Error(
+  throw new FatalError(
     'Could not determine workspace identity: no CONDUCTOR_WORKSPACE_NAME / ORCA_WORKSPACE_NAME / ' +
       'WORKSPACE_NAME is set, this checkout is not a secondary git worktree, and there is no usable ' +
       'git branch (detached HEAD, or not a git repository). Check out a named branch, or set ' +
@@ -301,7 +556,6 @@ export function resolveWorkspaceName(env: NodeJS.ProcessEnv, cwd: string, git: G
   )
 }
 
-/** Impure glue for resolveWorkspaceName()'s `git` parameter — not itself unit-tested; exercised via references/verify.md. */
 function currentGitContext(cwd: string): GitContext {
   let gitDir: string
   try {
@@ -320,262 +574,480 @@ function currentGitContext(cwd: string): GitContext {
   return { isSecondaryWorktree, branch }
 }
 
-/**
- * Persist the exact branch name provision() used. Reading this back in teardown() (instead of
- * re-deriving via workspaceBranchName()) makes teardown immune to a workspace rename changing
- * CONDUCTOR_WORKSPACE_NAME between provision and archive.
- *
- * The optional second line is a setup-phase marker: 'pending' means the branch was created but
- * baseline+seed have not completed (a crash in that window is the ONLY way a half-set-up branch
- * can survive, since caught failures self-destruct the branch). This does not gate WHETHER
- * provision() rebuilds — it always does — it exists so sync()'s hard gate (setupIsPending()) can
- * refuse to start the dev server against a branch caught mid-rebuild. A file without a marker —
- * e.g. written by an earlier version of this script — is treated as 'ready', so an upgrade
- * doesn't spuriously block sync() on a workspace that finished setup under the old format.
- */
-export function writeBranchState(branchName: string, phase: 'pending' | 'ready' = 'ready'): void {
-  const file = stateFilePath()
-  mkdirSync(dirname(file), { recursive: true })
-  // Write-then-rename so a crash mid-write can't leave a truncated/garbage state file.
-  const tmp = `${file}.tmp`
-  writeFileSync(tmp, `${branchName}\n${phase}\n`, { mode: 0o600 })
-  renameSync(tmp, file)
-}
-
-/** Single reader for the state file; the exported helpers below are thin views over it. */
-export function readBranchStateFull(): { branch: string; phase: 'pending' | 'ready' } | null {
-  try {
-    const lines = readFileSync(stateFilePath(), 'utf8').split('\n')
-    const branch = lines[0].trim()
-    if (!branch) return null
-    return { branch, phase: lines[1]?.trim() === 'pending' ? 'pending' : 'ready' }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-    throw error
-  }
-}
-
-/** The branch name provision() recorded, or null if absent — e.g. a workspace provisioned before this file existed, in which case the caller should fall back to re-deriving it. */
-export function readBranchState(): string | null {
-  return readBranchStateFull()?.branch ?? null
-}
-
-/** Whether the recorded branch was created but never finished baseline+seed (see writeBranchState). */
-export function setupIsPending(): boolean {
-  return readBranchStateFull()?.phase === 'pending'
-}
-
-/** Sibling of the workspace-branch state file, for the disposable check branch instead. */
-function checkBranchStateFilePath(): string {
-  return `${stateFilePath()}-check`
-}
-
-/**
- * Persist the check branch's exact name for its lifetime — written BEFORE it's created, cleared
- * AFTER it's successfully deleted. Mirrors why writeBranchState() persists the workspace branch's
- * name: without this, a leaked check branch (created but never cleaned up, e.g. by a kill) can
- * only ever be found by re-deriving checkBranchName() from the CURRENT CONDUCTOR_WORKSPACE_NAME —
- * which misses it entirely if the workspace is renamed before the next provision()/teardown()
- * call, since a renamed workspace derives a different name.
- */
-export function writeCheckBranchState(branchName: string): void {
-  const file = checkBranchStateFilePath()
-  mkdirSync(dirname(file), { recursive: true })
-  const tmp = `${file}.tmp`
-  writeFileSync(tmp, `${branchName}\n`, { mode: 0o600 })
-  renameSync(tmp, file)
-}
-
-/** The check branch name a previous run persisted, or null if none is recorded. */
-export function readCheckBranchState(): string | null {
-  try {
-    const name = readFileSync(checkBranchStateFilePath(), 'utf8').trim()
-    return name || null
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-    throw error
-  }
-}
-
-/** Clear the persisted check branch record — call once it's confirmed deleted (or absent). */
-export function clearCheckBranchState(): void {
-  rmSync(checkBranchStateFilePath(), { force: true })
-}
-
-/**
- * Hard safety guard. Destructive operations (deleting or renaming a branch) must only ever
- * target a disposable per-workspace `workspace/*` branch or a disposable `tmp/*` check branch —
- * never the parent (production). Throws otherwise.
- */
-export function assertDisposableChildBranch(branchName: string, parentBranch: string): void {
-  if (!branchName.startsWith(BRANCH_PREFIX) && !branchName.startsWith(CHECK_BRANCH_PREFIX)) {
-    throw new Error(
-      `Refusing destructive op on "${branchName}": not a "${BRANCH_PREFIX}" workspace branch ` +
-        `or a "${CHECK_BRANCH_PREFIX}" check branch.`,
-    )
-  }
-  if (parentBranch && branchName === parentBranch) {
-    throw new Error(`Refusing destructive op on "${branchName}": it is the parent branch.`)
-  }
-}
-
-/**
- * Stricter than assertDisposableChildBranch: a check-branch reference must be tmp/*-prefixed
- * specifically — never workspace/* (a workspace branch name), even though that alone would
- * satisfy the generic guard above. Without this, a corrupted or hand-edited
- * .neondb/branch-check record that happens to hold a workspace/*-prefixed value (e.g. this
- * workspace's own branch name) would be accepted as a "valid" check branch and deleted by
- * check-branch cleanup logic — which runs independently of, and potentially before, the actual
- * workspace branch's own guarded delete path.
- */
-export function assertDisposableCheckBranch(branchName: string, parentBranch: string): void {
-  if (!branchName.startsWith(CHECK_BRANCH_PREFIX)) {
-    throw new Error(`Refusing destructive op on "${branchName}": not a "${CHECK_BRANCH_PREFIX}" check branch.`)
-  }
-  assertDisposableChildBranch(branchName, parentBranch)
-}
-
-/** Run a project-local CLI. Captures stdout by default; `inherit` streams output to the user. */
-function pmExec(bin: string, args: string[], opts: { inherit?: boolean } = {}): string {
-  const result = execFileSync(PM_EXEC[0], [...PM_EXEC.slice(1), bin, ...args], {
-    encoding: 'utf8',
-    env: process.env,
-    // Big enough that a large project's `branches list --output json` can't hit the 1 MiB
-    // default and make an existing branch look absent via a spawn failure.
-    maxBuffer: 64 * 1024 * 1024,
-    ...(opts.inherit ? { stdio: 'inherit' as const } : {}),
-  })
-  return result ?? ''
-}
-
-/** Run neonctl (it reads NEON_API_KEY from the environment) and return stdout. Throws on error. */
-function neon(args: string[], opts: { inherit?: boolean } = {}): string {
-  return pmExec('neonctl', args, opts)
-}
-
-/**
- * Whether the workspace branch already exists. Uses `branches list` (which throws on any neonctl
- * failure) so a transient error is NOT silently misread as "branch absent" — that would
- * spuriously trigger a create that then fails "branch already exists".
- */
-function branchExists(projectId: string, branchName: string): boolean {
-  const parsed = JSON.parse(neon(['branches', 'list', '--project-id', projectId, '--output', 'json'])) as
-    | Array<{ name?: string }>
-    | { branches?: Array<{ name?: string }> }
-  const branches = Array.isArray(parsed) ? parsed : parsed?.branches
-  if (!Array.isArray(branches)) {
-    // An unrecognized shape must THROW, not read as "absent" — misreading a live branch as
-    // absent would make teardown skip it (leak) or provision try to re-create it.
-    throw new Error('Unexpected `neonctl branches list --output json` output shape; cannot determine branch existence.')
-  }
-  return branches.some((b) => b.name === branchName)
-}
-
-function getConnectionString(projectId: string, branchName: string): string {
-  const uri = neon(['connection-string', branchName, '--project-id', projectId]).trim()
-  if (!uri.startsWith('postgres')) {
-    throw new Error(`neonctl did not return a postgres connection string (got ${uri.length} chars).`)
-  }
-  return uri
-}
+// ── Retry ────────────────────────────────────────────────────────────────────
 
 /** Block for ms without a timer — this is a synchronous one-shot CLI script. */
 function sleepMs(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
 }
 
-/** Retry backoff: grows each attempt (2s, 4s, 8s, …) so a slow compute boot gets more time
- * without making genuine failures wait as long up front. */
-function backoffMs(attempt: number): number {
+/** Backoff grows each attempt (2s, 4s, 8s, …) so a slow compute boot gets more time. */
+export function backoffMs(attempt: number): number {
   return 2000 * 2 ** (attempt - 1)
 }
 
-/**
- * An error retrying can never fix (misconfiguration, an impossible precondition). withRetry
- * rethrows it immediately instead of burning backoff sleeps on it.
- */
-export class FatalError extends Error {}
+export interface RetryOptions {
+  attempts?: number
+  sleep?: (ms: number) => void
+  log?: (message: string) => void
+  /**
+   * Whether an ambiguous control-plane failure (reset socket, response timeout, 5xx) may be retried.
+   * True only for operations that are safe to apply twice — reads, and deletes, whose second attempt
+   * is at worst a 404. NEVER true for branch creation: re-sending a POST whose outcome is unknown is
+   * exactly the blind-retry behaviour this design forbids.
+   */
+  retryAmbiguous?: boolean
+}
 
 /**
- * Retry an operation (sync or async) with the exponential backoff above. Used around the Neon
- * API steps of provisioning (branch create/rename, connection-string fetch, execSql) — a branch
- * whose compute is still booting can transiently refuse all of them. A FatalError is never
- * retried. `sleep` is injectable for tests only.
+ * Retry an operation with exponential backoff. A FatalError is never retried; an ambiguous
+ * NeonRequestError is retried only when the caller says the operation is idempotent.
  */
-export async function withRetry<T>(
-  label: string,
-  fn: () => T | Promise<T>,
-  attempts = 6,
-  sleep: (ms: number) => void = sleepMs,
-): Promise<T> {
+export async function withRetry<T>(label: string, fn: () => T | Promise<T>, options: RetryOptions = {}): Promise<T> {
+  const { attempts = 6, sleep = sleepMs, log = console.log, retryAmbiguous = false } = options
   for (let attempt = 1; ; attempt++) {
     try {
       return await fn()
     } catch (error) {
-      if (error instanceof FatalError || attempt >= attempts) throw error
+      const neonError = error instanceof NeonRequestError ? error : null
+      const unretryable =
+        error instanceof FatalError ||
+        error instanceof AmbiguousCreateError ||
+        (neonError !== null && (!neonError.retryable || (neonError.ambiguous && !retryAmbiguous)))
+      if (unretryable || attempt >= attempts) throw error
       const waitMs = backoffMs(attempt)
-      console.log(`[retry] ${label}: attempt ${attempt} failed; waiting ${waitMs / 1000}s before retry…`)
+      log(`[retry] ${label}: attempt ${attempt} failed; waiting ${waitMs / 1000}s before retry…`)
       sleep(waitMs)
     }
   }
 }
 
+// ── Neon control plane ───────────────────────────────────────────────────────
+
+export interface NeonBranch {
+  id: string
+  project_id: string
+  name: string
+  parent_id?: string | null
+  parent_lsn?: string | null
+  default?: boolean
+  primary?: boolean
+  protected?: boolean
+  current_state?: string
+  init_source?: string
+}
+
+export interface CreatedBranch {
+  branch: NeonBranch
+  connectionUri: string | null
+}
+
+export interface NeonClient {
+  findBranchByName(projectId: string, name: string): Promise<NeonBranch | null>
+  /** null when Neon reports the branch does not exist (404). */
+  getBranchById(projectId: string, branchId: string): Promise<NeonBranch | null>
+  createBranch(projectId: string, opts: { name: string; parentId: string; parentLsn: string }): Promise<CreatedBranch>
+  /** 'absent' when the branch was already gone. */
+  deleteBranch(projectId: string, branchId: string): Promise<'deleted' | 'absent'>
+  connectionUri(projectId: string, branchId: string): Promise<string>
+}
+
+const NEON_API_BASE = process.env.NEON_API_BASE ?? 'https://console.neon.tech/api/v2'
+
 /**
- * Rename a workspace branch, idempotently under retry: an attempt that "failed" after actually
- * renaming (e.g. a timeout on the response) is detected as already-done on the next attempt.
- * Callers decide how loud a final failure is (provision throws, sync warns).
+ * Network failures we can prove happened BEFORE the request reached Neon. Only these are safe to
+ * retry on a POST; everything else (a reset socket, a response timeout, a 5xx) may have been applied
+ * server-side and is reported as ambiguous.
  */
-async function renameBranch(projectId: string, from: string, to: string): Promise<void> {
-  // The existence checks run INSIDE the retry (a transient list failure must not abort the
-  // rename), but conditions retrying can never fix are FatalError — surfaced immediately.
-  await withRetry('rename branch', () => {
-    const fromExists = branchExists(projectId, from)
-    const toExists = branchExists(projectId, to)
-    if (fromExists && toExists) {
-      throw new FatalError(
-        `Cannot rename branch "${from}" → "${to}": both already exist in project ${projectId}. ` +
-          `"${to}" is likely a leftover from an earlier workspace — delete or rename it in the ` +
-          `Neon console (neonctl branches list --project-id ${projectId}), then retry.`,
+const PRE_REQUEST_ERROR_CODES = new Set(['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'UND_ERR_CONNECT_TIMEOUT'])
+
+function errorCodeChain(error: unknown): string[] {
+  const codes: string[] = []
+  let current: unknown = error
+  for (let depth = 0; current && depth < 5; depth++) {
+    const code = (current as { code?: unknown }).code
+    if (typeof code === 'string') codes.push(code)
+    current = (current as { cause?: unknown }).cause
+  }
+  return codes
+}
+
+/** The real Neon REST client. `neonctl` is deliberately not used: its `branches create --parent`
+ * takes a name OR an lsn as one value, so a named parent pinned at a captured LSN is not
+ * expressible through the CLI, and the REST response hands back the branch id and connection URI in
+ * one round trip. */
+export function createNeonRestClient(apiKey: string, fetchImpl: typeof fetch = fetch): NeonClient {
+  async function request<T>(method: string, path: string, body?: unknown): Promise<{ status: number; data: T }> {
+    let response: Response
+    try {
+      response = await fetchImpl(`${NEON_API_BASE}${path}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          Accept: 'application/json',
+          ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      })
+    } catch (error) {
+      const codes = errorCodeChain(error)
+      const preRequest = codes.some((code) => PRE_REQUEST_ERROR_CODES.has(code))
+      throw new NeonRequestError(
+        `${method} ${path} failed before a response was read (${codes.join(' → ') || (error as Error).message})`,
+        null,
+        !preRequest,
       )
     }
-    if (fromExists) {
-      neon(['branches', 'rename', from, to, '--project-id', projectId])
-      return
+    let text: string
+    try {
+      text = await response.text()
+    } catch (error) {
+      throw new NeonRequestError(
+        `${method} ${path} response body could not be read (${(error as Error).message})`, null, true,
+      )
     }
-    if (!toExists) {
-      throw new FatalError(`neither "${from}" nor "${to}" exists in project ${projectId}`)
+    let data: unknown = null
+    if (text) {
+      try {
+        data = JSON.parse(text)
+      } catch {
+        data = null
+      }
     }
-    // from gone, to present: a previous attempt actually renamed — done.
-  }, 3)
+    if (!response.ok) {
+      const detail = (data as { message?: string } | null)?.message ?? text.slice(0, 300)
+      // A 5xx leaves a mutating request's outcome unknown. A 4xx — 429 included — means Neon
+      // rejected it before applying anything, so the outcome is known even when it is a failure.
+      const ambiguous = response.status >= 500
+      throw new NeonRequestError(`${method} ${path} → HTTP ${response.status}: ${detail}`, response.status, ambiguous)
+    }
+    return { status: response.status, data: data as T }
+  }
+
+  async function listBranches(projectId: string): Promise<NeonBranch[]> {
+    const collected: NeonBranch[] = []
+    let cursor: string | undefined
+    for (let page = 0; page < 50; page++) {
+      const query = new URLSearchParams({ limit: '400' })
+      if (cursor) query.set('cursor', cursor)
+      const { data } = await request<{ branches?: NeonBranch[]; pagination?: { next_cursor?: string; cursor?: string } }>(
+        'GET',
+        `/projects/${encodeURIComponent(projectId)}/branches?${query.toString()}`,
+      )
+      const branches = data?.branches
+      if (!Array.isArray(branches)) {
+        // An unrecognized shape must THROW, not read as "no branches" — misreading a live branch as
+        // absent would make provisioning create a duplicate or teardown skip a real branch.
+        throw new FatalError('Unexpected Neon list-branches response shape; cannot enumerate branches.')
+      }
+      collected.push(...branches)
+      const next = data.pagination?.next_cursor ?? data.pagination?.cursor
+      if (!next || next === cursor || branches.length === 0) break
+      cursor = next
+    }
+    return collected
+  }
+
+  return {
+    async findBranchByName(projectId, name) {
+      const matches = (await listBranches(projectId)).filter((branch) => branch.name === name)
+      if (matches.length > 1) {
+        throw new FatalError(`Project ${projectId} has ${matches.length} branches named "${name}" — refusing to guess which one is meant.`)
+      }
+      return matches[0] ?? null
+    },
+
+    async getBranchById(projectId, branchId) {
+      try {
+        const { data } = await request<{ branch?: NeonBranch }>('GET', `/projects/${encodeURIComponent(projectId)}/branches/${encodeURIComponent(branchId)}`)
+        const branch = data?.branch
+        if (!branch || branch.id !== branchId || branch.project_id !== projectId || typeof branch.name !== 'string' || !branch.name) {
+          throw new FatalError('Unexpected Neon branch response shape or identity; cannot establish branch presence or absence.')
+        }
+        return branch
+      } catch (error) {
+        if (error instanceof NeonRequestError && error.status === 404) return null
+        throw error
+      }
+    },
+
+    async createBranch(projectId, { name, parentId, parentLsn }) {
+      const { data } = await request<{ branch?: NeonBranch; connection_uris?: Array<{ connection_uri?: string }> }>(
+        'POST',
+        `/projects/${encodeURIComponent(projectId)}/branches`,
+        { branch: { name, parent_id: parentId, parent_lsn: parentLsn }, endpoints: [{ type: 'read_write' }] },
+      )
+      if (!data?.branch?.id) {
+        throw new FatalError('Neon accepted the branch creation but returned no branch id; cannot establish ownership.')
+      }
+      return { branch: data.branch, connectionUri: data.connection_uris?.[0]?.connection_uri ?? null }
+    },
+
+    async deleteBranch(projectId, branchId) {
+      try {
+        await request('DELETE', `/projects/${encodeURIComponent(projectId)}/branches/${encodeURIComponent(branchId)}`)
+        return 'deleted'
+      } catch (error) {
+        if (error instanceof NeonRequestError && error.status === 404) return 'absent'
+        throw error
+      }
+    },
+
+    async connectionUri(projectId, branchId) {
+      const databaseName = process.env.NEON_DATABASE_NAME
+      const roleName = process.env.NEON_ROLE_NAME
+      let database = databaseName
+      let role = roleName
+      if (!database || !role) {
+        const { data } = await request<{ databases?: Array<{ name?: string; owner_name?: string }> }>(
+          'GET',
+          `/projects/${encodeURIComponent(projectId)}/branches/${encodeURIComponent(branchId)}/databases`,
+        )
+        const databases = data?.databases
+        const selected = Array.isArray(databases)
+          ? (database ? databases.find((entry) => entry.name === database) : databases.length === 1 ? databases[0] : undefined)
+          : undefined
+        if (!selected?.name || (!role && !selected.owner_name)) {
+          throw new FatalError(
+            `Could not determine the database/role for branch ${branchId}. Set NEON_DATABASE_NAME and NEON_ROLE_NAME explicitly.`,
+          )
+        }
+        database = database || selected.name
+        role = role || selected.owner_name!
+      }
+      const query = new URLSearchParams({ branch_id: branchId, database_name: database, role_name: role })
+      const { data } = await request<{ uri?: string; connection_uri?: string }>(
+        'GET',
+        `/projects/${encodeURIComponent(projectId)}/connection_uri?${query.toString()}`,
+      )
+      const uri = data?.uri ?? data?.connection_uri
+      if (!uri || !uri.startsWith('postgres')) {
+        throw new FatalError(`Neon did not return a postgres connection string for branch ${branchId}.`)
+      }
+      return uri
+    },
+
+  }
 }
 
 /**
- * Delete a workspace branch, retried (a just-created branch can transiently refuse deletion
- * while its create/compute operations are still running) and idempotent under retry (an attempt
- * that "failed" after actually deleting reads as done on the next attempt).
+ * Everything about the branch that must hold before this script runs a single destructive statement
+ * against it. `parentLsn` is the nonce: together with the name and parent id it distinguishes the
+ * branch WE just created from a same-named branch created by anyone else.
  */
-async function deleteBranch(projectId: string, branchName: string, opts: { inherit?: boolean } = {}): Promise<void> {
-  await withRetry('delete branch', () => {
-    if (branchExists(projectId, branchName)) {
-      neon(['branches', 'delete', branchName, '--project-id', projectId], opts)
-    }
-  }, 3)
+export function assertOwnedDisposableBranch(
+  branch: NeonBranch,
+  expected: { projectId: string; name: string; parentId: string; parentLsn?: string },
+): void {
+  const fail = (why: string): never => {
+    throw new FatalError(`Refusing to use branch ${branch.id ?? '(no id)'}: ${why}`)
+  }
+  if (typeof branch.id !== 'string' || !branch.id.startsWith('br-')) fail('it has no Neon branch id')
+  if (branch.project_id !== expected.projectId) fail(`it belongs to project "${branch.project_id}", not "${expected.projectId}"`)
+  if (branch.name !== expected.name) fail(`its name is "${branch.name}", not the expected "${expected.name}"`)
+  if (!branch.name.startsWith(BRANCH_PREFIX)) fail(`its name is not under the disposable "${BRANCH_PREFIX}" namespace`)
+  if (branch.id === expected.parentId) fail('it IS the parent branch')
+  if (branch.parent_id !== expected.parentId) fail(`its parent is "${branch.parent_id ?? '(none — a root branch)'}", not "${expected.parentId}"`)
+  if (expected.parentLsn !== undefined && branch.parent_lsn !== expected.parentLsn) {
+    fail(`its parent_lsn is "${branch.parent_lsn ?? '(none)'}", not the captured "${expected.parentLsn}" — this is not the branch this run created`)
+  }
+  if (branch.default === true) fail('it is the project default branch')
+  if (branch.primary === true) fail('it is the project primary branch')
+  if (branch.protected === true) fail('it is a protected branch')
+}
+
+// ── Purge ────────────────────────────────────────────────────────────────────
+
+export interface DiscoveredTable {
+  schema: string
+  name: string
+  extensionOwned: boolean
+}
+
+export interface PurgePlan {
+  truncate: string[]
+  preserved: string[]
+}
+
+/** Double any embedded quote so a catalog-supplied identifier is a valid quoted identifier. */
+export function quoteIdent(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`
+}
+
+function qualify(table: { schema: string; name: string }): string {
+  return `${table.schema}.${table.name}`
 }
 
 /**
- * Retry a project-local CLI — a branch compute that's never been connected to (just created, or
- * just renamed) can take a while to finish booting. When `input` is given it is piped to the
- * command's stdin.
+ * Decide what the purge empties and what it keeps — pure, so every fail-closed case is unit-tested
+ * without a database.
+ *
+ * Preserved: the migration ledger (inherited from production and the whole point of using an
+ * ordinary child), every extension-owned table (PostGIS's spatial_ref_sys and friends), and the
+ * PRESERVED_TABLES knob.
+ *
+ * Fails closed on any base table in a non-system schema that is neither preserved nor a known
+ * application table, and on any schema outside APP_SCHEMAS that holds such a table. That is the
+ * "production is ahead of this checkout" case, and publishing a database with rows this script
+ * cannot account for is exactly what must not happen. Known tables that are ABSENT are fine — that
+ * is "production is behind this checkout", and migrate-deploy creates them after the purge.
  */
-function runWithRetry(bin: string, binArgs: string[], env: NodeJS.ProcessEnv, attempts = 3, input?: string): void {
+export function planPurge(
+  discovered: DiscoveredTable[],
+  known: string[],
+  opts: { appSchemas?: string[]; preserved?: string[]; ledgerTable?: string } = {},
+): PurgePlan {
+  const appSchemas = new Set(opts.appSchemas ?? APP_SCHEMAS)
+  const ledger = opts.ledgerTable ?? migrationLedgerTable()
+  const preservedNames = new Set([ledger, ...(opts.preserved ?? PRESERVED_TABLES)])
+  const knownNames = new Set(known)
+
+  const truncate: string[] = []
+  const preserved: string[] = []
+  const unknownTables: string[] = []
+  const unknownSchemas = new Set<string>()
+
+  for (const table of discovered) {
+    const qualified = qualify(table)
+    if (table.extensionOwned || preservedNames.has(qualified)) {
+      preserved.push(qualified)
+      continue
+    }
+    if (!appSchemas.has(table.schema)) {
+      unknownSchemas.add(table.schema)
+      continue
+    }
+    if (!knownNames.has(qualified)) {
+      unknownTables.push(qualified)
+      continue
+    }
+    truncate.push(qualified)
+  }
+
+  if (unknownSchemas.size > 0 || unknownTables.length > 0) {
+    const parts: string[] = []
+    if (unknownSchemas.size > 0) parts.push(`schema(s) ${[...unknownSchemas].sort().join(', ')}`)
+    if (unknownTables.length > 0) parts.push(`table(s) ${unknownTables.sort().join(', ')}`)
+    throw new FatalError(
+      `The parent branch contains ${parts.join(' and ')} that this checkout does not know about. ` +
+        'Refusing to publish a workspace database holding production rows this script cannot ' +
+        'account for. Either pull the migrations that define them, add them to APP_SCHEMAS / ' +
+        'PRESERVED_TABLES, or widen knownApplicationTables().',
+    )
+  }
+  return { truncate: truncate.sort(), preserved: preserved.sort() }
+}
+
+/** Include stored materialized views too: ignoring them would publish inherited production rows. */
+export const DISCOVER_TABLES_SQL = `
+SELECT n.nspname AS schema,
+       c.relname AS name,
+       EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e') AS extension_owned
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r', 'p', 'm')
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND n.nspname NOT LIKE 'pg\\_toast%'
+  AND n.nspname NOT LIKE 'pg\\_temp%'
+  AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid)
+ORDER BY 1, 2`
+
+export async function discoverTables(client: SqlClient): Promise<DiscoveredTable[]> {
+  const rows = await client.query<{ schema: string; name: string; extension_owned: boolean | string }>(DISCOVER_TABLES_SQL)
+  return rows.map((row) => ({
+    schema: row.schema,
+    name: row.name,
+    extensionOwned: row.extension_owned === true || row.extension_owned === 't' || row.extension_owned === 'true',
+  }))
+}
+
+export function buildTruncateSql(tables: string[]): string {
+  const list = tables
+    .map((qualified) => {
+      const separator = qualified.indexOf('.')
+      return `${quoteIdent(qualified.slice(0, separator))}.${quoteIdent(qualified.slice(separator + 1))}`
+    })
+    .join(', ')
+  return `TRUNCATE TABLE ${list} RESTART IDENTITY RESTRICT`
+}
+
+export function buildCountSql(tables: string[]): string {
+  return tables
+    .map((qualified) => {
+      const separator = qualified.indexOf('.')
+      const ref = `${quoteIdent(qualified.slice(0, separator))}.${quoteIdent(qualified.slice(separator + 1))}`
+      return `SELECT ${quoteLiteral(qualified)} AS qualified, count(*)::bigint AS rows FROM ${ref}`
+    })
+    .join('\nUNION ALL\n')
+}
+
+function quoteLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`
+}
+
+/**
+ * Empty every application table in ONE transaction, leaving the inherited migration ledger and every
+ * extension-owned table intact. Any failure rolls the whole thing back, so the branch is never left
+ * half-purged — a half-purged branch is worse than an unpurged one, because it looks provisioned.
+ *
+ * Database operations only. No Blob deletion, no billing calls, no worker calls, no application
+ * side effects of any kind: this runs against a copy of production, and firing the app's own
+ * deletion hooks here would reach out and mutate shared systems.
+ */
+export async function purgeApplicationRows(client: SqlClient, plan: PurgePlan): Promise<void> {
+  if (plan.truncate.length === 0) return
+  await client.query('BEGIN')
+  try {
+    // TRUNCATE fires database hooks even though it avoids DELETE hooks. Reject application hooks
+    // rather than invoking copied production integrations. Descendants are truncated implicitly.
+    const triggers = await client.query<{ name: string }>(`
+WITH RECURSIVE targets(oid) AS (
+  SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE n.nspname || '.' || c.relname = ANY($1::text[])
+  UNION
+  SELECT i.inhrelid FROM pg_inherits i JOIN targets t ON i.inhparent = t.oid
+)
+SELECT tg.tgname AS name FROM pg_trigger tg JOIN targets t ON tg.tgrelid = t.oid
+WHERE NOT tg.tgisinternal AND tg.tgenabled <> 'D' AND (tg.tgtype & 32) <> 0`, [plan.truncate])
+    if (triggers.length > 0) {
+      throw new FatalError(`Refusing to run application TRUNCATE trigger(s): ${triggers.map((trigger) => trigger.name).join(', ')}. Review and remove those hooks from the disposable child before designing a project-specific purge.`)
+    }
+    await client.query(buildTruncateSql(plan.truncate))
+    await client.query('COMMIT')
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK')
+    } catch {
+      // The original error is what matters; a rollback that itself fails (dead connection) must not
+      // replace it.
+    }
+    throw error
+  }
+}
+
+/** Confirm the purge actually emptied everything before any connection URL is published. */
+export async function verifyTablesEmpty(client: SqlClient, tables: string[]): Promise<void> {
+  if (tables.length === 0) return
+  const rows = await client.query<{ qualified: string; rows: number | string }>(buildCountSql(tables))
+  const nonEmpty = rows.filter((row) => Number(row.rows) > 0).map((row) => `${row.qualified}=${row.rows}`)
+  if (nonEmpty.length > 0) {
+    throw new FatalError(`Purge did not empty every application table (${nonEmpty.join(', ')}) — refusing to publish this database.`)
+  }
+}
+
+// ── Child processes ──────────────────────────────────────────────────────────
+
+/** The child-process environment with every DB var pinned to the workspace branch. */
+function childDbEnv(uri: string): NodeJS.ProcessEnv {
+  return { ...process.env, ...Object.fromEntries(DB_ENV_VARS.map((name) => [name, uri])) }
+}
+
+/** Retry a project-local CLI — a compute that has just booted can still refuse the first attempts. */
+function runWithRetry(bin: string, binArgs: string[], env: NodeJS.ProcessEnv, attempts = 3): void {
   const file = PM_EXEC[0]
   const args = [...PM_EXEC.slice(1), bin, ...binArgs]
   for (let attempt = 1; attempt <= attempts; attempt++) {
-    const res = spawnSync(
-      file,
-      args,
-      input === undefined ? { stdio: 'inherit', env } : { stdio: ['pipe', 'inherit', 'inherit'], env, input },
-    )
+    const res = spawnSync(file, args, { stdio: 'inherit', env })
     if (res.error) throw new Error(`Failed to spawn ${file}: ${res.error.message}`)
     if (res.status === 0) return
     if (attempt === attempts) {
@@ -588,6 +1060,34 @@ function runWithRetry(bin: string, binArgs: string[], env: NodeJS.ProcessEnv, at
   }
 }
 
+/** Apply migrations this checkout has that the parent had not run. Always AFTER the purge. */
+function deployMigrations(uri: string): void {
+  if (ORM === 'prisma') runWithRetry('prisma', ['migrate', 'deploy'], childDbEnv(uri))
+  else runWithRetry('drizzle-kit', ['migrate'], childDbEnv(uri))
+}
+
+/**
+ * Seed the workspace with test fixtures — the last step of provisioning.
+ *
+ * ── ADAPT THIS to your project's seed ──────────────────────────────────────────
+ *  • No seed?  Delete this function and its call.
+ *  • Plain seed, no safety guard?
+ *      Prisma:  runWithRetry('prisma', ['db', 'seed'], childDbEnv(uri), 2)
+ *      Drizzle: runWithRetry('tsx', [SEED_SCRIPT], childDbEnv(uri), 2)
+ *  • Seed that REFUSES non-local DBs (recommended)? Authorize it for THIS branch only. The example
+ *    below matches a seed that allows a remote DB when E2E_EXPECTED_DATABASE_URL === DATABASE_URL.
+ */
+function seedWorkspace(uri: string): void {
+  if (!process.env.E2E_USER_PASSWORD) {
+    console.warn('[seed] seed credentials not set — skipping seed (workspace DB will be empty). Set them in your orchestrator env to seed test fixtures.')
+    return
+  }
+  console.log('[seed] seeding workspace fixtures…')
+  runWithRetry('tsx', [SEED_SCRIPT], { ...childDbEnv(uri), E2E_EXPECTED_DATABASE_URL: uri }, 2)
+}
+
+// ── .env.neondb ──────────────────────────────────────────────────────────────
+
 function readEnvFileRaw(path: string): string {
   try {
     return readFileSync(path, 'utf8')
@@ -597,7 +1097,6 @@ function readEnvFileRaw(path: string): string {
   }
 }
 
-/** Non-empty lines of `content`, trailing newline stripped, with any line whose key is in `keys` removed. */
 function withoutKeys(content: string, keys: string[]): string[] {
   const trimmed = content.replace(/\n+$/, '')
   if (trimmed === '') return []
@@ -609,9 +1108,8 @@ function withoutKeys(content: string, keys: string[]): string[] {
 }
 
 /**
- * Upsert every NAME=value pair in `vars` into `path`, preserving every other line (unrelated vars,
- * comments, blank lines) untouched. Creates the file if it doesn't exist yet. Single-quoted values:
- * dotenv's expand step would otherwise rewrite a literal `$` inside a connection string.
+ * Upsert every NAME=value pair into `path`, preserving every other line untouched. Single-quoted
+ * values: dotenv's expand step would otherwise rewrite a literal `$` inside a connection string.
  */
 export function upsertEnvVars(path: string, vars: Record<string, string>): void {
   const kept = withoutKeys(readEnvFileRaw(path), Object.keys(vars))
@@ -619,10 +1117,7 @@ export function upsertEnvVars(path: string, vars: Record<string, string>): void 
   writeFileSync(path, `${[...kept, ...appended].join('\n')}\n`, { mode: 0o600 })
 }
 
-/**
- * Remove every line whose key is in `keys` from `path`, preserving everything else. Deletes the
- * file entirely if that leaves nothing behind; no-ops if the file doesn't exist.
- */
+/** Remove every line whose key is in `keys`, deleting the file if that leaves nothing behind. */
 export function stripEnvVars(path: string, keys: string[]): void {
   const raw = readEnvFileRaw(path)
   if (!raw.trim()) return
@@ -632,463 +1127,392 @@ export function stripEnvVars(path: string, keys: string[]): void {
 }
 
 /**
- * Build the INSERT that seeds the workspace branch's Drizzle ledger with EXACTLY what's
- * genuinely applied on the parent — rows captured verbatim from readTrueDrizzleLedger, not
- * derived from local migration files. Returns null if the parent has nothing applied yet —
- * nothing to baseline; deployMigrations() creates everything for real. Idempotent (WHERE NOT
- * EXISTS on hash) as defense-in-depth, though in practice the workspace branch's ledger is
- * always empty at this point (freshly created — see provision()).
+ * Which of `names` the managed env file actually defines. Deliberately reads the FILE and not
+ * process.env: an ambient DATABASE_URL exported by the shell or a shared .env would otherwise
+ * satisfy a check whose whole purpose is to prove this workspace has its own URL.
  */
-export function buildDrizzleLedgerBaselineSql(rows: Array<{ hash: string; created_at: string | number }>): string | null {
-  if (rows.length === 0) return null
-  const values = rows
-    .map(({ hash, created_at }) => {
-      if (!/^[0-9a-f]{64}$/.test(hash)) {
-        throw new FatalError(`Migration ledger row has a non-hex hash (${JSON.stringify(hash)}) — refusing to splice it into SQL.`)
-      }
-      const createdAt = typeof created_at === 'string' ? Number(created_at) : created_at
-      if (!Number.isSafeInteger(createdAt) || createdAt < 0) {
-        throw new FatalError(`Migration ledger row has a non-integer created_at (${JSON.stringify(created_at)}) — refusing to splice it into SQL.`)
-      }
-      return `('${hash}', ${createdAt})`
-    })
-    .join(',\n')
-  const qualified = `"${DRIZZLE_MIGRATIONS_SCHEMA}"."${DRIZZLE_MIGRATIONS_TABLE}"`
-  return (
-    `CREATE SCHEMA IF NOT EXISTS "${DRIZZLE_MIGRATIONS_SCHEMA}";\n` +
-    `CREATE TABLE IF NOT EXISTS ${qualified} (id SERIAL PRIMARY KEY, hash text NOT NULL, created_at bigint);\n` +
-    `INSERT INTO ${qualified} (hash, created_at)\n` +
-    'SELECT m.hash, m.created_at\n' +
-    `FROM (VALUES\n${values}\n) AS m(hash, created_at)\n` +
-    `WHERE NOT EXISTS (SELECT 1 FROM ${qualified} e WHERE e.hash = m.hash);`
-  )
+export function managedVarsInFile(path: string, names: string[] = DB_ENV_VARS): string[] {
+  const raw = readEnvFileRaw(path)
+  if (!raw.trim()) return []
+  const wanted = new Set(names)
+  const found: string[] = []
+  for (const line of raw.split('\n')) {
+    const eq = line.indexOf('=')
+    if (eq === -1) continue
+    const key = line.slice(0, eq).trim()
+    if (!wanted.has(key)) continue
+    const value = line.slice(eq + 1).trim().replace(/^['"]|['"]$/g, '')
+    if (value !== '') found.push(key)
+  }
+  return found
 }
 
 /**
- * Same idea for Prisma: seeds `_prisma_migrations` with the checksum + migration_name rows
- * readTruePrismaLedger captured from the parent's true ledger, not recomputed from local
- * migration.sql files. Returns null if the parent has nothing genuinely applied yet. Idempotent
- * (WHERE NOT EXISTS on migration_name), same reasoning as the Drizzle variant.
+ * Where the managed DB vars are written. NEONDB_BRANCH_ENV_FILE is a TEST-ONLY override — never set
+ * it in a real workspace, or `load-env.cjs` and this script would disagree about which file is the
+ * workspace's.
  */
-export function buildPrismaLedgerBaselineSql(rows: Array<{ checksum: string; migration_name: string }>): string | null {
-  if (rows.length === 0) return null
-  const values = rows
-    .map(({ checksum, migration_name }) => {
-      if (!/^[0-9a-f]{64}$/.test(checksum)) {
-        throw new FatalError(`Migration ledger row has a non-hex checksum (${JSON.stringify(checksum)}) — refusing to splice it into SQL.`)
-      }
-      const safeName = migration_name.replace(/'/g, "''") // double single quotes for a valid SQL string literal
-      return `('${checksum}', '${safeName}')`
-    })
-    .join(',\n')
-  return (
-    'INSERT INTO "_prisma_migrations" ' +
-    '(id, checksum, finished_at, migration_name, logs, rolled_back_at, started_at, applied_steps_count)\n' +
-    'SELECT gen_random_uuid()::text, m.checksum, now(), m.migration_name, NULL, NULL, now(), 1\n' +
-    `FROM (VALUES\n${values}\n) AS m(checksum, migration_name)\n` +
-    'WHERE NOT EXISTS (SELECT 1 FROM "_prisma_migrations" e WHERE e.migration_name = m.migration_name);'
-  )
+export function envFilePath(): string {
+  return process.env.NEONDB_BRANCH_ENV_FILE ?? ENV_FILE
 }
 
-/** Apply any migrations pulled into this workspace since its branch was created. */
-function deployMigrations(uri: string): void {
-  if (ORM === 'prisma') {
-    runWithRetry('prisma', ['migrate', 'deploy'], childDbEnv(uri))
-  } else {
-    runWithRetry('drizzle-kit', ['migrate'], childDbEnv(uri))
-  }
+export function loadEnvFile(): void {
+  dotenvConfig({ path: envFilePath() })
+}
+
+// ── Commands ─────────────────────────────────────────────────────────────────
+
+export interface Deps {
+  neon: NeonClient
+  connect: SqlConnect
+  knownTables: () => Promise<string[]>
+  deployMigrations: (uri: string) => void | Promise<void>
+  seed: (uri: string) => void | Promise<void>
+  sleep: (ms: number) => void
+  log: (message: string) => void
+  warn: (message: string) => void
 }
 
 /**
- * Learn the parent's TRUE applied-migration set via a disposable full-data clone, then seed the
- * workspace branch's (currently empty) ledger with exactly that — never with an assumption
- * derived from local migration files. This is what actually fixes "the parent hasn't run every
- * migration yet" drift: a schema-only branch's ledger starts empty regardless of the parent's
- * real state, so baselining from local files would falsely mark migrations applied that the
- * parent never ran, and the ORM would silently no-op instead of creating the missing tables. The
- * check branch is always fresh: delete-if-present before creating, never reused, since a leaked
- * one from an interrupted run could hold a stale snapshot of the parent's true state.
+ * The REST client, built on first use rather than up front, so a command that legitimately has
+ * nothing to do (teardown on a workspace that was never provisioned) still reports that instead of
+ * demanding NEON_API_KEY first.
  */
-async function seedTrueBaseline(projectId: string, parent: string, uri: string, raw: string): Promise<void> {
-  // Handle a leftover from a previous, incomplete run first. Prefer the PERSISTED name over the
-  // freshly-derived one: it's written below before the branch is created, specifically so a
-  // leaked branch is still findable even if the workspace was renamed since (checkBranchName()
-  // alone would derive a different name and miss it — see writeCheckBranchState()'s docstring).
-  const previousCheckName = readCheckBranchState()
-  if (previousCheckName) {
-    // A corrupted/hand-edited record must not brick provisioning — it gets overwritten by
-    // writeCheckBranchState() below regardless. Matches provision()'s identical handling of a
-    // corrupted WORKSPACE-branch record.
-    let previousUsable = true
-    try {
-      assertDisposableCheckBranch(previousCheckName, parent)
-    } catch (error) {
-      previousUsable = false
-      console.warn(
-        `[neondb-branch] ignoring unusable ${checkBranchStateFilePath()} record "${previousCheckName}" ` +
-          `(${error instanceof Error ? error.message : error}) — it will be overwritten.`,
-      )
-    }
-    if (previousUsable) {
-      // No try/finally here deliberately: only clear the record after a CONFIRMED delete (or
-      // confirmed absence) below. If branchExists()/deleteBranch() throws, clearCheckBranchState()
-      // is never reached and the record survives — so a still-live leaked branch never loses its
-      // only tracking record just because this attempt to clean it up failed.
-      if (await withRetry('check for stale check branch', () => branchExists(projectId, previousCheckName), 3)) {
-        console.log(`[neon] deleting stale check branch ${previousCheckName}…`)
-        await deleteBranch(projectId, previousCheckName)
-      }
-      clearCheckBranchState()
-    }
+function lazyNeonClient(): NeonClient {
+  let inner: NeonClient | null = null
+  const client = (): NeonClient => (inner ??= createNeonRestClient(requireEnv('NEON_API_KEY')))
+  return {
+    findBranchByName: (projectId, name) => client().findBranchByName(projectId, name),
+    getBranchById: (projectId, branchId) => client().getBranchById(projectId, branchId),
+    createBranch: (projectId, opts) => client().createBranch(projectId, opts),
+    deleteBranch: (projectId, branchId) => client().deleteBranch(projectId, branchId),
+    connectionUri: (projectId, branchId) => client().connectionUri(projectId, branchId),
   }
+}
 
-  const checkName = checkBranchName(raw)
-  writeCheckBranchState(checkName) // before creating — see writeCheckBranchState()'s docstring
-  console.log(`[neon] creating check branch ${checkName} off ${parent} (full data, disposable)…`)
-  await withRetry(
-    'create check branch',
-    () => {
-      if (!branchExists(projectId, checkName)) {
-        neon(['branches', 'create', '--project-id', projectId, '--name', checkName, '--parent', parent, '--output', 'json'])
-      }
-    },
-    3,
-  )
+function defaultDeps(): Deps {
+  return {
+    neon: lazyNeonClient(),
+    connect,
+    knownTables: knownApplicationTables,
+    deployMigrations,
+    seed: seedWorkspace,
+    sleep: sleepMs,
+    log: console.log,
+    warn: console.warn,
+  }
+}
 
-  // Tracks whether the try block itself failed, so the finally block below can tell "a cleanup
-  // failure on top of a real error" (log it, let the original error through) apart from "cleanup
-  // is the ONLY failure" (this file's policy is to fail loudly on a branch-delete failure, same
-  // as everywhere else — swallowing it unconditionally would just trade the original masking bug
-  // for silently leaving a leak unreported).
-  let failed = false
+/** Retry options for a READ or a DELETE: safe to apply twice, so an ambiguous failure may retry. */
+function idempotent(deps: Deps, attempts: number): RetryOptions {
+  return { attempts, sleep: deps.sleep, log: deps.log, retryAmbiguous: true }
+}
+
+/** Retry options for anything whose double-application would be a bug. */
+function mutating(deps: Deps, attempts: number): RetryOptions {
+  return { attempts, sleep: deps.sleep, log: deps.log, retryAmbiguous: false }
+}
+
+/** Open a connection, run `fn`, and always close — used for every SQL step below. */
+async function withConnection<T>(deps: Deps, uri: string, fn: (client: SqlClient) => Promise<T>): Promise<T> {
+  const { client, end } = await deps.connect(uri)
   try {
-    const checkUri = await withRetry('fetch check branch connection string', () => getConnectionString(projectId, checkName))
-    if (ORM === 'prisma') {
-      const trueRows = await withRetry('read true migration ledger', () => readTruePrismaLedger(checkUri), 6)
-      const sql = buildPrismaLedgerBaselineSql(trueRows)
-      if (sql) {
-        await withRetry('seed true baseline', () => execSql(uri, sql), 6)
-      } else {
-        console.log('[prisma] parent has no applied migrations yet — nothing to baseline.')
-      }
-    } else {
-      const trueRows = await withRetry('read true migration ledger', () => readTrueDrizzleLedger(checkUri), 6)
-      const sql = buildDrizzleLedgerBaselineSql(trueRows)
-      if (sql) {
-        await withRetry('seed true baseline', () => execSql(uri, sql), 6)
-      } else {
-        console.log('[drizzle] parent has no applied migrations yet — nothing to baseline.')
-      }
-    }
-  } catch (error) {
-    failed = true
-    throw error
+    return await fn(client)
   } finally {
-    try {
-      assertDisposableCheckBranch(checkName, parent)
-      await deleteBranch(projectId, checkName)
-      clearCheckBranchState()
-    } catch (cleanupError) {
-      if (failed) {
-        // A real error is already propagating — don't let this cleanup failure replace it (a
-        // throw in `finally` would). The persisted record (still in place) means teardown()'s
-        // own leaked-check-branch sweep will find and remove it on a later archive.
-        console.error(
-          `[neondb-branch] WARNING: could not delete check branch ${checkName} while handling ` +
-            `another error; it may be orphaned (${cleanupError instanceof Error ? cleanupError.message : cleanupError}). ` +
-            `teardown()'s sweep will catch it on a later archive.`,
-        )
-      } else {
-        // Nothing else went wrong — this cleanup failure IS the failure. Fail loudly, matching
-        // this file's policy elsewhere, instead of silently leaving a leak unreported.
-        throw cleanupError
-      }
+    await end().catch(() => undefined)
+  }
+}
+
+/** Read the parent's current WAL position. The ONLY statement this script sends to production. */
+export async function captureParentLsn(deps: Deps, parentUri: string): Promise<string> {
+  const rows = await withConnection(deps, parentUri, (client) => client.query<{ lsn: string }>('SELECT pg_current_wal_lsn()::text AS lsn'))
+  const lsn = rows[0]?.lsn
+  if (typeof lsn !== 'string' || !/^[0-9A-Fa-f]+\/[0-9A-Fa-f]+$/.test(lsn)) {
+    throw new FatalError(`Could not read a WAL LSN from the parent branch (got ${JSON.stringify(lsn)}).`)
+  }
+  return lsn
+}
+
+/** Wait until a brand-new compute accepts a connection. Generous by design — see FIRST_CONNECTION_ATTEMPTS. */
+async function waitForFirstConnection(deps: Deps, uri: string): Promise<void> {
+  await withRetry('acquire first connection to the new compute', () => withConnection(deps, uri, (client) => client.query('SELECT 1')), {
+    attempts: FIRST_CONNECTION_ATTEMPTS,
+    sleep: deps.sleep,
+    log: deps.log,
+    retryAmbiguous: true,
+  })
+}
+
+/** Delete only a still-disposable recorded id, retaining recovery state until absence is proven. */
+async function deleteRecordedBranch(deps: Deps, state: WorkspaceState, parentId?: string): Promise<void> {
+  const branchId = state.branchId
+  if (!branchId) throw new FatalError('Cannot delete an unresolved branch creation; inspect Neon manually.')
+  const ownership = readOwnership(state)
+  writeState({ ...state, status: 'deleting' })
+  const branch = await withRetry('inspect branch before deletion', () => deps.neon.getBranchById(state.projectId, branchId), idempotent(deps, 4))
+  if (branch) {
+    if (branch.parent_id !== ownership.parentId || branch.parent_lsn !== ownership.parentLsn) {
+      throw new FatalError(`Refusing to delete ${branchId}: its creation ancestry no longer matches the workspace ownership receipt.`)
     }
+    const parentRef = process.env.NEON_PARENT_BRANCH
+    if (branch.id !== branchId || branch.project_id !== state.projectId ||
+        branch.id === parentId || branch.id === parentRef || branch.name === parentRef ||
+        !branch.parent_id?.startsWith('br-') || branch.default === true || branch.primary === true || branch.protected === true) {
+      throw new FatalError(`Refusing to delete branch ${branchId}: identity mismatch or branch is a parent, root, default, primary, or protected branch. Inspect it in Neon before manual recovery.`)
+    }
+    await withRetry('delete branch', () => deps.neon.deleteBranch(state.projectId, branchId), idempotent(deps, 4))
+    await withRetry('confirm branch deletion', async () => {
+      const still = await deps.neon.getBranchById(state.projectId, branchId)
+      if (still) throw new Error(`branch ${branchId} still present (state: ${still.current_state ?? 'unknown'})`)
+    }, idempotent(deps, 5))
+  } else {
+    deps.log(`[neondb-branch] branch ${branchId} was already gone — treating as torn down.`)
   }
+  stripEnvVars(envFilePath(), DB_ENV_VARS)
+  clearState()
 }
 
-/**
- * Seed the workspace with test fixtures — the last step of setup, after the true baseline and
- * migrate-deploy above.
- *
- * ── ADAPT THIS to your project's seed ──────────────────────────────────────────
- *  • No seed?  Delete this function and its call in provision().
- *  • Plain seed, no safety guard?  Replace the body with:
- *      Prisma:  runWithRetry('prisma', ['db', 'seed'], childDbEnv(uri), 2)
- *      Drizzle: runWithRetry('tsx', [SEED_SCRIPT], childDbEnv(uri), 2)
- *  • Seed that REFUSES non-local DBs (recommended — stops accidental prod seeding)?
- *      Authorize it for THIS branch only. The example below matches a seed that allows a remote
- *      DB when E2E_EXPECTED_DATABASE_URL === DATABASE_URL, gated on a password.
- */
-function seedWorkspace(uri: string): void {
-  if (!process.env.E2E_USER_PASSWORD) {
-    console.warn(
-      '[seed] seed credentials not set — skipping seed (workspace DB will be empty). ' +
-        'Set them in Conductor env to seed test fixtures.',
-    )
-    return
-  }
-  console.log('[seed] seeding workspace fixtures…')
-  runWithRetry('tsx', [SEED_SCRIPT], { ...childDbEnv(uri), E2E_EXPECTED_DATABASE_URL: uri }, 2)
-}
-
-async function provision(): Promise<void> {
+export async function provision(deps: Deps = defaultDeps()): Promise<void> {
   const projectId = requireEnv('NEON_PROJECT_ID')
-  const apiKey = requireEnv('NEON_API_KEY') // consumed by neonctl from the environment; also mirrored into ENV_FILE below for archive
-  const parent = requireEnv('NEON_PARENT_BRANCH')
+  const apiKey = requireEnv('NEON_API_KEY')
+  const parentRef = requireEnv('NEON_PARENT_BRANCH')
   const raw = resolveWorkspaceName(process.env, process.cwd(), currentGitContext(process.cwd()))
   const branchName = workspaceBranchName(raw)
-  assertDisposableChildBranch(branchName, parent)
 
-  // Every run is a full rebuild — delete whatever's currently recorded (if it still exists),
-  // regardless of name or phase. This also handles a renamed workspace for free: the OLD
-  // recorded name gets deleted here, and a fresh branch gets created below under the CURRENT
-  // derived name — no rename API call, no orphan. Any data written into the workspace branch
-  // since it was created is discarded by design (see the header comment).
-  const recorded = readBranchState()
-  if (recorded) {
-    let recordedUsable = true
-    try {
-      assertDisposableChildBranch(recorded, parent)
-    } catch (error) {
-      // A corrupted/hand-edited record must not brick provisioning with a confusing "refusing
-      // destructive op" — it will simply be overwritten by the fresh create below.
-      recordedUsable = false
-      console.warn(
-        `[neondb-branch] ignoring unusable ${stateFilePath()} record "${recorded}" ` +
-          `(${error instanceof Error ? error.message : error}) — it will be overwritten.`,
-      )
-    }
-    if (recordedUsable && (await withRetry('check recorded branch', () => branchExists(projectId, recorded), 3))) {
-      console.log(`[neon] deleting recorded branch ${recorded} to rebuild from scratch…`)
-      await deleteBranch(projectId, recorded)
-    }
-  }
-
-  writeBranchState(branchName, 'pending') // sync()'s hard gate needs this window covered
-  console.log(`[neon] creating schema-only branch ${branchName} off ${parent}…`)
-  // Idempotent under retry: if a create "fails" after actually creating (e.g. a timeout on the
-  // response), the next attempt sees the branch and doesn't re-create it.
-  await withRetry(
-    'create branch',
-    () => {
-      if (!branchExists(projectId, branchName)) {
-        neon(['branches', 'create', '--project-id', projectId, '--name', branchName, '--parent', parent, '--schema-only', '--output', 'json'])
-      }
-    },
-    3,
-  )
-
-  // Everything after a successful create is wrapped so that ANY failure (connection-string
-  // fetch, writing the env file, true-baseline, migrate, seed) triggers the cleanup below —
-  // otherwise a create followed by a transient error would leak the branch.
+  const releaseLock = acquireLock('provision')
   try {
-    const uri = await withRetry('fetch connection string', () => getConnectionString(projectId, branchName))
-    upsertEnvVars(ENV_FILE, {
-      ...Object.fromEntries(DB_ENV_VARS.map((name) => [name, uri])),
-      NEON_API_KEY: apiKey,
-      NEON_PROJECT_ID: projectId,
-      NEON_PARENT_BRANCH: parent,
-    })
-    console.log(`[neondb-branch] wrote ${DB_ENV_VARS.join(', ')} and Neon credentials for ${branchName} → ${ENV_FILE}`)
-
-    console.log(`[${ORM}] learning the parent's true applied-migration state…`)
-    await seedTrueBaseline(projectId, parent, uri, raw)
-
-    console.log(`[${ORM}] applying any migrations beyond the baseline…`)
-    deployMigrations(uri)
-
-    seedWorkspace(uri)
-    writeBranchState(branchName, 'ready')
-  } catch (error) {
-    console.error('[neondb-branch] setup failed — deleting the branch so the next attempt starts clean.')
-    try {
-      await deleteBranch(projectId, branchName)
-      // Strip only the branch-specific DB vars (they'd point at a dead endpoint) — leave
-      // NEON_API_KEY/NEON_PROJECT_ID/NEON_PARENT_BRANCH in .env.neondb so the next provision
-      // attempt doesn't need them re-supplied. State record last: a crash between the two leaves
-      // the record (harmless, self-corrects on the next provision), rather than a DB var with no
-      // record, which would slip past sync's gates and boot the app against a dead endpoint.
-      stripEnvVars(ENV_FILE, DB_ENV_VARS)
-      rmSync(stateFilePath(), { force: true })
-    } catch {
-      console.error(
-        `[neondb-branch] WARNING: could not delete branch ${branchName}; ` +
-          `keeping ${stateFilePath()} so the next provision/teardown can find it.`,
-      )
+    const existing = readState() // also rejects the legacy format
+    if (existing) {
+      assertProjectMatches(existing, projectId)
+      if (existing.status === 'creating') {
+        throw new FatalError(
+          `${stateFilePath()} records an UNRESOLVED branch creation (status "creating", no id): a ` +
+            'previous provision could not confirm whether Neon created its branch. Refusing to ' +
+            'create another one, and refusing to guess by name. Look for a branch named ' +
+            `"${existing.branchName}" in project ${projectId}; if it exists and is yours, delete it ` +
+            `in the Neon console, then delete ${stateFilePath()} and re-run provision.`,
+        )
+      }
+      readOwnership(existing)
     }
-    throw error
-  }
 
-  console.log('✅ [neondb-branch] workspace database ready.')
-}
-
-export type TeardownAction = { type: 'delete' } | { type: 'alreadyGone' }
-
-/**
- * Pure decision function for teardown(): whether the target branch still exists on Neon. Mirrors
- * planSync()'s extraction for the same class of decision — self-heal (skip a delete that would
- * 404 forever) is directly testable without mocking neonctl.
- */
-export function planTeardown(branchExists: boolean): TeardownAction {
-  return branchExists ? { type: 'delete' } : { type: 'alreadyGone' }
-}
-
-async function teardown(): Promise<void> {
-  const raw = resolveWorkspaceName(process.env, process.cwd(), currentGitContext(process.cwd()))
-  const derived = workspaceBranchName(raw)
-  const state = readBranchStateFull()
-  const target = state?.branch ?? derived
-
-  if (!process.env.NEON_PROJECT_ID || !process.env.NEON_API_KEY) {
-    if (!state && !readCheckBranchState()) {
-      console.warn('[neondb-branch] NEON_PROJECT_ID / NEON_API_KEY not set and nothing recorded — nothing to clean.')
-      return
-    }
-    throw new Error(
-      'NEON_PROJECT_ID / NEON_API_KEY are required to delete this workspace\'s Neon branch (a record ' +
-        'exists). Set them (e.g. in .env.neondb) and re-run teardown, or the branch will leak.',
+    // Resolve the parent and capture its LSN BEFORE destroying anything. If production is
+    // unreachable or misconfigured, the workspace still has the database it had.
+    deps.log(`[neon] resolving parent branch "${parentRef}"…`)
+    const parent = await withRetry(
+      'resolve parent branch',
+      async () => {
+        const found = parentRef.startsWith('br-')
+          ? await deps.neon.getBranchById(projectId, parentRef)
+          : await deps.neon.findBranchByName(projectId, parentRef)
+        if (!found) throw new FatalError(`Parent branch "${parentRef}" was not found in project ${projectId}.`)
+        return found
+      },
+      idempotent(deps, 3),
     )
-  }
-  const projectId = requireEnv('NEON_PROJECT_ID')
-  const parent = process.env.NEON_PARENT_BRANCH ?? ''
 
-  // Sweep a leaked tmp/* check branch first (a provision killed between creating it and its own
-  // cleanup) — independent of which workspace branch we target below.
-  try {
-    const checkName = readCheckBranchState() ?? checkBranchName(raw)
-    assertDisposableCheckBranch(checkName, parent)
-    if (await withRetry('check for leaked check branch', () => branchExists(projectId, checkName), 3)) {
-      console.log(`[neon] deleting leaked check branch ${checkName}…`)
-      await deleteBranch(projectId, checkName, { inherit: true })
+    const parentUri = await withRetry('fetch parent connection string', () => deps.neon.connectionUri(projectId, parent.id), idempotent(deps, 5))
+    const parentLsn = await withRetry('capture parent WAL LSN', () => captureParentLsn(deps, parentUri), idempotent(deps, FIRST_CONNECTION_ATTEMPTS))
+    deps.log(`[neon] parent ${parent.name} (${parent.id}) is at LSN ${parentLsn}`)
+
+    if (existing) {
+      // Every run is a full rebuild. Delete by ID: the recorded name may be stale, and a name is
+      // never proof of ownership.
+      deps.log(`[neon] deleting recorded branch ${existing.branchId} (${existing.branchName}) to rebuild from scratch…`)
+      await deleteRecordedBranch(deps, existing, parent.id)
     }
-    clearCheckBranchState()
-  } catch (error) {
-    console.warn(`[neondb-branch] WARNING: could not check for/delete a leaked check branch: ${error instanceof Error ? error.message : error}`)
-  }
 
-  assertDisposableChildBranch(target, parent)
-  const exists = await withRetry('check branch exists', () => branchExists(projectId, target), 3)
-  const action = planTeardown(exists)
-  if (action.type === 'alreadyGone') {
-    console.log(`[neondb-branch] branch ${target} not found in project ${projectId} — treating as already torn down.`)
-  } else {
-    console.log(`[neon] deleting branch ${target}…`)
-    await deleteBranch(projectId, target, { inherit: true })
-  }
-  stripEnvVars(ENV_FILE, DB_ENV_VARS)
-  rmSync(stateFilePath(), { force: true })
-  console.log('✅ [neondb-branch] workspace database torn down.')
-}
+    // Creation intent is recorded BEFORE the POST, so an interrupted or ambiguous creation is always
+    // visible afterwards instead of silently leaking a branch nothing tracks.
+    writeState({ branchId: null, branchName, projectId, status: 'creating' })
 
-/**
- * Runs before every dev-server start. See planSync() for the full decision table.
- */
-
-export type SyncGateReason =
-  | { type: 'unprovisioned' }
-  | { type: 'pending' }
-  | { type: 'deadBranch'; recorded: string }
-
-export type SyncAction =
-  | { type: 'gate'; reason: SyncGateReason }
-  | { type: 'noop' }
-  | { type: 'reconcile'; to: string }
-  | { type: 'rename'; from: string; to: string }
-  | { type: 'collision'; from: string; to: string }
-
-/**
- * Pure decision function for sync(). Hard gates (unprovisioned / pending / dead recorded branch)
- * always win. Only once past those does a recorded-vs-current mismatch get evaluated: normal
- * rename, a reconcile-only self-heal (a prior sync already renamed on Neon but crashed before
- * persisting locally), or — when the target name is already a DIFFERENT live branch — a hard
- * collision gate instead of a rename that would silently fail and leave a stale DATABASE_URL.
- */
-export function planSync(
-  state: { branch: string; phase: 'pending' | 'ready' } | null,
-  current: string,
-  recordedExists: boolean,
-  currentExists: boolean,
-): SyncAction {
-  if (!state) return { type: 'gate', reason: { type: 'unprovisioned' } }
-  if (state.phase === 'pending') return { type: 'gate', reason: { type: 'pending' } }
-  if (state.branch === current) {
-    return recordedExists ? { type: 'noop' } : { type: 'gate', reason: { type: 'deadBranch', recorded: state.branch } }
-  }
-  if (!recordedExists && currentExists) return { type: 'reconcile', to: current }
-  if (!recordedExists && !currentExists) return { type: 'gate', reason: { type: 'deadBranch', recorded: state.branch } }
-  if (currentExists) return { type: 'collision', from: state.branch, to: current }
-  return { type: 'rename', from: state.branch, to: current }
-}
-
-function throwForGate(reason: SyncGateReason): never {
-  if (reason.type === 'unprovisioned') {
-    throw new Error('Workspace not provisioned — run `db:provision` (or `worktree:setup`) before starting the dev server.')
-  }
-  if (reason.type === 'pending') {
-    throw new Error('Workspace database setup did not finish (state is "pending") — re-run `db:provision` to recover it.')
-  }
-  throw new Error(`Recorded branch "${reason.recorded}" no longer exists in Neon — re-run \`db:provision\` to recreate it.`)
-}
-
-function collisionMessage(action: Extract<SyncAction, { type: 'collision' }>): string {
-  return (
-    `Refusing to start: this workspace's identity resolves to "${action.to}", which already exists ` +
-    `as its own live Neon branch, while "${action.from}" (a different, still-live branch) is ` +
-    `recorded here. These are two previously-provisioned workspaces colliding — renaming would ` +
-    `silently fail and leave a stale DATABASE_URL. Re-run \`db:provision\` to rebuild "${action.to}" ` +
-    `for this checkout (discards its current data), or check back out whatever matches "${action.from}".`
-  )
-}
-
-/**
- * Runs before every dev-server start (chained in front of it — see the "dev" package.json script).
- * Hard gates throw (blocking the dev server, deliberately); a rename/reconcile is best-effort and
- * never blocks the dev server on its own failure. See planSync() for the full decision table.
- */
-async function sync(): Promise<void> {
-  const raw = resolveWorkspaceName(process.env, process.cwd(), currentGitContext(process.cwd()))
-  const current = workspaceBranchName(raw)
-  const state = readBranchStateFull()
-
-  if (!state || state.phase === 'pending') {
-    const action = planSync(state, current, false, false)
-    if (action.type === 'gate') throwForGate(action.reason)
-    return
-  }
-
-  const projectId = requireEnv('NEON_PROJECT_ID')
-  requireEnv('NEON_API_KEY')
-  const recordedExists = await withRetry('check recorded branch', () => branchExists(projectId, state.branch), 3)
-  const currentExists =
-    state.branch === current ? recordedExists : await withRetry('check current branch', () => branchExists(projectId, current), 3)
-  const action = planSync(state, current, recordedExists, currentExists)
-
-  switch (action.type) {
-    case 'noop':
-      return
-    case 'gate':
-      throwForGate(action.reason)
-      return
-    case 'collision':
-      throw new Error(collisionMessage(action))
-    case 'reconcile':
-      writeBranchState(action.to)
-      console.log(`[neondb-branch] recorded branch was already renamed on Neon — reconciled local state to "${action.to}".`)
-      return
-    case 'rename': {
-      try {
-        const parent = process.env.NEON_PARENT_BRANCH ?? ''
-        assertDisposableChildBranch(action.from, parent)
-        assertDisposableChildBranch(action.to, parent)
-        await renameBranch(projectId, action.from, action.to)
-        writeBranchState(action.to)
-        console.log(`✅ [neondb-branch] renamed ${action.from} → ${action.to} to match the current workspace.`)
-      } catch (error) {
-        console.warn(`[neondb-branch] WARNING: branch rename failed: ${error instanceof Error ? error.message : error}`)
+    deps.log(`[neon] creating ordinary child branch ${branchName} off ${parent.name} at ${parentLsn}…`)
+    let created: CreatedBranch
+    try {
+      created = await withRetry('create branch', () => deps.neon.createBranch(projectId, { name: branchName, parentId: parent.id, parentLsn }), mutating(deps, 3))
+    } catch (error) {
+      if (error instanceof NeonRequestError && error.ambiguous) {
+        throw new AmbiguousCreateError(
+          `Neon did not confirm whether it created "${branchName}" (${error.message}). Creation ` +
+            `intent has been kept in ${stateFilePath()} as status "creating". This is NOT retried ` +
+            'automatically and the branch is NOT looked up by name: a branch with that name may ' +
+            `belong to another workspace. Check project ${projectId} in the Neon console, delete ` +
+            `"${branchName}" if it is yours, then delete ${stateFilePath()} and re-run provision.`,
+        )
       }
+      if (error instanceof NeonRequestError && !error.ambiguous) clearState()
+      throw error
+    }
+
+    // Verify before anything destructive touches it.
+    try {
+      assertOwnedDisposableBranch(created.branch, { projectId, name: branchName, parentId: parent.id, parentLsn })
+    } catch (error) {
+      // A response that failed ownership verification cannot authorize deletion either. Preserve
+      // creating intent for manual recovery, even when the reported id looks disposable.
+      throw new FatalError(
+        `${error instanceof Error ? error.message : error} — Neon reported creating branch ` +
+          `${created.branch.id ?? '(no id)'}; delete it in the console only if it is yours, then remove ${stateFilePath()}. ` +
+          'Creation intent has been retained. Re-run provision once the cause is understood.',
+      )
+    }
+    const branchId = created.branch.id
+    const ownership: OwnershipReceipt = { branchId, projectId, parentId: parent.id, parentLsn, databaseTarget: null }
+    writeOwnership(ownership)
+    writeState({ branchId, branchName, projectId, status: 'pending' })
+    deps.log(`[neon] created ${branchId} (parent ${created.branch.parent_id} @ ${created.branch.parent_lsn})`)
+
+    try {
+      // The create response may list a different database/role first. Resolve the selected database
+      // for this verified child explicitly, exactly as for the parent.
+      const uri = await withRetry('fetch connection string', () => deps.neon.connectionUri(projectId, branchId), idempotent(deps, 5))
+      await waitForFirstConnection(deps, uri)
+
+      const known = await deps.knownTables()
+      deps.log('[purge] emptying inherited production rows (migration ledger preserved)…')
+      const plan = await withConnection(deps, uri, async (client) => {
+        const discovered = await discoverTables(client)
+        const purgePlan = planPurge(discovered, known)
+        await purgeApplicationRows(client, purgePlan)
+        await verifyTablesEmpty(client, purgePlan.truncate)
+        return purgePlan
+      })
+      deps.log(`[purge] emptied ${plan.truncate.length} table(s); preserved ${plan.preserved.length} (${plan.preserved.join(', ') || 'none'})`)
+
+      // Migrate and seed reach the branch through their child-process environment only — the
+      // provisioning migrator is the ONE thing allowed to touch a pending branch.
+      deps.log(`[${ORM}] applying migrations this checkout has that the parent did not…`)
+      await deps.deployMigrations(uri)
+      await deps.seed(uri)
+
+      // Publishing is the last thing that happens before `ready`, and it happens only after the
+      // purge was verified. Until this point nothing outside provisioning can reach the branch.
+      writeOwnership({ ...ownership, databaseTarget: workspaceState.databaseTarget(uri) })
+      upsertEnvVars(envFilePath(), {
+        ...Object.fromEntries(DB_ENV_VARS.map((name) => [name, uri])),
+        NEON_API_KEY: apiKey,
+        NEON_PROJECT_ID: projectId,
+        NEON_PARENT_BRANCH: parentRef,
+      })
+      deps.log(`[neondb-branch] wrote ${DB_ENV_VARS.join(', ')} and Neon credentials → ${envFilePath()}`)
+
+      writeState({ branchId, branchName, projectId, status: 'ready' })
+      deps.log('✅ [neondb-branch] workspace database ready.')
+    } catch (error) {
+      deps.warn('[neondb-branch] setup failed after the branch was created — deleting it so the next attempt starts clean.')
+      try {
+        await deleteRecordedBranch(deps, { branchId, branchName, projectId, status: 'pending' }, parent.id)
+      } catch (cleanupError) {
+        // Cleanup failed: KEEP the recovery state so teardown can still find the branch by id, and
+        // say so loudly. Silently dropping the record is how a branch leaks forever.
+        deps.warn(
+          `[neondb-branch] WARNING: could not delete branch ${branchId} ` +
+            `(${cleanupError instanceof Error ? cleanupError.message : cleanupError}). ` +
+            `${stateFilePath()} still records it — run teardown to remove it.`,
+        )
+      }
+      throw error
+    }
+  } finally {
+    releaseLock()
+  }
+}
+
+export async function sync(deps: Deps = defaultDeps()): Promise<void> {
+  const releaseLock = acquireLock('sync')
+  try {
+    const state = readState()
+    if (!state) {
+      throw new FatalError('Workspace not provisioned — run `db:provision` (or `worktree:setup`) before starting the dev server.')
+    }
+    if (state.status !== 'ready') {
+      throw new FatalError(
+        `Workspace database is in state "${state.status}", not "ready" — the app must not start ` +
+          'against it. Re-run `db:provision` to rebuild it (or `teardown` to release it).',
+      )
+    }
+    const missingUrls = DB_ENV_VARS.filter((name) => !managedVarsInFile(envFilePath()).includes(name))
+    if (missingUrls.length > 0) {
+      throw new FatalError(
+        `${envFilePath()} does not define ${missingUrls.join(', ')} for this workspace. Re-run ` +
+          '`db:provision`. (An ambient DATABASE_URL does not count — that is the shared database.)',
+      )
+    }
+
+    const projectId = requireEnv('NEON_PROJECT_ID')
+    requireEnv('NEON_API_KEY')
+    assertProjectMatches(state, projectId)
+    const ownership = readOwnership(state)
+    const managed = parseEnv(readEnvFileRaw(envFilePath()))
+    for (const name of DB_ENV_VARS) workspaceState.assertDatabaseTarget(ownership, managed[name])
+
+    const branch = await withRetry('verify recorded branch', () => deps.neon.getBranchById(projectId, state.branchId as string), idempotent(deps, 3))
+    if (!branch) {
+      throw new FatalError(`Recorded branch ${state.branchId} no longer exists in Neon — re-run \`db:provision\` to recreate it.`)
+    }
+
+    // The NAME may have changed on either side. Neon's is authoritative for display; a name that now
+    // matches some other workspace's identity is NOT a reason to switch branches.
+    if (branch.name !== state.branchName) {
+      deps.log(`[neondb-branch] recorded branch ${state.branchId} is now named "${branch.name}" (was "${state.branchName}") — refreshing the display name.`)
+      writeState({ ...state, branchName: branch.name })
+    }
+
+    // Purely informational. Identity is not ownership: an unresolvable identity (detached HEAD) is
+    // no reason to block a workspace whose recorded branch is verified and ready.
+    let currentIdentityName: string | null = null
+    try {
+      currentIdentityName = workspaceBranchName(resolveWorkspaceName(process.env, process.cwd(), currentGitContext(process.cwd())))
+    } catch {
+      currentIdentityName = null
+    }
+    if (currentIdentityName !== null && currentIdentityName !== branch.name) {
+      deps.log(
+        `[neondb-branch] this checkout's identity would name a branch "${currentIdentityName}", but ` +
+          `it owns ${state.branchId} ("${branch.name}"). Keeping the recorded database — a git ` +
+          'branch change or workspace rename never switches database ownership. Run `db:provision` ' +
+          'if you deliberately want a fresh database for the new identity.',
+      )
+    }
+  } finally {
+    releaseLock()
+  }
+}
+
+export async function teardown(deps: Deps = defaultDeps()): Promise<void> {
+  const releaseLock = acquireLock('teardown')
+  let released = false
+  try {
+    const state = readState() // also rejects the legacy format
+    if (!state) {
+      deps.log('[neondb-branch] nothing recorded for this workspace — nothing to tear down.')
+      stripEnvVars(envFilePath(), DB_ENV_VARS)
       return
     }
+    const projectId = requireEnv('NEON_PROJECT_ID')
+    requireEnv('NEON_API_KEY')
+    assertProjectMatches(state, projectId)
+
+    if (state.status === 'creating') {
+      throw new FatalError(
+        `${stateFilePath()} records an UNRESOLVED branch creation (status "creating", no id). There ` +
+          'is no id to delete and a name is not proof of ownership, so teardown will not guess. ' +
+          `Check project ${projectId} for a branch named "${state.branchName}", delete it in the ` +
+          `Neon console if it is yours, then delete ${stateFilePath()}.`,
+      )
+    }
+
+    const branchId = state.branchId as string
+    deps.log(`[neon] deleting branch ${branchId} (${state.branchName})…`)
+    await deleteRecordedBranch(deps, state)
+    releaseLock()
+    released = true
+    // Only after the lock file itself is gone can the directory be empty. Never recursive: anything
+    // else the project keeps in .neondb/ is not ours to delete.
+    if (removeStateDirIfEmpty()) deps.log(`[neondb-branch] removed empty ${stateDir()}/`)
+    deps.log('✅ [neondb-branch] workspace database torn down.')
+  } finally {
+    if (!released) releaseLock()
   }
 }
 
@@ -1100,7 +1524,7 @@ async function main(): Promise<void> {
     else if (mode === 'teardown') await teardown()
     else if (mode === 'sync') await sync()
     else {
-      console.error('Usage: tsx scripts/neondb-branch.ts <provision|teardown|sync>')
+      console.error('Usage: tsx scripts/neondb-branch.ts <provision|sync|teardown>')
       process.exit(2)
     }
   } catch (error) {
@@ -1109,8 +1533,7 @@ async function main(): Promise<void> {
   }
 }
 
-// Run only when executed directly (e.g. `tsx scripts/neondb-branch.ts provision`),
-// so unit tests can import the pure helpers above without triggering the CLI.
+// Run only when executed directly, so unit tests can import the helpers above without the CLI.
 if (process.argv[1] && /neondb-branch\.[cm]?[jt]s$/.test(process.argv[1])) {
   void main()
 }

@@ -1,554 +1,1063 @@
-// Unit tests for the safety-critical pure helpers in scripts/neondb-branch.ts.
-// When you copy this into a project, adjust the import path to your layout
-// (e.g. `../../scripts/neondb-branch` from `__tests__/scripts/`). Runs under Jest or Vitest.
-import { createHash } from 'node:crypto'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+// Regression tests for scripts/neondb-branch.ts — lifecycle state, ownership, and the fail-closed
+// paths. When you copy this into a project, adjust the import path to your layout.
+//
+// Nothing here talks to Neon or to a real Postgres: the control plane is a fake implementing the
+// same NeonClient interface the production code uses, with response shapes taken from live Neon API
+// output. The purge itself is exercised against real Postgres in purge.test.ts.
+import { spawnSync } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  assertDisposableChildBranch,
-  assertDisposableCheckBranch,
-  buildDrizzleLedgerBaselineSql,
-  buildPrismaLedgerBaselineSql,
-  checkBranchName,
-  clearCheckBranchState,
+  acquireLock,
+  assertNoLegacyState,
+  assertOwnedDisposableBranch,
+  assertProjectMatches,
+  AmbiguousCreateError,
+  backoffMs,
+  buildCountSql,
+  buildTruncateSql,
+  createNeonRestClient,
+  DISCOVER_TABLES_SQL,
   FatalError,
-  loadEnvFile,
-  planSync,
-  planTeardown,
-  readBranchState,
-  readCheckBranchState,
+  FIRST_CONNECTION_ATTEMPTS,
+  NeonRequestError,
+  parseState,
+  planPurge,
+  prismaKnownTables,
+  PRISMA_TX_MAXWAIT_MS,
+  provision,
+  quoteIdent,
+  readState,
+  removeStateDirIfEmpty,
   resolveWorkspaceName,
-  setupIsPending,
   stripEnvVars,
+  sync,
+  teardown,
   upsertEnvVars,
   withRetry,
   workspaceBranchName,
-  writeBranchState,
-  writeCheckBranchState,
+  writeState as persistState,
+  type Deps,
+  type DiscoveredTable,
   type GitContext,
+  type NeonBranch,
+  type NeonClient,
+  type SqlClient,
+  type SqlConnect,
+  type WorkspaceState,
 } from '../scripts/neondb-branch'
 
-describe('neondb-branch helpers', () => {
-  const ORIGINAL_ENV = process.env
-  let sandbox: string
+const PROJECT = 'orange-forest-39329018'
+const PARENT_ID = 'br-sweet-resonance-arsioaz3'
+const PARENT_LSN = '0/1BBADB0'
 
-  // Point the state-file helpers at a throwaway directory (via the script's test-only
-  // NEONDB_BRANCH_STATE_FILE override) so the tests can never touch — or destroy, if the run is
-  // interrupted — the REAL .neondb/branch of the workspace they happen to run inside.
-  // (No process.chdir(): it is unsupported in worker threads, e.g. Vitest's threads pool.)
-  beforeAll(() => {
-    sandbox = mkdtempSync(join(tmpdir(), 'neondb-branch-test-'))
-    ORIGINAL_ENV.NEONDB_BRANCH_STATE_FILE = join(sandbox, '.neondb', 'branch')
+/** Shapes copied from live `GET /projects/{id}/branches` output. */
+function parentBranch(): NeonBranch {
+  return { id: PARENT_ID, project_id: PROJECT, name: 'production', primary: true, default: true, protected: true, current_state: 'ready', init_source: 'parent-data' }
+}
+function childBranch(overrides: Partial<NeonBranch> = {}): NeonBranch {
+  return {
+    id: 'br-dawn-river-arrz6rux',
+    project_id: PROJECT,
+    name: 'workspace/feature-x',
+    parent_id: PARENT_ID,
+    parent_lsn: PARENT_LSN,
+    primary: false,
+    default: false,
+    protected: false,
+    current_state: 'ready',
+    init_source: 'parent-data',
+    ...overrides,
+  }
+}
+
+interface FakeNeon extends NeonClient {
+  calls: string[]
+  branches: Map<string, NeonBranch>
+  failDeleteWith?: Error
+  failCreateWith?: Error
+}
+
+function fakeNeon(options: { branches?: NeonBranch[]; created?: NeonBranch; connectionUri?: string } = {}): FakeNeon {
+  const branches = new Map<string, NeonBranch>((options.branches ?? [parentBranch()]).map((b) => [b.id, b]))
+  const client: FakeNeon = {
+    calls: [],
+    branches,
+    async findBranchByName(projectId, name) {
+      client.calls.push(`findBranchByName(${projectId},${name})`)
+      return [...branches.values()].find((b) => b.name === name && b.project_id === projectId) ?? null
+    },
+    async getBranchById(projectId, branchId) {
+      client.calls.push(`getBranchById(${projectId},${branchId})`)
+      const found = branches.get(branchId)
+      return found && found.project_id === projectId ? found : null
+    },
+    async createBranch(projectId, opts) {
+      client.calls.push(`createBranch(${projectId},${opts.name},${opts.parentId},${opts.parentLsn})`)
+      if (client.failCreateWith) throw client.failCreateWith
+      const branch = options.created ?? childBranch({ name: opts.name, parent_id: opts.parentId, parent_lsn: opts.parentLsn })
+      branches.set(branch.id, branch)
+      return { branch, connectionUri: options.connectionUri ?? 'postgres://u:p@ep-child-123.us-east-2.aws.neon.tech/appdb' }
+    },
+    async deleteBranch(projectId, branchId) {
+      client.calls.push(`deleteBranch(${projectId},${branchId})`)
+      if (client.failDeleteWith) throw client.failDeleteWith
+      return branches.delete(branchId) ? 'deleted' : 'absent'
+    },
+    async connectionUri(projectId, branchId) {
+      client.calls.push(`connectionUri(${projectId},${branchId})`)
+      return `postgres://u:p@ep-${branchId}.us-east-2.aws.neon.tech/appdb`
+    },
+  }
+  return client
+}
+
+interface FakeSql {
+  connect: SqlConnect
+  statements: string[]
+  connectAttempts: number
+}
+
+/** A scripted SQL session: enough to satisfy LSN capture, discovery, purge and the empty check. */
+function fakeSql(options: { tables?: DiscoveredTable[]; failConnectTimes?: number; countsAfterPurge?: Record<string, number> } = {}): FakeSql {
+  const state: FakeSql = { connect: null as unknown as SqlConnect, statements: [], connectAttempts: 0 }
+  const tables = options.tables ?? [
+    { schema: 'public', name: 'users', extensionOwned: false },
+    { schema: 'public', name: '_prisma_migrations', extensionOwned: false },
+  ]
+  state.connect = async (uri: string) => {
+    state.connectAttempts++
+    if (options.failConnectTimes !== undefined && state.connectAttempts <= options.failConnectTimes) {
+      throw new Error(`ECONNREFUSED connecting to ${uri}`)
+    }
+    const client: SqlClient = {
+      async query<T>(sql: string): Promise<T[]> {
+        state.statements.push(sql)
+        if (sql.includes('pg_current_wal_lsn')) return [{ lsn: PARENT_LSN }] as unknown as T[]
+        if (sql.trim() === DISCOVER_TABLES_SQL.trim()) {
+          return tables.map((t) => ({ schema: t.schema, name: t.name, extension_owned: t.extensionOwned })) as unknown as T[]
+        }
+        if (sql.includes('count(*)')) {
+          const counts = options.countsAfterPurge ?? {}
+          return sql
+            .split('UNION ALL')
+            .map((part) => {
+              const qualified = /'([^']+)' AS qualified/.exec(part)?.[1] ?? ''
+              return { qualified, rows: counts[qualified] ?? 0 }
+            }) as unknown as T[]
+        }
+        return [] as unknown as T[]
+      },
+    }
+    return { client, end: async () => undefined }
+  }
+  return state
+}
+
+let sandbox: string
+let neon: FakeNeon
+let sql: FakeSql
+let logs: string[]
+let warnings: string[]
+
+function makeDeps(overrides: Partial<Deps> = {}): Deps {
+  return {
+    neon,
+    connect: sql.connect,
+    knownTables: async () => ['public.users'],
+    deployMigrations: () => undefined,
+    seed: () => undefined,
+    sleep: () => undefined, // never actually wait in tests
+    log: (message) => logs.push(message),
+    warn: (message) => warnings.push(message),
+    ...overrides,
+  }
+}
+
+beforeEach(() => {
+  sandbox = mkdtempSync(join(tmpdir(), 'neondb-branch-test-'))
+  vi.stubEnv('NEONDB_OWNERSHIP_FILE', join(sandbox, '.git', 'neondb-workspace.json'))
+  vi.stubEnv('NEONDB_STATE_DIR', join(sandbox, '.neondb'))
+  vi.stubEnv('NEONDB_BRANCH_ENV_FILE', join(sandbox, '.env.neondb'))
+  vi.stubEnv('NEON_PROJECT_ID', PROJECT)
+  vi.stubEnv('NEON_API_KEY', 'neon_api_key_test')
+  vi.stubEnv('NEON_PARENT_BRANCH', 'production')
+  vi.stubEnv('WORKSPACE_NAME', 'feature-x')
+  vi.stubEnv('DATABASE_URL', '')
+  neon = fakeNeon()
+  sql = fakeSql()
+  logs = []
+  warnings = []
+})
+
+afterEach(() => {
+  vi.unstubAllEnvs()
+  rmSync(sandbox, { recursive: true, force: true })
+})
+
+const stateFile = () => join(sandbox, '.neondb', 'state.json')
+const readStateFile = () => JSON.parse(readFileSync(stateFile(), 'utf8'))
+
+// A previously provisioned workspace also has a receipt in its private Git metadata.
+function writeState(state: WorkspaceState, target = 'ep-child-123.us-east-2.aws.neon.tech:5432/appdb'): void {
+  persistState(state)
+  if (state.branchId) {
+    mkdirSync(join(sandbox, '.git'), { recursive: true })
+    writeFileSync(join(sandbox, '.git', 'neondb-workspace.json'), JSON.stringify({
+      branchId: state.branchId, projectId: state.projectId, parentId: PARENT_ID,
+      parentLsn: PARENT_LSN, databaseTarget: target,
+    }))
+  }
+}
+
+describe('state file (.neondb/state.json)', () => {
+  const valid = { branchId: 'br-abc', branchName: 'workspace/x', projectId: PROJECT, status: 'ready' as const }
+
+  it('round-trips a valid state atomically, leaving no temp file behind', () => {
+    writeState(valid)
+    expect(readState()).toEqual(valid)
+    expect(readdirSync(join(sandbox, '.neondb'))).toEqual(['state.json'])
   })
+
+  it('rejects malformed JSON rather than guessing', () => {
+    mkdirSync(join(sandbox, '.neondb'), { recursive: true })
+    writeFileSync(stateFile(), '{not json')
+    expect(() => readState()).toThrow(/not valid JSON/)
+  })
+
+  it.each(['branchId', 'branchName', 'projectId', 'status'])('rejects state missing "%s"', (key) => {
+    const incomplete: Record<string, unknown> = { ...valid }
+    delete incomplete[key]
+    expect(() => parseState(JSON.stringify(incomplete))).toThrow(/incomplete: missing/)
+  })
+
+  it('rejects an unknown status', () => {
+    expect(() => parseState(JSON.stringify({ ...valid, status: 'provisioned' }))).toThrow(/unknown status/)
+  })
+
+  it('rejects an unrecognized key — a foreign or drifted file is not interpreted loosely', () => {
+    expect(() => parseState(JSON.stringify({ ...valid, databaseUrl: 'postgres://…' }))).toThrow(/unrecognized key/)
+  })
+
+  it('allows branchId null ONLY with status "creating"', () => {
+    expect(parseState(JSON.stringify({ ...valid, branchId: null, status: 'creating' })).branchId).toBeNull()
+    expect(() => parseState(JSON.stringify({ ...valid, branchId: null, status: 'ready' }))).toThrow(/"branchId" is not a Neon branch id/)
+    expect(() => parseState(JSON.stringify({ ...valid, branchId: 'br-abc', status: 'creating' }))).toThrow(/creation intent is unresolved/)
+  })
+
+  it('rejects a branchId that is not a Neon branch id', () => {
+    expect(() => parseState(JSON.stringify({ ...valid, branchId: 'workspace/x' }))).toThrow(/not a Neon branch id/)
+  })
+
+  it('carries no credentials', () => {
+    writeState(valid)
+    const raw = readFileSync(stateFile(), 'utf8')
+    expect(raw).not.toMatch(/neon_api_key|password|postgres:\/\//i)
+  })
+
+  it('refuses a project mismatch BEFORE any Neon call', () => {
+    expect(() => assertProjectMatches({ ...valid, projectId: 'some-other-project' }, PROJECT)).toThrow(/Refusing to contact Neon/)
+  })
+})
+
+describe('ownership receipt in real Git worktrees', () => {
+  it('uses distinct per-worktree metadata that stays stable when a worktree moves', () => {
+    const primary = join(sandbox, 'primary')
+    const linked = join(sandbox, 'linked')
+    const moved = join(sandbox, 'moved')
+    const git = (args: string[]) => {
+      const result = spawnSync('git', args, { encoding: 'utf8' })
+      expect(result.status, result.stderr).toBe(0)
+    }
+    git(['init', '--quiet', primary])
+    git(['-C', primary, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.com', '-c', 'commit.gpgsign=false', 'commit', '--quiet', '--allow-empty', '-m', 'fixture'])
+    git(['-C', primary, 'worktree', 'add', '--quiet', '-b', 'linked', linked])
+    const receiptPath = (cwd: string) => {
+      const result = spawnSync(process.execPath, ['-e', 'process.stdout.write(require(process.argv[1]).ownershipFilePath())', fileURLToPath(new URL('../scripts/workspace-state.cjs', import.meta.url))], {
+        cwd, encoding: 'utf8', env: { PATH: process.env.PATH ?? '' },
+      })
+      expect(result.status, result.stderr).toBe(0)
+      return result.stdout
+    }
+    const primaryReceipt = receiptPath(primary)
+    const linkedReceipt = receiptPath(linked)
+    expect(primaryReceipt).not.toBe(linkedReceipt)
+    writeFileSync(linkedReceipt, 'private receipt')
+    git(['-C', primary, 'worktree', 'move', linked, moved])
+    expect(receiptPath(moved)).toBe(linkedReceipt)
+    expect(readFileSync(receiptPath(moved), 'utf8')).toBe('private receipt')
+    expect(existsSync(primaryReceipt)).toBe(false)
+  })
+})
+
+describe('legacy state detection (no compatibility path)', () => {
+  it('refuses to run while the old .neondb/branch record is present', () => {
+    mkdirSync(join(sandbox, '.neondb'), { recursive: true })
+    writeFileSync(join(sandbox, '.neondb', 'branch'), 'workspace/feature-x\nready\n')
+    expect(() => assertNoLegacyState()).toThrow(/is not proof of ownership/)
+    // The error has to be actionable on its own: what to delete, and where the steps are.
+    expect(() => readState()).toThrow(/delete the branch it names from the Neon console/)
+    expect(() => readState()).toThrow(/rm -rf/)
+    expect(() => readState()).toThrow(/SKILL\.md/)
+  })
+
+  it('refuses to run while a leaked temporary-branch record is present, so teardown cannot abandon it', () => {
+    mkdirSync(join(sandbox, '.neondb'), { recursive: true })
+    writeFileSync(join(sandbox, '.neondb', 'branch-check'), 'tmp/feature-x\n')
+    expect(() => assertNoLegacyState()).toThrow(/leaked disposable clone/)
+    expect(() => assertNoLegacyState()).toThrow(/rm -rf/)
+  })
+
+  it('teardown refuses rather than silently skipping a legacy record', async () => {
+    mkdirSync(join(sandbox, '.neondb'), { recursive: true })
+    writeFileSync(join(sandbox, '.neondb', 'branch'), 'workspace/feature-x\nready\n')
+    await expect(teardown(makeDeps())).rejects.toThrow(/is not proof of ownership/)
+    expect(neon.calls).toEqual([]) // and it never quietly reports "nothing to tear down"
+  })
+})
+
+describe('lifecycle lock', () => {
+  it('does not reclaim a lock whose PID has not been written yet', () => {
+    mkdirSync(join(sandbox, '.neondb'), { recursive: true })
+    writeFileSync(join(sandbox, '.neondb', 'lock'), '')
+    expect(() => acquireLock('teardown')).toThrow(/cannot prove|Cannot prove/)
+    expect(readFileSync(join(sandbox, '.neondb', 'lock'), 'utf8')).toBe('')
+  })
+
+  it('blocks a competing stale-lock reclaimer until the first has acquired ownership', () => {
+    acquireLock('dead')
+    let competitorError: unknown
+    const release = acquireLock('first', () => {
+      try { acquireLock('competitor', () => false) } catch (error) { competitorError = error }
+      return false
+    })
+    expect(competitorError).toBeInstanceOf(FatalError)
+    expect(JSON.parse(readFileSync(join(sandbox, '.neondb', 'lock'), 'utf8')).label).toBe('first')
+    release()
+  })
+  it('serializes commands: a second holder is refused while the first is alive', () => {
+    const release = acquireLock('provision')
+    expect(() => acquireLock('teardown')).toThrow(/Another neondb-branch command \(provision/)
+    release()
+    acquireLock('teardown')()
+  })
+
+  it('reclaims a lock whose holder process is gone', () => {
+    acquireLock('provision', () => true)
+    const release = acquireLock('teardown', () => false) // the recorded pid is dead
+    expect(typeof release).toBe('function')
+    release()
+  })
+})
+
+describe('removeStateDirIfEmpty', () => {
+  it('removes the directory when it is empty', () => {
+    mkdirSync(join(sandbox, '.neondb'), { recursive: true })
+    expect(removeStateDirIfEmpty()).toBe(true)
+    expect(existsSync(join(sandbox, '.neondb'))).toBe(false)
+  })
+
+  it('preserves the directory — and its contents — when anything else lives there', () => {
+    mkdirSync(join(sandbox, '.neondb'), { recursive: true })
+    writeFileSync(join(sandbox, '.neondb', 'notes.md'), 'keep me')
+    expect(removeStateDirIfEmpty()).toBe(false)
+    expect(readFileSync(join(sandbox, '.neondb', 'notes.md'), 'utf8')).toBe('keep me')
+  })
+})
+
+describe('provision', () => {
+  it('clears creation intent after a definitively rejected POST', async () => {
+    neon.failCreateWith = new NeonRequestError('branch limit', 422, false)
+    await expect(provision(makeDeps())).rejects.toThrow('branch limit')
+    expect(readState()).toBeNull()
+  })
+
+  it('uses the selected child database instead of an arbitrary URI in the create response', async () => {
+    neon = fakeNeon({ connectionUri: 'postgres://u:p@wrong-db-host/wrong' })
+    const migrated: string[] = []
+    await provision(makeDeps({ deployMigrations: (uri) => { migrated.push(uri) } }))
+    expect(migrated).toEqual(['postgres://u:p@ep-br-dawn-river-arrz6rux.us-east-2.aws.neon.tech/appdb'])
+  })
+
+  it('refuses to delete its configured parent during a rebuild', async () => {
+    const parent = childBranch({ id: PARENT_ID, name: 'stand-in-parent', parent_id: 'br-grandparent' })
+    neon = fakeNeon({ branches: [parent] })
+    vi.stubEnv('NEON_PARENT_BRANCH', PARENT_ID)
+    writeState({ branchId: PARENT_ID, branchName: parent.name, projectId: PROJECT, status: 'ready' })
+    await expect(provision(makeDeps())).rejects.toThrow(/Refusing to delete/)
+    expect(neon.calls.some((call) => call.startsWith('deleteBranch'))).toBe(false)
+  })
+
+  it('keeps deleting state and does not create again while the old branch remains', async () => {
+    neon = fakeNeon({ branches: [parentBranch(), childBranch()] })
+    writeState({ branchId: childBranch().id, branchName: childBranch().name, projectId: PROJECT, status: 'ready' })
+    neon.deleteBranch = async () => {
+      expect(readStateFile().status).toBe('deleting')
+      return 'deleted'
+    }
+    await expect(provision(makeDeps())).rejects.toThrow(/still present/)
+    expect(readStateFile().status).toBe('deleting')
+    expect(neon.calls.some((call) => call.startsWith('createBranch'))).toBe(false)
+  })
+
+  it('retains the branch id when cleanup was accepted but never finished', async () => {
+    neon.deleteBranch = async () => 'deleted'
+    await expect(provision(makeDeps({ seed: () => { throw new Error('seed failed') } }))).rejects.toThrow('seed failed')
+    expect(readState()).toMatchObject({ branchId: childBranch().id, status: 'deleting' })
+    expect(warnings.join('\n')).toMatch(/still present/)
+  })
+  it('walks creating → pending → ready, creating an ordinary child at the captured parent LSN', async () => {
+    const transitions: string[] = []
+    const deps = makeDeps({
+      deployMigrations: () => {
+        transitions.push(`migrate:${readStateFile().status}`)
+      },
+      seed: () => {
+        transitions.push(`seed:${readStateFile().status}`)
+      },
+    })
+    await provision(deps)
+
+    expect(neon.calls).toContain(`createBranch(${PROJECT},workspace/feature-x,${PARENT_ID},${PARENT_LSN})`)
+    // Migrations run only after the purge, and only while the branch is still `pending`.
+    expect(transitions).toEqual(['migrate:pending', 'seed:pending'])
+    expect(readStateFile()).toEqual({ branchId: 'br-dawn-river-arrz6rux', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' })
+  })
+
+  it('purges before publishing connection URLs, and truncates in a transaction', async () => {
+    let envAtTruncate: boolean | null = null
+    const watchingSql = fakeSql()
+    const originalConnect = watchingSql.connect
+    sql = {
+      ...watchingSql,
+      connect: async (uri) => {
+        const session = await originalConnect(uri)
+        return {
+          ...session,
+          client: {
+            query: async <T>(statement: string, params?: unknown[]) => {
+              if (statement.startsWith('TRUNCATE')) envAtTruncate = existsSync(join(sandbox, '.env.neondb'))
+              return session.client.query<T>(statement, params)
+            },
+          },
+        }
+      },
+    }
+    await provision(makeDeps())
+
+    const purge = sql.statements.filter((s) => s === 'BEGIN' || s.startsWith('TRUNCATE') || s === 'COMMIT')
+    expect(purge).toEqual(['BEGIN', 'TRUNCATE TABLE "public"."users" RESTART IDENTITY RESTRICT', 'COMMIT'])
+    expect(envAtTruncate).toBe(false) // no URL was publishable while production rows were still there
+    expect(readFileSync(join(sandbox, '.env.neondb'), 'utf8')).toMatch(/DATABASE_URL='postgres:\/\//)
+  })
+
+  it('preserves the inherited migration ledger — the whole reason an ordinary child is used', async () => {
+    await provision(makeDeps())
+    const truncate = sql.statements.find((s) => s.startsWith('TRUNCATE')) ?? ''
+    expect(truncate).not.toContain('_prisma_migrations')
+    expect(logs.join('\n')).toMatch(/preserved 1 \(public\._prisma_migrations\)/)
+  })
+
+  it('fails closed on an unknown application table instead of publishing the database', async () => {
+    sql = fakeSql({
+      tables: [
+        { schema: 'public', name: 'users', extensionOwned: false },
+        { schema: 'public', name: 'invoices', extensionOwned: false }, // production is ahead of this checkout
+        { schema: 'public', name: '_prisma_migrations', extensionOwned: false },
+      ],
+    })
+    await expect(provision(makeDeps())).rejects.toThrow(/table\(s\) public\.invoices/)
+    expect(existsSync(stateFile())).toBe(false) // cleaned up
+    expect(neon.calls.filter((c) => c.startsWith('deleteBranch'))).toHaveLength(1)
+  })
+
+  it('refuses a mismatched parent_lsn without deleting a branch it cannot prove it owns', async () => {
+    neon = fakeNeon({ created: childBranch({ parent_lsn: '0/DEADBEEF' }) })
+    await expect(provision(makeDeps())).rejects.toThrow(/parent_lsn .* not the captured/)
+    expect(neon.calls.some((call) => call.startsWith('deleteBranch'))).toBe(false)
+    expect(readStateFile().status).toBe('creating')
+  })
+
+  it('leaves a non-disposable surprise response strictly alone', async () => {
+    neon = fakeNeon({ created: childBranch({ name: 'production', protected: true }) })
+    await expect(provision(makeDeps())).rejects.toThrow(/Refusing to use branch/)
+    expect(neon.calls.some((c) => c.startsWith('deleteBranch'))).toBe(false)
+    expect(readStateFile().status).toBe('creating') // a human resolves this one
+  })
+
+  it('refuses a returned branch that is a root branch (the schema-only bug this replaces)', () => {
+    expect(() =>
+      assertOwnedDisposableBranch(childBranch({ parent_id: undefined, parent_lsn: undefined, init_source: 'parent-schema' }), {
+        projectId: PROJECT,
+        name: 'workspace/feature-x',
+        parentId: PARENT_ID,
+      }),
+    ).toThrow(/a root branch/)
+  })
+
+  it.each([{ default: true }, { primary: true }, { protected: true }])('refuses a branch flagged %o as non-disposable', (flag) => {
+    expect(() => assertOwnedDisposableBranch(childBranch(flag), { projectId: PROJECT, name: 'workspace/feature-x', parentId: PARENT_ID, parentLsn: PARENT_LSN })).toThrow(
+      /Refusing to use branch/,
+    )
+  })
+
+  it('leaves creation intent unresolved on an ambiguous create — no blind retry, no adoption by name', async () => {
+    neon.failCreateWith = new NeonRequestError('POST /branches → HTTP 502', 502, true)
+    await expect(provision(makeDeps())).rejects.toThrow(AmbiguousCreateError)
+
+    expect(neon.calls.filter((c) => c.startsWith('createBranch'))).toHaveLength(1) // exactly one POST
+    expect(neon.calls.some((c) => c.startsWith('findBranchByName') && c.includes('workspace/feature-x'))).toBe(false)
+    expect(neon.calls.some((c) => c.startsWith('deleteBranch'))).toBe(false)
+    expect(readStateFile()).toEqual({ branchId: null, branchName: 'workspace/feature-x', projectId: PROJECT, status: 'creating' })
+  })
+
+  it('retries a create that provably never reached Neon', async () => {
+    let attempts = 0
+    const flaky = fakeNeon()
+    const realCreate = flaky.createBranch.bind(flaky)
+    flaky.createBranch = async (projectId, opts) => {
+      attempts++
+      if (attempts === 1) throw new NeonRequestError('POST /branches failed before a response was read (ECONNREFUSED)', null, false)
+      return realCreate(projectId, opts)
+    }
+    neon = flaky
+    await provision(makeDeps())
+    expect(attempts).toBe(2)
+    expect(readStateFile().status).toBe('ready')
+  })
+
+  it('refuses to start when a previous run left creation intent unresolved', async () => {
+    writeState({ branchId: null, branchName: 'workspace/feature-x', projectId: PROJECT, status: 'creating' })
+    await expect(provision(makeDeps())).rejects.toThrow(/UNRESOLVED branch creation/)
+    expect(neon.calls).toEqual([]) // nothing is created, nothing is deleted
+  })
+
+  it('refuses a recorded project that is not the configured one, before contacting Neon', async () => {
+    writeState({ branchId: 'br-elsewhere', branchName: 'workspace/feature-x', projectId: 'a-different-project', status: 'ready' })
+    await expect(provision(makeDeps())).rejects.toThrow(/Refusing to contact Neon/)
+    expect(neon.calls).toEqual([])
+  })
+
+  it('rebuilds by deleting the recorded ID, never the derived name', async () => {
+    const stale = childBranch({ id: 'br-old-one', name: 'workspace/an-older-name' })
+    neon = fakeNeon({ branches: [parentBranch(), stale] })
+    writeState({ branchId: 'br-old-one', branchName: 'workspace/an-older-name', projectId: PROJECT, status: 'ready' })
+    await provision(makeDeps())
+    expect(neon.calls).toContain(`deleteBranch(${PROJECT},br-old-one)`)
+    expect(neon.calls.some((c) => c.startsWith('findBranchByName') && c.includes('workspace/an-older-name'))).toBe(false)
+  })
+
+  it('tolerates a slow compute: the first connection is retried with growing backoff', async () => {
+    sql = fakeSql({ failConnectTimes: 4 })
+    const waits: number[] = []
+    await provision(makeDeps({ sleep: (ms) => waits.push(ms) }))
+    expect(readStateFile().status).toBe('ready')
+    expect(waits.slice(0, 4)).toEqual([2000, 4000, 8000, 16000])
+  })
+
+  it('budgets minutes, not seconds, for a cold compute', () => {
+    const budgetMs = Array.from({ length: FIRST_CONNECTION_ATTEMPTS - 1 }, (_, i) => backoffMs(i + 1)).reduce((a, b) => a + b, 0)
+    expect(budgetMs).toBeGreaterThan(120_000)
+    expect(PRISMA_TX_MAXWAIT_MS).toBe(30_000) // Prisma's 2s default loses this race every time
+  })
+
+  it('deletes the branch and clears state when setup fails after creation', async () => {
+    await expect(
+      provision(
+        makeDeps({
+          deployMigrations: () => {
+            throw new Error('migrate deploy exploded')
+          },
+        }),
+      ),
+    ).rejects.toThrow('migrate deploy exploded')
+    expect(neon.calls).toContain(`deleteBranch(${PROJECT},br-dawn-river-arrz6rux)`)
+    expect(existsSync(stateFile())).toBe(false)
+    // Publishing happens last, so a failure before it means no URL was ever exposed at all.
+    expect(existsSync(join(sandbox, '.env.neondb'))).toBe(false)
+  })
+
+  it('withdraws the previous URL but keeps the Neon control vars when a re-provision fails', async () => {
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@previous-branch/appdb', NEON_PROJECT_ID: PROJECT })
+    const stale = childBranch({ id: 'br-old-one', name: 'workspace/feature-x' })
+    neon = fakeNeon({ branches: [parentBranch(), stale] })
+    writeState({ branchId: 'br-old-one', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' })
+    await expect(
+      provision(
+        makeDeps({
+          deployMigrations: () => {
+            throw new Error('migrate deploy exploded')
+          },
+        }),
+      ),
+    ).rejects.toThrow('migrate deploy exploded')
+
+    const envFile = readFileSync(join(sandbox, '.env.neondb'), 'utf8')
+    expect(envFile).not.toMatch(/DATABASE_URL/) // the old branch is gone; its URL must not linger
+    expect(envFile).toMatch(/NEON_PROJECT_ID/) // the next attempt does not need these re-supplied
+  })
+
+  it('RETAINS recovery state and warns when that cleanup itself fails', async () => {
+    neon.failDeleteWith = new NeonRequestError('DELETE → HTTP 500', 500, true)
+    await expect(
+      provision(
+        makeDeps({
+          deployMigrations: () => {
+            throw new Error('migrate deploy exploded')
+          },
+        }),
+      ),
+    ).rejects.toThrow('migrate deploy exploded')
+
+    expect(readStateFile()).toMatchObject({ branchId: 'br-dawn-river-arrz6rux', status: 'deleting' })
+    expect(warnings.join('\n')).toMatch(/could not delete branch br-dawn-river-arrz6rux/)
+  })
+})
+
+describe('sync', () => {
+  function ready() {
+    writeState({ branchId: 'br-dawn-river-arrz6rux', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' })
+    neon = fakeNeon({ branches: [parentBranch(), childBranch()] })
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@ep-child-123.us-east-2.aws.neon.tech/appdb' })
+  }
+
+  it('verifies the recorded branch by ID and passes', async () => {
+    ready()
+    await sync(makeDeps())
+    expect(neon.calls).toEqual([`getBranchById(${PROJECT},br-dawn-river-arrz6rux)`])
+  })
+
+  it('refuses a URL copied from another workspace despite valid local state', async () => {
+    await provision(makeDeps())
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@other-workspace/appdb' })
+    await expect(sync(makeDeps())).rejects.toThrow(/database target|ownership/)
+  })
+
+  it.each(['creating', 'pending', 'deleting'] as const)('gates the app when state is "%s"', async (status) => {
+    writeState({ branchId: status === 'creating' ? null : 'br-dawn-river-arrz6rux', branchName: 'workspace/feature-x', projectId: PROJECT, status })
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@ep-child-123.example/appdb' })
+    await expect(sync(makeDeps())).rejects.toThrow(new RegExp(`state "${status}", not "ready"`))
+  })
+
+  it('gates when the workspace was never provisioned', async () => {
+    await expect(sync(makeDeps())).rejects.toThrow(/not provisioned/)
+  })
+
+  it('gates when the managed database URL is missing, even with an ambient one exported', async () => {
+    writeState({ branchId: 'br-dawn-river-arrz6rux', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' })
+    vi.stubEnv('DATABASE_URL', 'postgres://u:p@shared-production-host/appdb') // the trap
+    await expect(sync(makeDeps())).rejects.toThrow(/An ambient DATABASE_URL does not count/)
+  })
+
+  it('refreshes a branch renamed on Neon, keeping the same ID', async () => {
+    ready()
+    neon.branches.set('br-dawn-river-arrz6rux', childBranch({ name: 'workspace/renamed-in-console' }))
+    await sync(makeDeps())
+    expect(readStateFile()).toEqual({ branchId: 'br-dawn-river-arrz6rux', branchName: 'workspace/renamed-in-console', projectId: PROJECT, status: 'ready' })
+  })
+
+  it('never adopts another branch that reused this workspace name', async () => {
+    ready()
+    // Our branch was renamed away; a DIFFERENT branch now carries the name our identity derives.
+    neon.branches.set('br-dawn-river-arrz6rux', childBranch({ name: 'workspace/renamed-in-console' }))
+    neon.branches.set('br-someone-else', childBranch({ id: 'br-someone-else', name: 'workspace/feature-x' }))
+    await sync(makeDeps())
+    expect(readStateFile().branchId).toBe('br-dawn-river-arrz6rux')
+    expect(neon.calls.some((c) => c.startsWith('findBranchByName'))).toBe(false)
+    expect(logs.join('\n')).toMatch(/never switches database ownership/)
+  })
+
+  it('gates when the recorded branch is gone, rather than picking a replacement', async () => {
+    ready()
+    neon.branches.delete('br-dawn-river-arrz6rux')
+    await expect(sync(makeDeps())).rejects.toThrow(/no longer exists in Neon/)
+  })
+
+  it('refuses a project mismatch without contacting Neon', async () => {
+    writeState({ branchId: 'br-dawn-river-arrz6rux', branchName: 'workspace/feature-x', projectId: 'other-project', status: 'ready' })
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@ep-child-123.example/appdb' })
+    await expect(sync(makeDeps())).rejects.toThrow(/Refusing to contact Neon/)
+    expect(neon.calls).toEqual([])
+  })
+})
+
+describe('teardown', () => {
+  it.each([teardown, provision])('refuses another workspace state before any API call (%s)', async (command) => {
+    await provision(makeDeps())
+    writeFileSync(stateFile(), JSON.stringify({ branchId: 'br-foreign', branchName: 'workspace/foreign', projectId: PROJECT, status: 'ready' }))
+    neon.branches.set('br-foreign', childBranch({ id: 'br-foreign', name: 'workspace/foreign' }))
+    neon.calls.length = 0
+    await expect(command(makeDeps())).rejects.toThrow(/ownership/)
+    expect(neon.calls).toEqual([])
+    expect(neon.branches.has('br-foreign')).toBe(true)
+  })
+
+  it('rejects changed creation ancestry before deleting the recorded id', async () => {
+    await provision(makeDeps())
+    neon.branches.set(childBranch().id, childBranch({ parent_lsn: '0/DEADBEEF' }))
+    await expect(teardown(makeDeps())).rejects.toThrow(/ownership|ancestry/)
+    expect(neon.branches.has(childBranch().id)).toBe(true)
+  })
+  it.each([{ default: true }, { primary: true }, { protected: true }, { parent_id: null }])('refuses to delete a recorded branch that is no longer disposable: %o', async (flags) => {
+    neon.branches.set(childBranch().id, childBranch(flags))
+    await expect(teardown(makeDeps())).rejects.toThrow(/Refusing to delete/)
+    expect(neon.calls.some((call) => call.startsWith('deleteBranch'))).toBe(false)
+    expect(readState()).not.toBeNull()
+  })
+  beforeEach(() => {
+    writeState({ branchId: 'br-dawn-river-arrz6rux', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' })
+    neon = fakeNeon({ branches: [parentBranch(), childBranch()] })
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@h/db', NEON_PROJECT_ID: PROJECT })
+  })
+
+  it('records deleting, deletes by ID, confirms absence, then clears state and URLs', async () => {
+    await teardown(makeDeps())
+    expect(neon.calls).toEqual([`getBranchById(${PROJECT},br-dawn-river-arrz6rux)`, `deleteBranch(${PROJECT},br-dawn-river-arrz6rux)`, `getBranchById(${PROJECT},br-dawn-river-arrz6rux)`])
+    expect(existsSync(stateFile())).toBe(false)
+    expect(readFileSync(join(sandbox, '.env.neondb'), 'utf8')).not.toMatch(/DATABASE_URL/)
+    expect(existsSync(join(sandbox, '.neondb'))).toBe(false) // empty, so removed
+  })
+
+  it('treats an already-deleted branch as success', async () => {
+    neon.branches.delete('br-dawn-river-arrz6rux')
+    await teardown(makeDeps())
+    expect(logs.join('\n')).toMatch(/was already gone/)
+    expect(existsSync(stateFile())).toBe(false)
+  })
+
+  it('waits out a delayed deletion instead of trusting the response', async () => {
+    let reads = 0
+    const slow = neon.getBranchById.bind(neon)
+    neon.getBranchById = async (projectId, branchId) => {
+      reads++
+      return reads < 3 ? childBranch({ current_state: 'deleting' }) : slow(projectId, branchId)
+    }
+    await teardown(makeDeps())
+    expect(reads).toBe(3)
+    expect(existsSync(stateFile())).toBe(false)
+  })
+
+  it('retains "deleting" and fails visibly when the delete fails', async () => {
+    neon.failDeleteWith = new NeonRequestError('DELETE → HTTP 500', 500, true)
+    await expect(teardown(makeDeps())).rejects.toThrow(/HTTP 500/)
+    expect(readStateFile()).toEqual({ branchId: 'br-dawn-river-arrz6rux', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'deleting' })
+    expect(readFileSync(join(sandbox, '.env.neondb'), 'utf8')).toMatch(/DATABASE_URL/) // still recoverable
+  })
+
+  it('preserves unrelated files in .neondb and never removes the directory recursively', async () => {
+    writeFileSync(join(sandbox, '.neondb', 'notes.md'), 'keep me')
+    await teardown(makeDeps())
+    expect(readFileSync(join(sandbox, '.neondb', 'notes.md'), 'utf8')).toBe('keep me')
+    expect(existsSync(stateFile())).toBe(false)
+  })
+
+  it('refuses to guess when creation intent was never resolved', async () => {
+    writeState({ branchId: null, branchName: 'workspace/feature-x', projectId: PROJECT, status: 'creating' })
+    await expect(teardown(makeDeps())).rejects.toThrow(/UNRESOLVED branch creation/)
+    expect(neon.calls).toEqual([])
+  })
+})
+
+describe('planPurge (fail-closed classification)', () => {
+  const ledger: DiscoveredTable = { schema: 'public', name: '_prisma_migrations', extensionOwned: false }
+
+  it('truncates known application tables and preserves the ledger', () => {
+    const plan = planPurge([ledger, { schema: 'public', name: 'users', extensionOwned: false }], ['public.users'])
+    expect(plan).toEqual({ truncate: ['public.users'], preserved: ['public._prisma_migrations'] })
+  })
+
+  it('preserves extension-owned tables (PostGIS reference data) without listing them as known', () => {
+    const plan = planPurge([ledger, { schema: 'public', name: 'spatial_ref_sys', extensionOwned: true }], [])
+    expect(plan.preserved).toContain('public.spatial_ref_sys')
+    expect(plan.truncate).toEqual([])
+  })
+
+  it('fails closed on a table this checkout does not know about', () => {
+    expect(() => planPurge([ledger, { schema: 'public', name: 'invoices', extensionOwned: false }], ['public.users'])).toThrow(/table\(s\) public\.invoices/)
+  })
+
+  it('fails closed on a schema outside APP_SCHEMAS', () => {
+    expect(() => planPurge([ledger, { schema: 'billing', name: 'ledger_entries', extensionOwned: false }], ['public.users'])).toThrow(/schema\(s\) billing/)
+  })
+
+  it('accepts known tables that are absent — production being behind this checkout is normal', () => {
+    const plan = planPurge([ledger], ['public.users', 'public.invoices'])
+    expect(plan.truncate).toEqual([])
+  })
+
+  it('honours an explicitly preserved table', () => {
+    const plan = planPurge([ledger, { schema: 'public', name: 'countries', extensionOwned: false }], [], { preserved: ['public.countries'] })
+    expect(plan.preserved).toContain('public.countries')
+  })
+})
+
+describe('SQL construction', () => {
+  it('quotes identifiers, doubling embedded quotes', () => {
+    expect(quoteIdent('users')).toBe('"users"')
+    expect(quoteIdent('we"ird')).toBe('"we""ird"')
+  })
+
+  it('builds a single multi-table TRUNCATE so foreign-key order cannot matter', () => {
+    expect(buildTruncateSql(['public.users', 'public.orders'])).toBe('TRUNCATE TABLE "public"."users", "public"."orders" RESTART IDENTITY RESTRICT')
+  })
+
+  it('builds one round-trip emptiness check', () => {
+    expect(buildCountSql(['public.users'])).toBe('SELECT \'public.users\' AS qualified, count(*)::bigint AS rows FROM "public"."users"')
+  })
+})
+
+describe('prismaKnownTables', () => {
+  it('uses the schema of the alphabetically first model for an implicit join table', () => {
+    const tables = prismaKnownTables({ models: [
+      { name: 'Zebra', schema: 'zoo', fields: [{ kind: 'object', relationName: 'Friends', isList: true }] },
+      { name: 'Antelope', dbName: 'z_antelopes', schema: 'savanna', fields: [{ kind: 'object', relationName: 'Friends', isList: true }] },
+    ] })
+    expect(tables).toContain('savanna._Friends')
+    expect(tables).not.toContain('public._Friends')
+  })
+  it('honours @@map and includes implicit many-to-many join tables', () => {
+    const tables = prismaKnownTables({
+      models: [
+        { name: 'User', dbName: 'users', fields: [{ kind: 'object', relationName: 'PostToUser', isList: true }] },
+        { name: 'Post', dbName: null, fields: [{ kind: 'object', relationName: 'PostToUser', isList: true }] },
+      ],
+    })
+    expect(tables.sort()).toEqual(['public.Post', 'public._PostToUser', 'public.users'])
+  })
+
+  it('does not invent a join table for a one-to-many relation', () => {
+    const tables = prismaKnownTables({
+      models: [
+        { name: 'User', fields: [{ kind: 'object', relationName: 'PostToUser', isList: true }] },
+        { name: 'Post', fields: [{ kind: 'object', relationName: 'PostToUser', isList: false }] },
+      ],
+    })
+    expect(tables).not.toContain('public._PostToUser')
+  })
+})
+
+describe('withRetry', () => {
+  it('retries a transient failure with growing backoff, then succeeds', async () => {
+    const waits: number[] = []
+    let calls = 0
+    const result = await withRetry(
+      'flaky',
+      () => {
+        calls++
+        if (calls < 3) throw new Error('transient')
+        return 'ok'
+      },
+      { sleep: (ms) => waits.push(ms), log: () => undefined },
+    )
+    expect(result).toBe('ok')
+    expect(waits).toEqual([2000, 4000])
+  })
+
+  it('never retries a FatalError', async () => {
+    let calls = 0
+    await expect(
+      withRetry(
+        'fatal',
+        () => {
+          calls++
+          throw new FatalError('misconfigured')
+        },
+        { sleep: () => undefined, log: () => undefined },
+      ),
+    ).rejects.toThrow('misconfigured')
+    expect(calls).toBe(1)
+  })
+
+  it('never retries an ambiguous control-plane failure unless the caller says it is idempotent', async () => {
+    let mutatingCalls = 0
+    await expect(
+      withRetry(
+        'mutating',
+        () => {
+          mutatingCalls++
+          throw new NeonRequestError('HTTP 503', 503, true)
+        },
+        { sleep: () => undefined, log: () => undefined },
+      ),
+    ).rejects.toThrow('HTTP 503')
+    expect(mutatingCalls).toBe(1)
+
+    let idempotentCalls = 0
+    await expect(
+      withRetry(
+        'idempotent',
+        () => {
+          idempotentCalls++
+          throw new NeonRequestError('HTTP 503', 503, true)
+        },
+        { attempts: 3, sleep: () => undefined, log: () => undefined, retryAmbiguous: true },
+      ),
+    ).rejects.toThrow('HTTP 503')
+    expect(idempotentCalls).toBe(3)
+  })
+})
+
+describe('Neon REST boundary', () => {
+  it('never retries POST after headers arrive but reading the response body fails', async () => {
+    let posts = 0
+    const client = createNeonRestClient('test', async () => {
+      posts++
+      return { text: async () => { throw new Error('socket reset') }, status: 201, ok: true } as unknown as Response
+    })
+    await expect(withRetry('create', () => client.createBranch(PROJECT, { name: 'workspace/test', parentId: PARENT_ID, parentLsn: PARENT_LSN }), {
+      attempts: 3, sleep: () => undefined, log: () => undefined,
+    })).rejects.toMatchObject({ ambiguous: true })
+    expect(posts).toBe(1)
+  })
+
+  it.each(['{}', 'null', '{bad', '{"branch":{"id":"br-other"}}'])('does not interpret malformed HTTP 200 lookup as absence: %s', async (body) => {
+    const client = createNeonRestClient('test', async () => new Response(body, { status: 200 }))
+    await expect(client.getBranchById(PROJECT, 'br-requested')).rejects.toThrow(/Unexpected Neon/)
+  })
+
+  it('uses only HTTP 404 as proof a branch is absent', async () => {
+    const client = createNeonRestClient('test', async () => new Response('{"message":"not found"}', { status: 404 }))
+    await expect(client.getBranchById(PROJECT, 'br-requested')).resolves.toBeNull()
+  })
+
+  it('requires database selection when the branch has multiple databases', async () => {
+    vi.stubEnv('NEON_DATABASE_NAME', '')
+    vi.stubEnv('NEON_ROLE_NAME', '')
+    const client = createNeonRestClient('test', async (url) => new Response(JSON.stringify(String(url).includes('/databases')
+      ? { databases: [{ name: 'first', owner_name: 'first_owner' }, { name: 'app', owner_name: 'app_owner' }] }
+      : { uri: 'postgres://first_owner:p@child/first' })))
+    await expect(client.connectionUri(PROJECT, 'br-child')).rejects.toThrow(/NEON_DATABASE_NAME/)
+  })
+
+  it('derives the role from the selected database rather than the first database', async () => {
+    vi.stubEnv('NEON_DATABASE_NAME', 'app')
+    vi.stubEnv('NEON_ROLE_NAME', '')
+    let requestedRole: string | null = null
+    const client = createNeonRestClient('test', async (url) => {
+      if (String(url).includes('/databases')) return new Response(JSON.stringify({ databases: [{ name: 'first', owner_name: 'first_owner' }, { name: 'app', owner_name: 'app_owner' }] }))
+      requestedRole = new URL(String(url)).searchParams.get('role_name')
+      return new Response(JSON.stringify({ uri: 'postgres://app_owner:p@child/app' }))
+    })
+    await client.connectionUri(PROJECT, 'br-child')
+    expect(requestedRole).toBe('app_owner')
+  })
+})
+
+describe('workspace identity (unchanged naming convention)', () => {
+  const worktree: GitContext = { isSecondaryWorktree: true, branch: 'martintechlabs/feature-x' }
+  const singleClone: GitContext = { isSecondaryWorktree: false, branch: 'martintechlabs/feature-x' }
+
+  it('prefers CONDUCTOR_WORKSPACE_NAME over every other source', () => {
+    expect(resolveWorkspaceName({ CONDUCTOR_WORKSPACE_NAME: 'conductor-ws', ORCA_WORKSPACE_NAME: 'orca-ws', WORKSPACE_NAME: 'generic' }, '/tmp/dir', worktree)).toBe('conductor-ws')
+  })
+
+  it('falls back to the checkout basename for a secondary worktree, then the git branch', () => {
+    expect(resolveWorkspaceName({}, '/tmp/my-worktree', worktree)).toBe('my-worktree')
+    expect(resolveWorkspaceName({}, '/tmp/repo', singleClone)).toBe('martintechlabs/feature-x')
+  })
+
+  it('keeps the workspace/ prefix, slugification and hash-truncation of the previous design', () => {
+    expect(workspaceBranchName('martintechlabs/feature-x')).toBe('workspace/martintechlabs-feature-x')
+    const long = workspaceBranchName('a'.repeat(80))
+    expect(long.startsWith('workspace/')).toBe(true)
+    expect(long.slice('workspace/'.length).length).toBeLessThanOrEqual(48)
+    expect(long).not.toMatch(/-$/)
+  })
+})
+
+describe('.env.neondb upsert/strip', () => {
+  const file = () => join(sandbox, '.env.neondb')
+
+  it('updates a key in place, preserving unrelated lines and comments', () => {
+    writeFileSync(file(), '# comment\nOTHER=1\nDATABASE_URL=old\n')
+    upsertEnvVars(file(), { DATABASE_URL: 'postgres://new' })
+    expect(readFileSync(file(), 'utf8')).toBe("# comment\nOTHER=1\nDATABASE_URL='postgres://new'\n")
+  })
+
+  it('strips only the managed keys, deleting the file when nothing is left', () => {
+    writeFileSync(file(), "DATABASE_URL='x'\nOTHER=1\n")
+    stripEnvVars(file(), ['DATABASE_URL'])
+    expect(readFileSync(file(), 'utf8')).toBe('OTHER=1\n')
+    stripEnvVars(file(), ['OTHER'])
+    expect(existsSync(file())).toBe(false)
+  })
+})
+
+describe('load-env.cjs (the startup guard)', () => {
+  it.each([
+    { status: 'ready' },
+    { branchId: 'br-x', branchName: 'workspace/x', projectId: 'foreign', status: 'ready' },
+    { branchId: null, branchName: 'workspace/x', projectId: PROJECT, status: 'ready' },
+    { branchId: 'br-x', branchName: 'workspace/x', projectId: PROJECT, status: 'ready', unexpected: true },
+  ])('rejects malformed or foreign ready state: %o', (state) => {
+    mkdirSync(join(sandbox, '.neondb'), { recursive: true })
+    writeFileSync(stateFile(), JSON.stringify(state))
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@workspace-host/appdb' })
+    expect(boot({ NEON_PROJECT_ID: PROJECT }).status).toBe(1)
+  })
+
+  it('rejects a managed URL copied from a different branch at startup', async () => {
+    await provision(makeDeps())
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@other-workspace/appdb' })
+    const result = boot({ NEON_PROJECT_ID: PROJECT })
+    expect(result.status).toBe(1)
+    expect(result.stderr).toMatch(/database target/)
+  })
+  /** Run the preload hook exactly as the dev/build/test scripts do, and report what the child saw. */
+  function boot(env: Record<string, string> = {}): { status: number | null; stdout: string; stderr: string } {
+    const result = spawnSync(process.execPath, ['--require', './scripts/load-env.cjs', '-e', 'process.stdout.write(String(process.env.DATABASE_URL))'], {
+      cwd: sandbox,
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH ?? '', NEON_PROJECT_ID: PROJECT, ...env },
+    })
+    return { status: result.status, stdout: result.stdout, stderr: result.stderr }
+  }
 
   beforeEach(() => {
-    process.env = { ...ORIGINAL_ENV }
+    expect(spawnSync('git', ['init', '--quiet', sandbox]).status).toBe(0)
+    symlinkSync(fileURLToPath(new URL('../node_modules', import.meta.url)), join(sandbox, 'node_modules'), 'dir')
+    mkdirSync(join(sandbox, 'scripts'), { recursive: true })
+    for (const script of ['load-env.cjs', 'workspace-state.cjs']) {
+      writeFileSync(join(sandbox, 'scripts', script), readFileSync(new URL(`../scripts/${script}`, import.meta.url), 'utf8'))
+    }
   })
 
-  afterAll(() => {
-    delete ORIGINAL_ENV.NEONDB_BRANCH_STATE_FILE
-    process.env = ORIGINAL_ENV
-    rmSync(sandbox, { recursive: true, force: true })
+  it('refuses to start an unprovisioned workspace', () => {
+    const { status, stderr } = boot()
+    expect(status).toBe(1)
+    expect(stderr).toMatch(/has no database/)
   })
 
-  describe('resolveWorkspaceName (workspace identity precedence)', () => {
-    const worktree: GitContext = { isSecondaryWorktree: true, branch: 'martintechlabs/feature-x' }
-    const singleClone: GitContext = { isSecondaryWorktree: false, branch: 'martintechlabs/feature-x' }
-    const noIdentity: GitContext = { isSecondaryWorktree: false, branch: null }
-
-    it('prefers CONDUCTOR_WORKSPACE_NAME over every other source', () => {
-      const env = { CONDUCTOR_WORKSPACE_NAME: 'conductor-ws', ORCA_WORKSPACE_NAME: 'orca-ws', WORKSPACE_NAME: 'general-ws' }
-      expect(resolveWorkspaceName(env, '/work/trees/mojarra', worktree)).toBe('conductor-ws')
-    })
-
-    it('prefers ORCA_WORKSPACE_NAME over WORKSPACE_NAME and checkout signals', () => {
-      const env = { ORCA_WORKSPACE_NAME: 'orca-ws', WORKSPACE_NAME: 'general-ws' }
-      expect(resolveWorkspaceName(env, '/work/trees/mojarra', worktree)).toBe('orca-ws')
-    })
-
-    it('falls back to WORKSPACE_NAME when no tool-specific var is set', () => {
-      expect(resolveWorkspaceName({ WORKSPACE_NAME: 'general-ws' }, '/work/trees/mojarra', worktree)).toBe('general-ws')
-    })
-
-    it('falls back to the checkout directory basename for a secondary git worktree with no env vars', () => {
-      expect(resolveWorkspaceName({}, '/Users/dev/workspaces/mojarra', worktree)).toBe('mojarra')
-    })
-
-    it('falls back to the current git branch for a plain single-clone checkout with no env vars', () => {
-      expect(resolveWorkspaceName({}, '/Users/dev/myrepo', singleClone)).toBe('martintechlabs/feature-x')
-    })
-
-    it('throws a clear error when nothing resolves (no env vars, not a worktree, detached HEAD)', () => {
-      expect(() => resolveWorkspaceName({}, '/Users/dev/myrepo', noIdentity)).toThrow(/Could not determine workspace identity/)
-    })
+  it.each(['creating', 'pending', 'deleting'] as const)('refuses to start against a "%s" branch', (status) => {
+    writeState({ branchId: status === 'creating' ? null : 'br-x', branchName: 'workspace/feature-x', projectId: PROJECT, status })
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@workspace-host/appdb' })
+    const result = boot()
+    expect(result.status).toBe(1)
+    expect(result.stderr).toMatch(new RegExp(`state "${status}", not "ready"`))
   })
 
-  describe('workspaceBranchName / checkBranchName (given an already-resolved raw identity)', () => {
-    it('slugifies a short identity into a clean workspace/ branch (no hash suffix)', () => {
-      expect(workspaceBranchName('My Cool Feature!')).toBe('workspace/my-cool-feature')
-    })
-
-    it('collapses separator runs and trims leading/trailing separators', () => {
-      expect(workspaceBranchName('  Feature / 123 -- test  ')).toBe('workspace/feature-123-test')
-    })
-
-    it('truncates an over-long identity and appends a hash suffix, never ending in a separator', () => {
-      const raw = 'a'.repeat(100)
-      const name = workspaceBranchName(raw)
-      expect(name).toMatch(/^workspace\/a{39}-[0-9a-f]{8}$/)
-      expect(name).not.toMatch(/-$/)
-      expect(name.length).toBeLessThanOrEqual('workspace/'.length + 48)
-    })
-
-    it('re-trims a separator left dangling by truncation before the hash (no "--")', () => {
-      const raw = 'a'.repeat(38) + ' ' + 'b'.repeat(20)
-      const name = workspaceBranchName(raw)
-      expect(name).toMatch(/^workspace\/a{38}-[0-9a-f]{8}$/)
-      expect(name).not.toContain('--')
-    })
-
-    it('gives distinct branches to distinct long identities sharing a truncated prefix (no collision)', () => {
-      const prefix = 'shared-prefix-that-is-definitely-longer-than-forty-eight-characters-'
-      expect(workspaceBranchName(`${prefix}alpha`)).not.toBe(workspaceBranchName(`${prefix}beta`))
-    })
-
-    it('throws when the identity has no usable characters', () => {
-      expect(() => workspaceBranchName('@@@')).toThrow(/Could not derive a branch name/)
-    })
-
-    it('checkBranchName shares workspaceBranchName\'s slug but under the tmp/ prefix', () => {
-      expect(checkBranchName('My Cool Feature!')).toBe('tmp/my-cool-feature')
-      expect(checkBranchName('My Cool Feature!')).not.toBe(workspaceBranchName('My Cool Feature!'))
-    })
-
-    it('truncates and hashes independently of workspaceBranchName, never colliding across the two prefixes', () => {
-      const raw = 'a'.repeat(100)
-      expect(checkBranchName(raw)).toMatch(/^tmp\/a{39}-[0-9a-f]{8}$/)
-      expect(checkBranchName(raw).slice('tmp/'.length)).toBe(workspaceBranchName(raw).slice('workspace/'.length))
-    })
+  it('overrides an ambient DATABASE_URL — the shared database never wins', () => {
+    writeState({ branchId: 'br-x', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' }, 'workspace-host:5432/appdb')
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@workspace-host/appdb' })
+    const { status, stdout } = boot({ DATABASE_URL: 'postgres://u:p@SHARED-production-host/appdb' })
+    expect(status).toBe(0)
+    expect(stdout).toBe('postgres://u:p@workspace-host/appdb')
   })
 
-  describe('assertDisposableChildBranch (production-safety guard)', () => {
-    it('allows a workspace/ workspace branch', () => {
-      expect(() => assertDisposableChildBranch('workspace/my-feature', 'production')).not.toThrow()
-    })
-
-    it('allows a tmp/ check branch', () => {
-      expect(() => assertDisposableChildBranch('tmp/my-feature', 'production')).not.toThrow()
-    })
-
-    it('refuses a branch that is neither workspace/ nor tmp/ prefixed (e.g. production)', () => {
-      expect(() => assertDisposableChildBranch('production', 'production')).toThrow(/workspace branch/)
-      expect(() => assertDisposableChildBranch('development', 'production')).toThrow(/workspace branch/)
-    })
-
-    it('refuses operating on the parent branch even if it were workspace/ prefixed', () => {
-      expect(() => assertDisposableChildBranch('workspace/x', 'workspace/x')).toThrow(/parent branch/)
-    })
+  it('reads the URL literally, so a $ in a generated password survives', () => {
+    writeState({ branchId: 'br-x', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' }, 'workspace-host:5432/appdb')
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:pa$$w0rd@workspace-host/appdb' })
+    expect(boot({ HOME: sandbox }).stdout).toBe('postgres://u:pa$$w0rd@workspace-host/appdb')
   })
 
-  describe('assertDisposableCheckBranch (stricter: tmp/ only, not workspace/)', () => {
-    it('allows a tmp/ check branch', () => {
-      expect(() => assertDisposableCheckBranch('tmp/my-feature', 'production')).not.toThrow()
-    })
-
-    it('refuses a workspace/ workspace branch even though assertDisposableChildBranch would allow it', () => {
-      expect(() => assertDisposableCheckBranch('workspace/my-feature', 'production')).toThrow(/check branch/)
-    })
-
-    it('refuses operating on the parent branch', () => {
-      expect(() => assertDisposableCheckBranch('tmp/x', 'tmp/x')).toThrow(/parent branch/)
-    })
-  })
-
-  describe('readBranchState / writeBranchState / setupIsPending (rename- and crash-safety)', () => {
-    // The suite-level sandbox (above) means there is no real state file to protect here; each
-    // test starts from whatever the previous one wrote, so clean up after each.
-    afterEach(() => {
-      rmSync(process.env.NEONDB_BRANCH_STATE_FILE!, { force: true })
-    })
-
-    it('returns null when no state file has been written', () => {
-      expect(readBranchState()).toBeNull()
-    })
-
-    it('creates the .neondb directory if missing and round-trips the branch name', () => {
-      writeBranchState('workspace/my-feature')
-      expect(readBranchState()).toBe('workspace/my-feature')
-    })
-
-    it('survives a simulated rename — teardown reads the ORIGINAL name, not one re-derived from a new identity', () => {
-      writeBranchState(workspaceBranchName('original-name'))
-
-      expect(workspaceBranchName('renamed-workspace')).toBe('workspace/renamed-workspace') // re-deriving now gives a DIFFERENT (wrong) name
-      expect(readBranchState()).toBe('workspace/original-name') // but the recorded name is still correct
-    })
-
-    it('defaults to ready — no file, and a plain write, are both "setup complete"', () => {
-      expect(setupIsPending()).toBe(false) // absent file
-      writeBranchState('workspace/my-feature') // default phase: ready
-      expect(setupIsPending()).toBe(false)
-    })
-
-    it('tracks the pending → ready lifecycle provision() uses for crash recovery', () => {
-      writeBranchState('workspace/my-feature', 'pending') // written right after branch create
-      expect(setupIsPending()).toBe(true)
-      expect(readBranchState()).toBe('workspace/my-feature')
-      writeBranchState('workspace/my-feature', 'ready') // written after baseline + deploy + seed succeed
-      expect(setupIsPending()).toBe(false)
-    })
-  })
-
-  describe('readCheckBranchState / writeCheckBranchState / clearCheckBranchState (check-branch leak tracking)', () => {
-    afterEach(() => {
-      clearCheckBranchState()
-    })
-
-    it('returns null when nothing is recorded', () => {
-      expect(readCheckBranchState()).toBeNull()
-    })
-
-    it('round-trips the check branch name, independent of the workspace-branch state file', () => {
-      writeBranchState('workspace/my-feature')
-      writeCheckBranchState('tmp/my-feature')
-      expect(readCheckBranchState()).toBe('tmp/my-feature')
-      expect(readBranchState()).toBe('workspace/my-feature') // unaffected by the check-branch record
-    })
-
-    it('clears cleanly, leaving the workspace-branch record untouched', () => {
-      writeBranchState('workspace/my-feature')
-      writeCheckBranchState('tmp/my-feature')
-      clearCheckBranchState()
-      expect(readCheckBranchState()).toBeNull()
-      expect(readBranchState()).toBe('workspace/my-feature')
-    })
-  })
-
-  describe('planSync (sync() decision logic)', () => {
-    const readyState = { branch: 'workspace/feature-x', phase: 'ready' as const }
-    const pendingState = { branch: 'workspace/feature-x', phase: 'pending' as const }
-
-    it('gates as unprovisioned when there is no state at all', () => {
-      expect(planSync(null, 'workspace/feature-x', false, false)).toEqual({ type: 'gate', reason: { type: 'unprovisioned' } })
-    })
-
-    it('gates as pending when setup never finished', () => {
-      expect(planSync(pendingState, 'workspace/feature-x', true, true)).toEqual({ type: 'gate', reason: { type: 'pending' } })
-    })
-
-    it('noops when the recorded branch matches current and still exists', () => {
-      expect(planSync(readyState, 'workspace/feature-x', true, true)).toEqual({ type: 'noop' })
-    })
-
-    it('gates as a dead branch when recorded matches current but the branch is gone', () => {
-      expect(planSync(readyState, 'workspace/feature-x', false, false)).toEqual({
-        type: 'gate',
-        reason: { type: 'deadBranch', recorded: 'workspace/feature-x' },
-      })
-    })
-
-    it('renames when recorded differs from current and only the recorded branch exists (the normal case)', () => {
-      expect(planSync(readyState, 'workspace/main', true, false)).toEqual({
-        type: 'rename',
-        from: 'workspace/feature-x',
-        to: 'workspace/main',
-      })
-    })
-
-    it('reconciles instead of renaming when a prior sync already renamed on Neon but crashed before recording it locally', () => {
-      expect(planSync(readyState, 'workspace/main', false, true)).toEqual({ type: 'reconcile', to: 'workspace/main' })
-    })
-
-    it('gates as a dead branch when recorded differs from current and NEITHER exists', () => {
-      expect(planSync(readyState, 'workspace/main', false, false)).toEqual({
-        type: 'gate',
-        reason: { type: 'deadBranch', recorded: 'workspace/feature-x' },
-      })
-    })
-
-    it('flags a collision when recorded differs from current and BOTH already exist as live branches', () => {
-      expect(planSync(readyState, 'workspace/main', true, true)).toEqual({
-        type: 'collision',
-        from: 'workspace/feature-x',
-        to: 'workspace/main',
-      })
-    })
-  })
-
-  describe('planTeardown (teardown() decision logic)', () => {
-    it('deletes when the branch still exists on Neon (the normal case)', () => {
-      expect(planTeardown(true)).toEqual({ type: 'delete' })
-    })
-
-    it('treats it as already torn down when the branch is gone — avoids retrying a delete that would 404 forever', () => {
-      expect(planTeardown(false)).toEqual({ type: 'alreadyGone' })
-    })
-  })
-
-  describe('withRetry (cold-compute backoff)', () => {
-    it('returns the result on first success without sleeping', async () => {
-      const waits: number[] = []
-      await expect(withRetry('op', () => 'ok', 3, (ms) => waits.push(ms))).resolves.toBe('ok')
-      expect(waits).toEqual([])
-    })
-
-    it('retries transient failures with exponential backoff (2s, 4s, …), then succeeds', async () => {
-      const waits: number[] = []
-      let calls = 0
-      const result = await withRetry(
-        'op',
-        () => {
-          calls += 1
-          if (calls < 3) throw new Error('the endpoint is not ready yet')
-          return 'ok'
-        },
-        5,
-        (ms) => waits.push(ms),
-      )
-      expect(result).toBe('ok')
-      expect(calls).toBe(3)
-      expect(waits).toEqual([2000, 4000])
-    })
-
-    it('retries a rejected async operation the same way (used for the execSql true-baseline read/write)', async () => {
-      const waits: number[] = []
-      let calls = 0
-      const result = await withRetry(
-        'op',
-        async () => {
-          calls += 1
-          if (calls < 2) throw new Error('compute still booting')
-          return 'ok'
-        },
-        3,
-        (ms) => waits.push(ms),
-      )
-      expect(result).toBe('ok')
-      expect(waits).toEqual([2000])
-    })
-
-    it('rejects with the last error once attempts are exhausted', async () => {
-      const waits: number[] = []
-      await expect(
-        withRetry(
-          'op',
-          () => {
-            throw new Error('still booting')
-          },
-          3,
-          (ms) => waits.push(ms),
-        ),
-      ).rejects.toThrow('still booting')
-      expect(waits).toEqual([2000, 4000])
-    })
-
-    it('never retries a FatalError — misconfiguration surfaces immediately, with no backoff', async () => {
-      const waits: number[] = []
-      let calls = 0
-      await expect(
-        withRetry(
-          'op',
-          () => {
-            calls += 1
-            throw new FatalError('execSql() is not configured')
-          },
-          6,
-          (ms) => waits.push(ms),
-        ),
-      ).rejects.toThrow('execSql() is not configured')
-      expect(calls).toBe(1)
-      expect(waits).toEqual([])
-    })
-  })
-
-  describe('buildPrismaLedgerBaselineSql (seeds _prisma_migrations from the parent\'s TRUE ledger)', () => {
-    it('returns null when the parent has nothing genuinely applied yet', () => {
-      expect(buildPrismaLedgerBaselineSql([])).toBeNull()
-    })
-
-    it('emits one _prisma_migrations row per captured ledger row, verbatim (no local re-derivation)', () => {
-      const rows = [
-        { checksum: createHash('sha256').update('a').digest('hex'), migration_name: '0001_init' },
-        { checksum: createHash('sha256').update('b').digest('hex'), migration_name: '0002_more' },
-      ]
-      const sql = buildPrismaLedgerBaselineSql(rows)!
-      expect(sql).toContain('INSERT INTO "_prisma_migrations"')
-      for (const { checksum, migration_name } of rows) {
-        expect(sql).toContain(`'${migration_name}'`)
-        expect(sql).toContain(checksum)
-      }
-    })
-
-    it('is idempotent — only inserts migrations not already recorded', () => {
-      const sql = buildPrismaLedgerBaselineSql([{ checksum: 'a'.repeat(64), migration_name: '0001_init' }])!
-      expect(sql).toMatch(/WHERE NOT EXISTS/i)
-      expect(sql).toContain('e.migration_name = m.migration_name')
-    })
-
-    it('escapes single quotes in migration names (valid SQL literal)', () => {
-      const sql = buildPrismaLedgerBaselineSql([{ checksum: 'a'.repeat(64), migration_name: "0001_o'brien" }])!
-      expect(sql).toContain("'0001_o''brien'")
-    })
-
-    it('rejects a non-hex checksum instead of splicing it into SQL', () => {
-      expect(() =>
-        buildPrismaLedgerBaselineSql([{ checksum: "'); DROP SCHEMA public CASCADE; --", migration_name: '0001_init' }]),
-      ).toThrow(/non-hex checksum/)
-    })
-  })
-
-  describe('buildDrizzleLedgerBaselineSql (seeds drizzle.__drizzle_migrations from the parent\'s TRUE ledger)', () => {
-    it('returns null when the parent has nothing genuinely applied yet', () => {
-      expect(buildDrizzleLedgerBaselineSql([])).toBeNull()
-    })
-
-    it('targets drizzle.__drizzle_migrations and ensures the table exists', () => {
-      const sql = buildDrizzleLedgerBaselineSql([{ hash: createHash('sha256').update('x').digest('hex'), created_at: 1700000000000 }])!
-      expect(sql).toContain('CREATE SCHEMA IF NOT EXISTS "drizzle"')
-      expect(sql).toContain('CREATE TABLE IF NOT EXISTS "drizzle"."__drizzle_migrations"')
-      expect(sql).toContain('INSERT INTO "drizzle"."__drizzle_migrations" (hash, created_at)')
-    })
-
-    it('emits one row per captured ledger row, verbatim (no local re-derivation)', () => {
-      const rows = [
-        { hash: createHash('sha256').update('a').digest('hex'), created_at: 1700000000000 },
-        { hash: createHash('sha256').update('b').digest('hex'), created_at: 1700000005000 },
-      ]
-      const sql = buildDrizzleLedgerBaselineSql(rows)!
-      for (const { hash, created_at } of rows) {
-        expect(sql).toContain(`('${hash}', ${created_at})`)
-      }
-    })
-
-    it('accepts a stringified created_at (as Postgres bigint columns come back over some drivers)', () => {
-      const hash = createHash('sha256').update('x').digest('hex')
-      const sql = buildDrizzleLedgerBaselineSql([{ hash, created_at: '1700000000000' }])!
-      expect(sql).toContain(`('${hash}', 1700000000000)`)
-    })
-
-    it('is idempotent — only inserts migrations not already recorded', () => {
-      const sql = buildDrizzleLedgerBaselineSql([{ hash: 'a'.repeat(64), created_at: 1700000000000 }])!
-      expect(sql).toMatch(/WHERE NOT EXISTS/i)
-      expect(sql).toContain('e.hash = m.hash')
-    })
-
-    it('rejects a non-hex hash instead of splicing it into SQL', () => {
-      expect(() =>
-        buildDrizzleLedgerBaselineSql([{ hash: "'); DROP SCHEMA public CASCADE; --", created_at: 1700000000000 }]),
-      ).toThrow(/non-hex hash/)
-    })
-
-    it('rejects a created_at that is not a plain non-negative integer instead of splicing it into SQL', () => {
-      const hash = 'a'.repeat(64)
-      expect(() => buildDrizzleLedgerBaselineSql([{ hash, created_at: NaN }])).toThrow(/non-integer created_at/)
-      expect(() => buildDrizzleLedgerBaselineSql([{ hash, created_at: 1700000000000.5 }])).toThrow(/non-integer created_at/) // Postgres would silently round it
-      expect(() => buildDrizzleLedgerBaselineSql([{ hash, created_at: 1e21 }])).toThrow(/non-integer created_at/) // serializes as "1e+21", not a bigint literal
-      expect(() => buildDrizzleLedgerBaselineSql([{ hash, created_at: -1 }])).toThrow(/non-integer created_at/)
-      expect(() => buildDrizzleLedgerBaselineSql([{ hash, created_at: "0),('x',0); DROP SCHEMA public CASCADE; --" }])).toThrow(
-        /non-integer created_at/,
-      )
-    })
-  })
-
-  describe('upsertEnvVars / stripEnvVars (.env.neondb is upserted in place, never truncated)', () => {
-    let envFile: string
-
-    beforeEach(() => {
-      envFile = join(sandbox, `.env.neondb.${Math.random().toString(36).slice(2)}`)
-    })
-
-    afterEach(() => {
-      rmSync(envFile, { force: true })
-    })
-
-    it('creates the file with the given vars when none existed', () => {
-      upsertEnvVars(envFile, { DATABASE_URL: 'postgres://a', NEON_API_KEY: 'k' })
-      const content = readFileSync(envFile, 'utf8')
-      expect(content).toContain("DATABASE_URL='postgres://a'")
-      expect(content).toContain("NEON_API_KEY='k'")
-    })
-
-    it('updates an existing key in place, preserving unrelated lines', () => {
-      writeFileSync(envFile, "# a comment\nDATABASE_URL='old'\nOTHER_VAR='keep-me'\n")
-      upsertEnvVars(envFile, { DATABASE_URL: 'postgres://new' })
-      const content = readFileSync(envFile, 'utf8')
-      expect(content).toContain('# a comment')
-      expect(content).toContain("DATABASE_URL='postgres://new'")
-      expect(content).not.toContain('old')
-      expect(content).toContain("OTHER_VAR='keep-me'")
-    })
-
-    it('appends a var that is not present yet, preserving everything else', () => {
-      writeFileSync(envFile, "OTHER_VAR='keep-me'\n")
-      upsertEnvVars(envFile, { DATABASE_URL: 'postgres://a' })
-      const content = readFileSync(envFile, 'utf8')
-      expect(content).toContain("OTHER_VAR='keep-me'")
-      expect(content).toContain("DATABASE_URL='postgres://a'")
-    })
-
-    it('upserts multiple keys in one call (DATABASE_URL plus the three Neon control vars)', () => {
-      upsertEnvVars(envFile, {
-        DATABASE_URL: 'postgres://a',
-        NEON_API_KEY: 'k',
-        NEON_PROJECT_ID: 'p',
-        NEON_PARENT_BRANCH: 'production',
-      })
-      const content = readFileSync(envFile, 'utf8')
-      for (const line of ["DATABASE_URL='postgres://a'", "NEON_API_KEY='k'", "NEON_PROJECT_ID='p'", "NEON_PARENT_BRANCH='production'"]) {
-        expect(content).toContain(line)
-      }
-    })
-
-    it('stripEnvVars removes just the given keys, preserving the rest', () => {
-      writeFileSync(envFile, "DATABASE_URL='postgres://a'\nNEON_API_KEY='k'\n")
-      stripEnvVars(envFile, ['DATABASE_URL'])
-      const content = readFileSync(envFile, 'utf8')
-      expect(content).not.toContain('DATABASE_URL')
-      expect(content).toContain("NEON_API_KEY='k'")
-    })
-
-    it('stripEnvVars deletes the file entirely when nothing is left', () => {
-      writeFileSync(envFile, "DATABASE_URL='postgres://a'\n")
-      stripEnvVars(envFile, ['DATABASE_URL'])
-      expect(existsSync(envFile)).toBe(false)
-    })
-
-    it('stripEnvVars is a no-op when the file does not exist', () => {
-      expect(() => stripEnvVars(envFile, ['DATABASE_URL'])).not.toThrow()
-      expect(existsSync(envFile)).toBe(false)
-    })
-  })
-
-  describe('main() loads .env.neondb before dispatching (never overriding an already-set var)', () => {
-    let envFile: string
-
-    beforeEach(() => {
-      envFile = join(sandbox, '.env.neondb')
-      process.env.NEONDB_BRANCH_ENV_FILE = envFile
-    })
-
-    afterEach(() => {
-      delete process.env.NEONDB_BRANCH_ENV_FILE
-      delete process.env.NEON_PROJECT_ID
-      rmSync(envFile, { force: true })
-    })
-
-    it('populates process.env from the file when the var is not already set', () => {
-      writeFileSync(envFile, "NEON_PROJECT_ID='from-file'\n")
-      loadEnvFile()
-      expect(process.env.NEON_PROJECT_ID).toBe('from-file')
-    })
-
-    it('never overrides a var already present in process.env', () => {
-      process.env.NEON_PROJECT_ID = 'from-shell'
-      writeFileSync(envFile, "NEON_PROJECT_ID='from-file'\n")
-      loadEnvFile()
-      expect(process.env.NEON_PROJECT_ID).toBe('from-shell')
-    })
-
-    it('is a no-op when the file does not exist', () => {
-      expect(() => loadEnvFile()).not.toThrow()
-    })
+  it('refuses when the state is ready but the managed URL is absent', () => {
+    writeState({ branchId: 'br-x', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' }, 'workspace-host:5432/appdb')
+    upsertEnvVars(join(sandbox, '.env.neondb'), { NEON_PROJECT_ID: PROJECT })
+    const { status, stderr } = boot({ DATABASE_URL: 'postgres://u:p@SHARED-production-host/appdb' })
+    expect(status).toBe(1)
+    expect(stderr).toMatch(/does not define DATABASE_URL/)
   })
 })

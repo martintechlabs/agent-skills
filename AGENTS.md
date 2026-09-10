@@ -10,7 +10,7 @@ containing a `SKILL.md` (YAML frontmatter + Markdown instructions) plus optional
 `npx skills add martintechlabs/agent-skills`. Some skills shell out to real CLIs
 against whatever repo or account they're pointed at — `github-lockdown` mutates live
 GitHub state (branch protection, rulesets, repo settings) via `gh`, `neondb-branch`
-creates and recreates real Neon branches via `neonctl`, and `consult-codex`,
+creates and recreates real Neon branches via the REST API, and `consult-codex`,
 `codex-review`, and `ship-ready-pr-loop` invoke the `codex` CLI. Treat those as
 live-system tooling, not sandboxed scripts.
 
@@ -93,6 +93,12 @@ skill's `tests/` dir) and `design-md` (a bash contract check plus a `node --test
 suite). Neither makes network calls or touches real GitHub state. A test result line
 looks like `ok   <description>`; grep for `not ok` to find failures.
 
+`neondb-branch` is the one exception to "no network": its script is TypeScript, not
+bash, so its `run.sh` bootstraps a throwaway harness (vitest + `@electric-sql/pglite` +
+typescript) in a temp dir outside this repo, typechecks with `tsc --noEmit`, and runs
+vitest there. It still needs no Neon credentials and no live database — the control
+plane is faked and the SQL runs in-process against PGlite.
+
 Before trusting a fixture-based test result for anything that touches `gh` output
 shape: verify the fixture matches what real `gh` actually returns (field names,
 casing) — a fixture drifting from reality is exactly how a real bug (case-sensitive
@@ -111,15 +117,15 @@ pins the Node version used by `design-md`'s `node --test` suite and by the
 `npx @google/design.md` lint it shells out to; skills whose *target* repos need Node
 at runtime get it from the same pin. The rest of this repo is bash
 (`skills/**/*.sh`) plus the occasional CLI dependency a skill shells out to (`gh`,
-`jq`, `codex`, `neonctl`, `git`).
+`jq`, `codex`, `git`).
 
 External CLI auth a live run needs, verified before you rely on it working:
 - `gh auth status` must be green for anything touching GitHub.
 - `codex` needs its own auth; if it's a ChatGPT-plan login rather than an API key, a
   given model may not be available — check `~/.codex/models_cache.json` for what's
   actually supported under the current auth rather than assuming a default works.
-- `neonctl` needs `NEON_API_KEY` (plus `NEON_PROJECT_ID`) in the target repo's
-  environment before `neondb-branch` can provision anything.
+- `neondb-branch` needs `NEON_API_KEY`, `NEON_PROJECT_ID`, and `NEON_PARENT_BRANCH`
+  in the target repo's environment. It uses Node's built-in fetch, not `neonctl`.
 
 ## Environment variables
 
