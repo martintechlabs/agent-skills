@@ -288,6 +288,38 @@ only**, never production. If there's no seed, delete `seedWorkspace()` and its c
 - Confirm the production branch is **protected** in Neon.
 - For end-to-end confidence against real Neon, follow `references/verify.md`.
 
+## What changed in 0.2.0, and why
+
+**The symptom:** provisioning starts failing with `ROOT_BRANCHES_LIMIT_EXCEEDED`, usually once three
+or four workspaces exist at once. Nothing in the project looks near a limit, because the Branches
+page shows far fewer branches than the plan allows.
+
+**The cause:** Neon caps how many *root* branches a project may have — branches with no parent, each
+starting an independent line of data. The allowance is small and it is per project:
+
+| Plan | Root branches per project |
+|---|---|
+| Free | 3 |
+| Launch | 5 |
+| Scale | 25 |
+
+Versions up to 0.1.x created each workspace branch with `--schema-only`. Schema-only branches **are
+root branches**: passing `--parent` names the schema donor, not a parent, and the resulting branch
+has no `parent_id` at all. So every workspace was quietly spending one of those few slots, and the
+project ran out long before it ran out of branches. The general branch limit is generous; the root
+limit is not, which is why the ceiling arrives without warning.
+
+**The fix:** 0.2.0 creates an ordinary child of production instead, which costs no root slot, and
+purges the production rows it inherits. That also deleted the disposable `tmp/*` clone the old design
+needed, since an ordinary child inherits the migration ledger directly. See "Why an ordinary child,
+and what it costs you" above for the trade-off that comes with it, and the privacy warning that goes
+with holding production data even briefly.
+
+Alongside it, tracking moved from `.neondb/branch` (a branch *name*, plus an undocumented marker
+line) to `.neondb/state.json`, keyed on the branch **id**. A name is not proof of ownership: the old
+design renamed live branches to follow git-branch changes, so a name freed by one workspace and
+reused by another was indistinguishable from "our branch, renamed".
+
 ## Fresh installs only
 
 This version targets repos that do not already have the skill installed. There is **no migration
