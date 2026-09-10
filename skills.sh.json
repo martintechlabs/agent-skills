@@ -35,16 +35,6 @@
       ]
     },
     {
-      "title": "Delivery pipeline",
-      "description": "Turn a plan into a live GitHub backlog and drive it to done: file complexity/priority-tagged tickets from a spec+plan, execute them with concurrent workers through review and CI, and supervise the epic end-to-end to a mergeable PR.",
-      "skills": [
-        "plan-to-tickets",
-        "execute-tickets",
-        "epic-manager",
-        "init-delivery-pipeline"
-      ]
-    },
-    {
       "title": "DevOps",
       "description": "Skills for provisioning and wiring up development infrastructure — isolated per-workspace environments, database branching, and the project setup that makes parallel agents safe.",
       "skills": [
