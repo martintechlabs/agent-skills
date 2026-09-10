@@ -5,9 +5,10 @@
 // same NeonClient interface the production code uses, with response shapes taken from live Neon API
 // output. The purge itself is exercised against real Postgres in purge.test.ts.
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   acquireLock,
@@ -38,7 +39,7 @@ import {
   upsertEnvVars,
   withRetry,
   workspaceBranchName,
-  writeState,
+  writeState as persistState,
   type Deps,
   type DiscoveredTable,
   type GitContext,
@@ -46,6 +47,7 @@ import {
   type NeonClient,
   type SqlClient,
   type SqlConnect,
+  type WorkspaceState,
 } from '../scripts/neondb-branch'
 
 const PROJECT = 'orange-forest-39329018'
@@ -177,6 +179,7 @@ function makeDeps(overrides: Partial<Deps> = {}): Deps {
 
 beforeEach(() => {
   sandbox = mkdtempSync(join(tmpdir(), 'neondb-branch-test-'))
+  vi.stubEnv('NEONDB_OWNERSHIP_FILE', join(sandbox, '.git', 'neondb-workspace.json'))
   vi.stubEnv('NEONDB_STATE_DIR', join(sandbox, '.neondb'))
   vi.stubEnv('NEONDB_BRANCH_ENV_FILE', join(sandbox, '.env.neondb'))
   vi.stubEnv('NEON_PROJECT_ID', PROJECT)
@@ -197,6 +200,18 @@ afterEach(() => {
 
 const stateFile = () => join(sandbox, '.neondb', 'state.json')
 const readStateFile = () => JSON.parse(readFileSync(stateFile(), 'utf8'))
+
+// A previously provisioned workspace also has a receipt in its private Git metadata.
+function writeState(state: WorkspaceState, target = 'ep-child-123.us-east-2.aws.neon.tech:5432/appdb'): void {
+  persistState(state)
+  if (state.branchId) {
+    mkdirSync(join(sandbox, '.git'), { recursive: true })
+    writeFileSync(join(sandbox, '.git', 'neondb-workspace.json'), JSON.stringify({
+      branchId: state.branchId, projectId: state.projectId, parentId: PARENT_ID,
+      parentLsn: PARENT_LSN, databaseTarget: target,
+    }))
+  }
+}
 
 describe('state file (.neondb/state.json)', () => {
   const valid = { branchId: 'br-abc', branchName: 'workspace/x', projectId: PROJECT, status: 'ready' as const }
@@ -245,6 +260,36 @@ describe('state file (.neondb/state.json)', () => {
 
   it('refuses a project mismatch BEFORE any Neon call', () => {
     expect(() => assertProjectMatches({ ...valid, projectId: 'some-other-project' }, PROJECT)).toThrow(/Refusing to contact Neon/)
+  })
+})
+
+describe('ownership receipt in real Git worktrees', () => {
+  it('uses distinct per-worktree metadata that stays stable when a worktree moves', () => {
+    const primary = join(sandbox, 'primary')
+    const linked = join(sandbox, 'linked')
+    const moved = join(sandbox, 'moved')
+    const git = (args: string[]) => {
+      const result = spawnSync('git', args, { encoding: 'utf8' })
+      expect(result.status, result.stderr).toBe(0)
+    }
+    git(['init', '--quiet', primary])
+    git(['-C', primary, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.com', '-c', 'commit.gpgsign=false', 'commit', '--quiet', '--allow-empty', '-m', 'fixture'])
+    git(['-C', primary, 'worktree', 'add', '--quiet', '-b', 'linked', linked])
+    const receiptPath = (cwd: string) => {
+      const result = spawnSync(process.execPath, ['-e', 'process.stdout.write(require(process.argv[1]).ownershipFilePath())', fileURLToPath(new URL('../scripts/workspace-state.cjs', import.meta.url))], {
+        cwd, encoding: 'utf8', env: { PATH: process.env.PATH ?? '' },
+      })
+      expect(result.status, result.stderr).toBe(0)
+      return result.stdout
+    }
+    const primaryReceipt = receiptPath(primary)
+    const linkedReceipt = receiptPath(linked)
+    expect(primaryReceipt).not.toBe(linkedReceipt)
+    writeFileSync(linkedReceipt, 'private receipt')
+    git(['-C', primary, 'worktree', 'move', linked, moved])
+    expect(receiptPath(moved)).toBe(linkedReceipt)
+    expect(readFileSync(receiptPath(moved), 'utf8')).toBe('private receipt')
+    expect(existsSync(primaryReceipt)).toBe(false)
   })
 })
 
@@ -585,6 +630,12 @@ describe('sync', () => {
     expect(neon.calls).toEqual([`getBranchById(${PROJECT},br-dawn-river-arrz6rux)`])
   })
 
+  it('refuses a URL copied from another workspace despite valid local state', async () => {
+    await provision(makeDeps())
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@other-workspace/appdb' })
+    await expect(sync(makeDeps())).rejects.toThrow(/database target|ownership/)
+  })
+
   it.each(['creating', 'pending', 'deleting'] as const)('gates the app when state is "%s"', async (status) => {
     writeState({ branchId: status === 'creating' ? null : 'br-dawn-river-arrz6rux', branchName: 'workspace/feature-x', projectId: PROJECT, status })
     upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@ep-child-123.example/appdb' })
@@ -634,6 +685,22 @@ describe('sync', () => {
 })
 
 describe('teardown', () => {
+  it.each([teardown, provision])('refuses another workspace state before any API call (%s)', async (command) => {
+    await provision(makeDeps())
+    writeFileSync(stateFile(), JSON.stringify({ branchId: 'br-foreign', branchName: 'workspace/foreign', projectId: PROJECT, status: 'ready' }))
+    neon.branches.set('br-foreign', childBranch({ id: 'br-foreign', name: 'workspace/foreign' }))
+    neon.calls.length = 0
+    await expect(command(makeDeps())).rejects.toThrow(/ownership/)
+    expect(neon.calls).toEqual([])
+    expect(neon.branches.has('br-foreign')).toBe(true)
+  })
+
+  it('rejects changed creation ancestry before deleting the recorded id', async () => {
+    await provision(makeDeps())
+    neon.branches.set(childBranch().id, childBranch({ parent_lsn: '0/DEADBEEF' }))
+    await expect(teardown(makeDeps())).rejects.toThrow(/ownership|ancestry/)
+    expect(neon.branches.has(childBranch().id)).toBe(true)
+  })
   it.each([{ default: true }, { primary: true }, { protected: true }, { parent_id: null }])('refuses to delete a recorded branch that is no longer disposable: %o', async (flags) => {
     neon.branches.set(childBranch().id, childBranch(flags))
     await expect(teardown(makeDeps())).rejects.toThrow(/Refusing to delete/)
@@ -743,6 +810,14 @@ describe('SQL construction', () => {
 })
 
 describe('prismaKnownTables', () => {
+  it('uses the schema of the alphabetically first model for an implicit join table', () => {
+    const tables = prismaKnownTables({ models: [
+      { name: 'Zebra', schema: 'zoo', fields: [{ kind: 'object', relationName: 'Friends', isList: true }] },
+      { name: 'Antelope', dbName: 'z_antelopes', schema: 'savanna', fields: [{ kind: 'object', relationName: 'Friends', isList: true }] },
+    ] })
+    expect(tables).toContain('savanna._Friends')
+    expect(tables).not.toContain('public._Friends')
+  })
   it('honours @@map and includes implicit many-to-many join tables', () => {
     const tables = prismaKnownTables({
       models: [
@@ -912,19 +987,42 @@ describe('.env.neondb upsert/strip', () => {
 })
 
 describe('load-env.cjs (the startup guard)', () => {
+  it.each([
+    { status: 'ready' },
+    { branchId: 'br-x', branchName: 'workspace/x', projectId: 'foreign', status: 'ready' },
+    { branchId: null, branchName: 'workspace/x', projectId: PROJECT, status: 'ready' },
+    { branchId: 'br-x', branchName: 'workspace/x', projectId: PROJECT, status: 'ready', unexpected: true },
+  ])('rejects malformed or foreign ready state: %o', (state) => {
+    mkdirSync(join(sandbox, '.neondb'), { recursive: true })
+    writeFileSync(stateFile(), JSON.stringify(state))
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@workspace-host/appdb' })
+    expect(boot({ NEON_PROJECT_ID: PROJECT }).status).toBe(1)
+  })
+
+  it('rejects a managed URL copied from a different branch at startup', async () => {
+    await provision(makeDeps())
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@other-workspace/appdb' })
+    const result = boot({ NEON_PROJECT_ID: PROJECT })
+    expect(result.status).toBe(1)
+    expect(result.stderr).toMatch(/database target/)
+  })
   /** Run the preload hook exactly as the dev/build/test scripts do, and report what the child saw. */
   function boot(env: Record<string, string> = {}): { status: number | null; stdout: string; stderr: string } {
     const result = spawnSync(process.execPath, ['--require', './scripts/load-env.cjs', '-e', 'process.stdout.write(String(process.env.DATABASE_URL))'], {
       cwd: sandbox,
       encoding: 'utf8',
-      env: { PATH: process.env.PATH ?? '', ...env },
+      env: { PATH: process.env.PATH ?? '', NEON_PROJECT_ID: PROJECT, ...env },
     })
     return { status: result.status, stdout: result.stdout, stderr: result.stderr }
   }
 
   beforeEach(() => {
+    expect(spawnSync('git', ['init', '--quiet', sandbox]).status).toBe(0)
+    symlinkSync(fileURLToPath(new URL('../node_modules', import.meta.url)), join(sandbox, 'node_modules'), 'dir')
     mkdirSync(join(sandbox, 'scripts'), { recursive: true })
-    writeFileSync(join(sandbox, 'scripts', 'load-env.cjs'), readFileSync(new URL('../scripts/load-env.cjs', import.meta.url), 'utf8'))
+    for (const script of ['load-env.cjs', 'workspace-state.cjs']) {
+      writeFileSync(join(sandbox, 'scripts', script), readFileSync(new URL(`../scripts/${script}`, import.meta.url), 'utf8'))
+    }
   })
 
   it('refuses to start an unprovisioned workspace', () => {
@@ -942,7 +1040,7 @@ describe('load-env.cjs (the startup guard)', () => {
   })
 
   it('overrides an ambient DATABASE_URL — the shared database never wins', () => {
-    writeState({ branchId: 'br-x', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' })
+    writeState({ branchId: 'br-x', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' }, 'workspace-host:5432/appdb')
     upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@workspace-host/appdb' })
     const { status, stdout } = boot({ DATABASE_URL: 'postgres://u:p@SHARED-production-host/appdb' })
     expect(status).toBe(0)
@@ -950,13 +1048,13 @@ describe('load-env.cjs (the startup guard)', () => {
   })
 
   it('reads the URL literally, so a $ in a generated password survives', () => {
-    writeState({ branchId: 'br-x', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' })
+    writeState({ branchId: 'br-x', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' }, 'workspace-host:5432/appdb')
     upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:pa$$w0rd@workspace-host/appdb' })
     expect(boot({ HOME: sandbox }).stdout).toBe('postgres://u:pa$$w0rd@workspace-host/appdb')
   })
 
   it('refuses when the state is ready but the managed URL is absent', () => {
-    writeState({ branchId: 'br-x', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' })
+    writeState({ branchId: 'br-x', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' }, 'workspace-host:5432/appdb')
     upsertEnvVars(join(sandbox, '.env.neondb'), { NEON_PROJECT_ID: PROJECT })
     const { status, stderr } = boot({ DATABASE_URL: 'postgres://u:p@SHARED-production-host/appdb' })
     expect(status).toBe(1)

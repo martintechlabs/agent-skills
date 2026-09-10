@@ -17,11 +17,13 @@
 //     environment tab cannot win. Values are read literally — no ${…} expansion — because a
 //     connection-string password may legitimately contain a `$`.
 //
-// Only the listed vars are touched; every other line in .env.neondb is left to whatever else loads
-// it. Nothing else in the file is read, and this file never writes.
+// Only the listed vars are assigned. NEON_PROJECT_ID is also read to validate the state, and the
+// per-worktree Git receipt binds the state to the published database target. This file never writes.
 
 const { readFileSync } = require('node:fs')
 const { join } = require('node:path')
+const { parse } = require('dotenv')
+const { parseState, readOwnership, assertDatabaseTarget } = require('./workspace-state.cjs')
 
 // KEEP IN SYNC with DB_ENV_VARS in scripts/neondb-branch.ts.
 const DB_ENV_VARS = ['DATABASE_URL']
@@ -32,7 +34,7 @@ function fail(message) {
   throw new Error(`[neondb-branch] ${message}`)
 }
 
-function readWorkspaceStatus() {
+function readWorkspaceState() {
   let raw
   try {
     raw = readFileSync(STATE_FILE, 'utf8')
@@ -42,19 +44,10 @@ function readWorkspaceStatus() {
     }
     throw error
   }
-  let state
-  try {
-    state = JSON.parse(raw)
-  } catch {
-    fail(`${STATE_FILE} is not valid JSON. Re-run \`db:provision\`.`)
-  }
-  if (!state || typeof state !== 'object' || typeof state.status !== 'string') {
-    fail(`${STATE_FILE} is malformed. Re-run \`db:provision\`.`)
-  }
-  return state.status
+  return parseState(raw, STATE_FILE)
 }
 
-/** Minimal literal parser for the KEY='value' lines this skill writes. No expansion, by design. */
+/** Parse dotenv values literally, without expansion or assignment to the process environment. */
 function readManagedVars() {
   let raw
   try {
@@ -63,23 +56,11 @@ function readManagedVars() {
     if (error.code === 'ENOENT') return {}
     throw error
   }
-  const wanted = new Set(DB_ENV_VARS)
-  const found = {}
-  for (const line of raw.split('\n')) {
-    const eq = line.indexOf('=')
-    if (eq === -1) continue
-    const key = line.slice(0, eq).trim()
-    if (!wanted.has(key)) continue
-    let value = line.slice(eq + 1).trim()
-    if ((value.startsWith("'") && value.endsWith("'")) || (value.startsWith('"') && value.endsWith('"'))) {
-      value = value.slice(1, -1)
-    }
-    found[key] = value
-  }
-  return found
+  return parse(raw) // literal parsing, no dotenv-expand or shell evaluation
 }
 
-const status = readWorkspaceStatus()
+const state = readWorkspaceState()
+const { status } = state
 if (status !== 'ready') {
   fail(
     `this workspace's database is in state "${status}", not "ready" — refusing to start against it. ` +
@@ -90,10 +71,15 @@ if (status !== 'ready') {
 }
 
 const managed = readManagedVars()
+const projectId = process.env.NEON_PROJECT_ID || managed.NEON_PROJECT_ID
+if (!projectId) fail('NEON_PROJECT_ID is required. Set it in the environment or .env.neondb.')
+if (projectId !== state.projectId) fail('Configured NEON_PROJECT_ID does not match the workspace state project. Refusing foreign state.')
+const ownership = readOwnership(state)
 const missing = DB_ENV_VARS.filter((name) => !managed[name])
 if (missing.length > 0) {
   fail(`${ENV_FILE} does not define ${missing.join(', ')} for this workspace. Re-run \`db:provision\`.`)
 }
 for (const name of DB_ENV_VARS) {
+  assertDatabaseTarget(ownership, managed[name])
   process.env[name] = managed[name] // override, always — an ambient value is the shared database
 }

@@ -26,6 +26,7 @@ echo "# harness: $HARNESS"
 mkdir -p "$HARNESS/scripts" "$HARNESS/tests"
 cp "$SKILL_DIR/scripts/neondb-branch.ts" "$HARNESS/scripts/"
 cp "$SKILL_DIR/scripts/load-env.cjs" "$HARNESS/scripts/"
+cp "$SKILL_DIR/scripts/workspace-state.cjs" "$HARNESS/scripts/"
 cp "$SKILL_DIR/tests/"*.test.ts "$HARNESS/tests/"
 
 cat > "$HARNESS/package.json" <<'JSON'

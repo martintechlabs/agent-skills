@@ -47,8 +47,11 @@
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, writeFileSync, writeSync } from 'node:fs'
-import { basename, join } from 'node:path'
-import { config as dotenvConfig } from 'dotenv'
+import { basename, dirname, join } from 'node:path'
+import { createRequire } from 'node:module'
+import { config as dotenvConfig, parse as parseEnv } from 'dotenv'
+
+const workspaceState = createRequire(import.meta.url)('./workspace-state.cjs')
 
 // ── PORTING KNOBS ────────────────────────────────────────────────────────────
 // Which ORM manages migrations. Switches the migration-ledger table that the purge preserves and
@@ -193,13 +196,15 @@ export function prismaKnownTables(datamodel: {
   models: Array<{ name: string; dbName?: string | null; schema?: string | null; fields: Array<{ isList?: boolean; relationName?: string; kind?: string }> }>
 }): string[] {
   const tables = new Set<string>()
-  const listRelationCounts = new Map<string, number>()
+  const listRelations = new Map<string, Array<{ name: string; schema: string }>>()
   for (const model of datamodel.models) {
     const schema = model.schema || APP_SCHEMAS[0]
     tables.add(`${schema}.${model.dbName || model.name}`)
     for (const field of model.fields) {
       if (field.kind === 'object' && field.relationName && field.isList) {
-        listRelationCounts.set(field.relationName, (listRelationCounts.get(field.relationName) ?? 0) + 1)
+        const sides = listRelations.get(field.relationName) ?? []
+        sides.push({ name: model.name, schema })
+        listRelations.set(field.relationName, sides)
       }
     }
   }
@@ -207,8 +212,11 @@ export function prismaKnownTables(datamodel: {
   // table named `_<relationName>`; when it is explicit, that join table is already a model above and
   // the extra name is simply absent from the database — harmless, since known-but-absent tables are
   // expected (the parent can legitimately be behind this checkout).
-  for (const [relationName, sides] of listRelationCounts) {
-    if (sides >= 2) tables.add(`${APP_SCHEMAS[0]}._${relationName}`)
+  for (const [relationName, sides] of listRelations) {
+    if (sides.length >= 2) {
+      sides.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+      tables.add(`${sides[0].schema}._${relationName}`)
+    }
   }
   return [...tables]
 }
@@ -257,7 +265,6 @@ export class AmbiguousCreateError extends Error {}
 // ── State file ───────────────────────────────────────────────────────────────
 
 export type LifecycleStatus = 'creating' | 'pending' | 'ready' | 'deleting'
-const LIFECYCLE_STATUSES: LifecycleStatus[] = ['creating', 'pending', 'ready', 'deleting']
 
 export interface WorkspaceState {
   branchId: string | null
@@ -328,42 +335,28 @@ export function assertNoLegacyState(): void {
  * published or the wrong branch gets deleted.
  */
 export function parseState(raw: string): WorkspaceState {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    throw new FatalError(`${stateFilePath()} is not valid JSON. Delete it and re-run provision.`)
-  }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new FatalError(`${stateFilePath()} must contain a JSON object.`)
-  }
-  const record = parsed as Record<string, unknown>
-  const expected = ['branchId', 'branchName', 'projectId', 'status']
-  const unknownKeys = Object.keys(record).filter((key) => !expected.includes(key))
-  if (unknownKeys.length > 0) {
-    throw new FatalError(`${stateFilePath()} has unrecognized key(s): ${unknownKeys.join(', ')}.`)
-  }
-  for (const key of expected) {
-    if (!(key in record)) throw new FatalError(`${stateFilePath()} is incomplete: missing "${key}".`)
-  }
-  const { branchId, branchName, projectId, status } = record
-  if (typeof status !== 'string' || !LIFECYCLE_STATUSES.includes(status as LifecycleStatus)) {
-    throw new FatalError(`${stateFilePath()} has an unknown status ${JSON.stringify(status)}.`)
-  }
-  if (typeof branchName !== 'string' || branchName === '') {
-    throw new FatalError(`${stateFilePath()} has a missing or empty "branchName".`)
-  }
-  if (typeof projectId !== 'string' || projectId === '') {
-    throw new FatalError(`${stateFilePath()} has a missing or empty "projectId".`)
-  }
-  if (status === 'creating') {
-    if (branchId !== null) {
-      throw new FatalError(`${stateFilePath()} has status "creating" but a non-null "branchId" — creation intent is unresolved and cannot carry an id.`)
-    }
-  } else if (typeof branchId !== 'string' || !branchId.startsWith('br-')) {
-    throw new FatalError(`${stateFilePath()} has status "${status}" but "branchId" is not a Neon branch id.`)
-  }
-  return { branchId: branchId as string | null, branchName, projectId, status: status as LifecycleStatus }
+  try { return workspaceState.parseState(raw, stateFilePath()) as WorkspaceState }
+  catch (error) { throw new FatalError((error as Error).message) }
+}
+
+interface OwnershipReceipt {
+  branchId: string
+  projectId: string
+  parentId: string
+  parentLsn: string
+  databaseTarget: string | null
+}
+
+function readOwnership(state: WorkspaceState): OwnershipReceipt {
+  try { return workspaceState.readOwnership(state) as OwnershipReceipt }
+  catch (error) { throw new FatalError((error as Error).message) }
+}
+
+function writeOwnership(receipt: OwnershipReceipt): void {
+  const file = workspaceState.ownershipFilePath() as string
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(`${file}.tmp`, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 })
+  renameSync(`${file}.tmp`, file)
 }
 
 /** Read state, or null when no state file exists. Rejects the legacy format before anything else. */
@@ -391,6 +384,7 @@ export function writeState(state: WorkspaceState): void {
 
 export function clearState(): void {
   rmSync(stateFilePath(), { force: true })
+  rmSync(workspaceState.ownershipFilePath(), { force: true })
 }
 
 /**
@@ -1253,9 +1247,13 @@ async function waitForFirstConnection(deps: Deps, uri: string): Promise<void> {
 async function deleteRecordedBranch(deps: Deps, state: WorkspaceState, parentId?: string): Promise<void> {
   const branchId = state.branchId
   if (!branchId) throw new FatalError('Cannot delete an unresolved branch creation; inspect Neon manually.')
+  const ownership = readOwnership(state)
   writeState({ ...state, status: 'deleting' })
   const branch = await withRetry('inspect branch before deletion', () => deps.neon.getBranchById(state.projectId, branchId), idempotent(deps, 4))
   if (branch) {
+    if (branch.parent_id !== ownership.parentId || branch.parent_lsn !== ownership.parentLsn) {
+      throw new FatalError(`Refusing to delete ${branchId}: its creation ancestry no longer matches the workspace ownership receipt.`)
+    }
     const parentRef = process.env.NEON_PARENT_BRANCH
     if (branch.id !== branchId || branch.project_id !== state.projectId ||
         branch.id === parentId || branch.id === parentRef || branch.name === parentRef ||
@@ -1295,6 +1293,7 @@ export async function provision(deps: Deps = defaultDeps()): Promise<void> {
             `in the Neon console, then delete ${stateFilePath()} and re-run provision.`,
         )
       }
+      readOwnership(existing)
     }
 
     // Resolve the parent and capture its LSN BEFORE destroying anything. If production is
@@ -1358,6 +1357,8 @@ export async function provision(deps: Deps = defaultDeps()): Promise<void> {
       )
     }
     const branchId = created.branch.id
+    const ownership: OwnershipReceipt = { branchId, projectId, parentId: parent.id, parentLsn, databaseTarget: null }
+    writeOwnership(ownership)
     writeState({ branchId, branchName, projectId, status: 'pending' })
     deps.log(`[neon] created ${branchId} (parent ${created.branch.parent_id} @ ${created.branch.parent_lsn})`)
 
@@ -1386,6 +1387,7 @@ export async function provision(deps: Deps = defaultDeps()): Promise<void> {
 
       // Publishing is the last thing that happens before `ready`, and it happens only after the
       // purge was verified. Until this point nothing outside provisioning can reach the branch.
+      writeOwnership({ ...ownership, databaseTarget: workspaceState.databaseTarget(uri) })
       upsertEnvVars(envFilePath(), {
         ...Object.fromEntries(DB_ENV_VARS.map((name) => [name, uri])),
         NEON_API_KEY: apiKey,
@@ -1440,6 +1442,9 @@ export async function sync(deps: Deps = defaultDeps()): Promise<void> {
     const projectId = requireEnv('NEON_PROJECT_ID')
     requireEnv('NEON_API_KEY')
     assertProjectMatches(state, projectId)
+    const ownership = readOwnership(state)
+    const managed = parseEnv(readEnvFileRaw(envFilePath()))
+    for (const name of DB_ENV_VARS) workspaceState.assertDatabaseTarget(ownership, managed[name])
 
     const branch = await withRetry('verify recorded branch', () => deps.neon.getBranchById(projectId, state.branchId as string), idempotent(deps, 3))
     if (!branch) {

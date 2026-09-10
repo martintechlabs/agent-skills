@@ -106,6 +106,16 @@ baseline INSERT are all gone.
 serializes acquisition and stale-lock reclamation. An unreadable lock or a leftover guard stops
 the command: stop all lifecycle commands and inspect it before manually removing a stale file.
 
+A separate `neondb-workspace.json` ownership receipt lives in the directory returned by
+`git rev-parse --absolute-git-dir`. For a linked worktree this is its private Git metadata, not the
+shared common directory. The receipt records branch/project IDs, creation parent/LSN, and the
+published database host/port/name without credentials. Copying `.neondb/` or `.env.neondb` from
+another checkout cannot authorize deletion or startup: every command checks the local receipt,
+and startup also checks the configured project and URL target. A workspace move or Git branch
+rename retains the receipt. Missing or mismatched receipts require manual recovery; never copy a
+receipt to adopt another workspace's branch. This protects against accidental copies, not someone
+who can rewrite both workspace files and private Git metadata.
+
 ### Renaming never moves a database
 
 A git branch changes on every `git checkout`, not just a deliberate rename. Because ownership is a
@@ -168,7 +178,9 @@ project's **production branch name** and confirm it is **protected** in the Neon
 
 ### 2. Add the provisioning script
 
-Copy `scripts/neondb-branch.ts` and `scripts/load-env.cjs` into the project's `scripts/`. Adjust the
+Copy `scripts/neondb-branch.ts`, `scripts/load-env.cjs`, and `scripts/workspace-state.cjs` into the
+project's `scripts/`. The last file shares strict state and ownership validation between the CLI
+and startup loader. Keep all three together. Adjust the
 **PORTING KNOBS** block at the top of `neondb-branch.ts`:
 
 - `ORM` — `'prisma'` or `'drizzle'`.
@@ -183,6 +195,8 @@ Copy `scripts/neondb-branch.ts` and `scripts/load-env.cjs` into the project's `s
   on its own join table. `Prisma.dmmf` comes from the `prisma-client-js` generator; on the newer
   `prisma-client` generator, read the datamodel with `getDMMF` from `@prisma/internals` instead. For
   Drizzle, map the schema module through `getTableConfig`.
+  For multi-schema Prisma projects, implicit join tables use the schema of the alphabetically
+  first participating model; include that schema in `APP_SCHEMAS`.
 - `APP_SCHEMAS` — schemas whose base tables the purge may empty (defaults to `public`).
 - `PRESERVED_TABLES` — anything else the purge must keep. The migration ledger and every
   extension-owned table (PostGIS's `spatial_ref_sys` and friends) are detected automatically.
@@ -373,7 +387,8 @@ root-branch slot.
 ## Safety model
 
 - **Ownership is a branch id, verified.** Every destructive call takes a `br-…` id from
-  `state.json`. Before any destructive SQL, the branch's id, exact name, `parent_id`, captured
+  `state.json` and checks its per-worktree receipt; deletion also revalidates the receipt's
+  creation parent and LSN. Before any destructive SQL, the branch's id, exact name, `parent_id`, captured
   `parent_lsn`, and disposable status are all checked. The captured LSN is what distinguishes the
   branch this run created from a same-named branch created by anyone else.
 - **Fail-closed purge.** A base table that is neither a known application table, the migration

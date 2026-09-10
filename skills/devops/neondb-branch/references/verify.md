@@ -59,8 +59,11 @@ cat .neondb/state.json
 # want: {"branchId":"br-…","branchName":"workspace/verify","projectId":"…","status":"ready"}
 # and NO credentials anywhere in that file.
 
+cat "$(git rev-parse --absolute-git-dir)/neondb-workspace.json"
+# want: matching branch/project ids, creation parent/LSN, and databaseTarget with NO credentials.
+
 BR=$(jq -r .branchId .neondb/state.json)
-neon "$API/projects/$PROJECT/branches/$BR" | jq '{parent_id, parent_lsn, init_source, protected, default}'
+neon "$API/projects/$PROJECT/branches/$BR" | jq '.branch | {parent_id, parent_lsn, init_source, protected, default}'
 # want: parent_id == the stand-in parent's id, parent_lsn a real "0/…" value,
 #       init_source "parent-data". A null parent_id here means the root-slot bug is back.
 
@@ -99,6 +102,13 @@ jq -r '.branchId, .branchName' .neondb/state.json
 Then, still with `WORKSPACE_NAME=verify`, confirm `sync` logs that identity and ownership have
 diverged and keeps the recorded branch rather than creating or adopting anything.
 
+### Check copied-file guards
+
+In a separate disposable Git worktree, copy only the ready workspace's `.neondb/state.json` and
+`.env.neondb`. Both `sync` and `teardown` must refuse the missing/foreign ownership receipt before
+contacting Neon; the startup preload must refuse too. Do not copy private Git metadata. Remove the
+copied files after the check. The original workspace must still sync successfully.
+
 ## 4. Tear down and check the cleanup
 
 ```bash
@@ -108,6 +118,7 @@ echo "note" > .neondb/keep-me.txt
 neon "$API/projects/$PROJECT/branches/$BR" | jq -r '.message // "gone"'   # want: an error/404
 ls .neondb                                                                # want: keep-me.txt only
 grep DATABASE_URL .env.neondb || echo "DATABASE_URL withdrawn"
+test ! -e "$(git rev-parse --absolute-git-dir)/neondb-workspace.json"
 rm .neondb/keep-me.txt && rmdir .neondb
 ```
 

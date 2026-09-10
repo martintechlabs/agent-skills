@@ -180,3 +180,23 @@ The review found gaps in the implementation of the safety rules above. Harden th
 
 These corrections keep the fresh-install scope and ordinary-child design. No live Neon resources
 are needed to reproduce them: REST response fixtures, lifecycle fakes, and PGlite cover the failures.
+
+### Greptile ownership corrections
+
+The four-field lifecycle file is not sufficient to establish that a copied record belongs to this
+checkout. Keep a separate credential-free `neondb-workspace.json` receipt in the directory returned
+by `git rev-parse --absolute-git-dir` (per-worktree, not the shared common git directory). Record the
+verified branch ID, project ID, parent ID, parent LSN, and the published database target (host, port,
+database; no credentials). Git metadata survives a workspace-directory move and a branch rename,
+but does not travel with copied `.neondb/` or `.env.neondb` files.
+
+Before any API operation on recorded state, compare its identity with the local receipt. Before
+deletion, revalidate the receipt's immutable parent and LSN against Neon. Before startup or sync,
+validate the complete state schema, configured project, receipt, and each managed URL's database
+target. Publish the target in the receipt before publishing URLs. Clear the receipt only after
+confirmed branch deletion; missing or foreign receipts require manual recovery, never adoption.
+Share these validators between the TypeScript CLI and CommonJS startup loader.
+
+This protects against accidental copying/corruption of workspace files, not an attacker who can
+rewrite both workspace files and private Git metadata. Prisma implicit join tables also use the
+schema of the alphabetically first participating model, following Prisma's documented convention.

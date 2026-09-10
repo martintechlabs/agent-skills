@@ -92,3 +92,12 @@ Vitest + `@electric-sql/pglite` in a throwaway scratch harness for this repo's o
 3. Update the day-to-day safety documentation and retain the unreleased `0.2.0` version bump.
 4. Run strict TypeScript and the full Vitest/PGlite harness, review the complete branch again,
    create/update its PR, and run Greploop. Record live-validation limitations in the PR.
+
+### Greptile fix pass
+
+1. Reproduce copied-state deletion, stale-URL startup/sync, malformed-ready state, and multi-schema
+   implicit join table failures.
+2. Share state/receipt/URL validators in `scripts/workspace-state.cjs`; write the creation receipt
+   into per-worktree Git metadata, validate before API access and startup, and clear after deletion.
+3. Correct Prisma join table schema selection; update installation and verification instructions
+   for the shared helper and receipt. Run all tests and request the next Greptile review.
