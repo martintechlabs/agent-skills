@@ -306,16 +306,17 @@ export function assertNoLegacyState(): void {
   if (fileExists(branch)) {
     throw new FatalError(
       `Found ${branch}, a workspace record from before .neondb/state.json. This version does not ` +
-        'read it — a branch name is not proof of ownership. Delete the branch it names from the ' +
-        `Neon console (it is a schema-only root branch, so this also frees a root-branch slot), ` +
-        `then remove ${branch} and run provision for a fresh workspace database.`,
+        'read it — a branch name is not proof of ownership. Clean up by hand (see "Fresh installs ' +
+        `only" in SKILL.md): delete the branch it names from the Neon console — it is a schema-only ` +
+        `root branch, so this frees a root-branch slot — then \`rm -rf ${stateDir()}\` and run ` +
+        'provision for a fresh workspace database.',
     )
   }
   if (fileExists(check)) {
     throw new FatalError(
       `Found ${check}, which names a leaked disposable clone of production left by an interrupted ` +
-        'run of an earlier version. Delete the branch it names from the Neon console, then remove ' +
-        `${check}.`,
+        'run of an earlier version. Delete the branch it names from the Neon console, then ' +
+        `\`rm -rf ${stateDir()}\` — see "Fresh installs only" in SKILL.md.`,
     )
   }
 }

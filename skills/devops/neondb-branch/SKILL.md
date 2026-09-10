@@ -294,13 +294,48 @@ This version targets repos that do not already have the skill installed. There i
 path** from 0.1.x and no conversion command: a branch *name* is not proof of ownership, so adopting
 one automatically would be the exact mistake the rest of the design avoids.
 
-If you do drop it into a repo that already ran 0.1.x, every command stops with an error rather than
-proceeding, because `.neondb/branch` (and possibly `.neondb/branch-check`) is still there. Silently
-ignoring those files would create a second branch alongside the old one and make teardown report
-"nothing to tear down", leaking a live branch — and, for `.neondb/branch`, the root-branch slot this
-change exists to reclaim. Resolve it by hand, per workspace: delete the branch named in the file from
-the Neon console, remove the file, and run `db:provision` for a fresh workspace database. That
-discards the workspace's development data, which is the normal `provision()` contract anyway.
+If you drop it into a repo that already ran 0.1.x, every command stops with an error while
+`.neondb/branch` or `.neondb/branch-check` is present. That is deliberate — ignoring those files
+would create a second branch beside the old one and make teardown report "nothing to tear down",
+leaking a live branch and the root-branch slot this change exists to reclaim.
+
+**Clean up by hand. It is three steps and it is fine to do this way.**
+
+### 1. Find every branch the old system created
+
+Old workspace branches are schema-only, so Neon reports them as `init_source: parent-schema` with no
+parent. Leftover ledger clones are named `tmp/*`. This lists both:
+
+```bash
+curl -sS -H "Authorization: Bearer $NEON_API_KEY" \
+  "https://console.neon.tech/api/v2/projects/$NEON_PROJECT_ID/branches" |
+  jq -r '.branches[]
+         | select(.init_source == "parent-schema" or (.name | startswith("tmp/")))
+         | [.id, .name, .init_source] | @tsv'
+```
+
+In the Neon console the same branches are the ones showing no parent on the Branches page.
+
+### 2. Delete them
+
+```bash
+curl -sS -X DELETE -H "Authorization: Bearer $NEON_API_KEY" \
+  "https://console.neon.tech/api/v2/projects/$NEON_PROJECT_ID/branches/<br-id>"
+```
+
+Or click Delete on each in the console. **Check the list before deleting** — anything you kept
+deliberately as a schema-only branch shows up in the same filter. Deleting a workspace branch
+discards that workspace's development data, which is the normal `provision()` contract anyway. Stop
+any dev server pointed at one first.
+
+### 3. Remove the old state directory in each workspace
+
+```bash
+rm -rf .neondb
+```
+
+Then run `pnpm db:provision` for a fresh workspace database. Each freed schema-only branch returns a
+root-branch slot.
 
 ## Safety model
 

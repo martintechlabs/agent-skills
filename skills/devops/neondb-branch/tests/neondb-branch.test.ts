@@ -252,13 +252,17 @@ describe('legacy state detection (no compatibility path)', () => {
     mkdirSync(join(sandbox, '.neondb'), { recursive: true })
     writeFileSync(join(sandbox, '.neondb', 'branch'), 'workspace/feature-x\nready\n')
     expect(() => assertNoLegacyState()).toThrow(/is not proof of ownership/)
-    expect(() => readState()).toThrow(/Delete the branch it names/)
+    // The error has to be actionable on its own: what to delete, and where the steps are.
+    expect(() => readState()).toThrow(/delete the branch it names from the Neon console/)
+    expect(() => readState()).toThrow(/rm -rf/)
+    expect(() => readState()).toThrow(/SKILL\.md/)
   })
 
   it('refuses to run while a leaked temporary-branch record is present, so teardown cannot abandon it', () => {
     mkdirSync(join(sandbox, '.neondb'), { recursive: true })
     writeFileSync(join(sandbox, '.neondb', 'branch-check'), 'tmp/feature-x\n')
     expect(() => assertNoLegacyState()).toThrow(/leaked disposable clone/)
+    expect(() => assertNoLegacyState()).toThrow(/rm -rf/)
   })
 
   it('teardown refuses rather than silently skipping a legacy record', async () => {
