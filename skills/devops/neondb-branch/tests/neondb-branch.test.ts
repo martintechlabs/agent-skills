@@ -4,6 +4,7 @@
 // Nothing here talks to Neon or to a real Postgres: the control plane is a fake implementing the
 // same NeonClient interface the production code uses, with response shapes taken from live Neon API
 // output. The purge itself is exercised against real Postgres in purge.test.ts.
+import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -370,11 +371,19 @@ describe('provision', () => {
     expect(neon.calls.filter((c) => c.startsWith('deleteBranch'))).toHaveLength(1)
   })
 
-  it('refuses to touch a branch whose parent_lsn is not the one this run captured', async () => {
+  it('refuses a branch whose parent_lsn is not the one this run captured, and deletes it again', async () => {
     neon = fakeNeon({ created: childBranch({ parent_lsn: '0/DEADBEEF' }) })
     await expect(provision(makeDeps())).rejects.toThrow(/parent_lsn .* not the captured/)
-    // Ownership could not be established, so state stays at the unresolved creation intent.
-    expect(readStateFile().status).toBe('creating')
+    // It came from our own POST and is provably disposable, so it is cleaned up rather than leaked.
+    expect(neon.calls).toContain(`deleteBranch(${PROJECT},br-dawn-river-arrz6rux)`)
+    expect(existsSync(stateFile())).toBe(false)
+  })
+
+  it('leaves a non-disposable surprise response strictly alone', async () => {
+    neon = fakeNeon({ created: childBranch({ name: 'production', protected: true }) })
+    await expect(provision(makeDeps())).rejects.toThrow(/Refusing to use branch/)
+    expect(neon.calls.some((c) => c.startsWith('deleteBranch'))).toBe(false)
+    expect(readStateFile().status).toBe('creating') // a human resolves this one
   })
 
   it('refuses a returned branch that is a root branch (the schema-only bug this replaces)', () => {
@@ -465,11 +474,28 @@ describe('provision', () => {
     ).rejects.toThrow('migrate deploy exploded')
     expect(neon.calls).toContain(`deleteBranch(${PROJECT},br-dawn-river-arrz6rux)`)
     expect(existsSync(stateFile())).toBe(false)
-    // The branch URL is withdrawn (it points at a deleted endpoint) but the Neon control vars stay,
-    // so the next attempt does not need them re-supplied.
+    // Publishing happens last, so a failure before it means no URL was ever exposed at all.
+    expect(existsSync(join(sandbox, '.env.neondb'))).toBe(false)
+  })
+
+  it('withdraws the previous URL but keeps the Neon control vars when a re-provision fails', async () => {
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@previous-branch/appdb', NEON_PROJECT_ID: PROJECT })
+    const stale = childBranch({ id: 'br-old-one', name: 'workspace/feature-x' })
+    neon = fakeNeon({ branches: [parentBranch(), stale] })
+    writeState({ branchId: 'br-old-one', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' })
+    await expect(
+      provision(
+        makeDeps({
+          deployMigrations: () => {
+            throw new Error('migrate deploy exploded')
+          },
+        }),
+      ),
+    ).rejects.toThrow('migrate deploy exploded')
+
     const envFile = readFileSync(join(sandbox, '.env.neondb'), 'utf8')
-    expect(envFile).not.toMatch(/DATABASE_URL/)
-    expect(envFile).toMatch(/NEON_PROJECT_ID/)
+    expect(envFile).not.toMatch(/DATABASE_URL/) // the old branch is gone; its URL must not linger
+    expect(envFile).toMatch(/NEON_PROJECT_ID/) // the next attempt does not need these re-supplied
   })
 
   it('RETAINS recovery state and warns when that cleanup itself fails', async () => {
@@ -493,7 +519,7 @@ describe('sync', () => {
   function ready() {
     writeState({ branchId: 'br-dawn-river-arrz6rux', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' })
     neon = fakeNeon({ branches: [parentBranch(), childBranch()] })
-    vi.stubEnv('DATABASE_URL', 'postgres://u:p@ep-child-123.us-east-2.aws.neon.tech/appdb')
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@ep-child-123.us-east-2.aws.neon.tech/appdb' })
   }
 
   it('verifies the recorded branch by ID and passes', async () => {
@@ -504,7 +530,7 @@ describe('sync', () => {
 
   it.each(['creating', 'pending', 'deleting'] as const)('gates the app when state is "%s"', async (status) => {
     writeState({ branchId: status === 'creating' ? null : 'br-dawn-river-arrz6rux', branchName: 'workspace/feature-x', projectId: PROJECT, status })
-    vi.stubEnv('DATABASE_URL', 'postgres://u:p@ep-child-123.example/appdb')
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@ep-child-123.example/appdb' })
     await expect(sync(makeDeps())).rejects.toThrow(new RegExp(`state "${status}", not "ready"`))
   })
 
@@ -512,10 +538,10 @@ describe('sync', () => {
     await expect(sync(makeDeps())).rejects.toThrow(/not provisioned/)
   })
 
-  it('gates when the managed database URL is missing, rather than using an ambient one', async () => {
+  it('gates when the managed database URL is missing, even with an ambient one exported', async () => {
     writeState({ branchId: 'br-dawn-river-arrz6rux', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' })
-    vi.stubEnv('DATABASE_URL', '')
-    await expect(sync(makeDeps())).rejects.toThrow(/Never fall back to an ambient DATABASE_URL/)
+    vi.stubEnv('DATABASE_URL', 'postgres://u:p@shared-production-host/appdb') // the trap
+    await expect(sync(makeDeps())).rejects.toThrow(/An ambient DATABASE_URL does not count/)
   })
 
   it('refreshes a branch renamed on Neon, keeping the same ID', async () => {
@@ -544,7 +570,7 @@ describe('sync', () => {
 
   it('refuses a project mismatch without contacting Neon', async () => {
     writeState({ branchId: 'br-dawn-river-arrz6rux', branchName: 'workspace/feature-x', projectId: 'other-project', status: 'ready' })
-    vi.stubEnv('DATABASE_URL', 'postgres://u:p@ep-child-123.example/appdb')
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@ep-child-123.example/appdb' })
     await expect(sync(makeDeps())).rejects.toThrow(/Refusing to contact Neon/)
     expect(neon.calls).toEqual([])
   })
@@ -827,5 +853,58 @@ describe('.env.neondb upsert/strip', () => {
     expect(readFileSync(file(), 'utf8')).toBe('OTHER=1\n')
     stripEnvVars(file(), ['OTHER'])
     expect(existsSync(file())).toBe(false)
+  })
+})
+
+describe('load-env.cjs (the startup guard)', () => {
+  /** Run the preload hook exactly as the dev/build/test scripts do, and report what the child saw. */
+  function boot(env: Record<string, string> = {}): { status: number | null; stdout: string; stderr: string } {
+    const result = spawnSync(process.execPath, ['--require', './scripts/load-env.cjs', '-e', 'process.stdout.write(String(process.env.DATABASE_URL))'], {
+      cwd: sandbox,
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH ?? '', ...env },
+    })
+    return { status: result.status, stdout: result.stdout, stderr: result.stderr }
+  }
+
+  beforeEach(() => {
+    mkdirSync(join(sandbox, 'scripts'), { recursive: true })
+    writeFileSync(join(sandbox, 'scripts', 'load-env.cjs'), readFileSync(new URL('../scripts/load-env.cjs', import.meta.url), 'utf8'))
+  })
+
+  it('refuses to start an unprovisioned workspace', () => {
+    const { status, stderr } = boot()
+    expect(status).toBe(1)
+    expect(stderr).toMatch(/has no database/)
+  })
+
+  it.each(['creating', 'pending', 'deleting'] as const)('refuses to start against a "%s" branch', (status) => {
+    writeState({ branchId: status === 'creating' ? null : 'br-x', branchName: 'workspace/feature-x', projectId: PROJECT, status })
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@workspace-host/appdb' })
+    const result = boot()
+    expect(result.status).toBe(1)
+    expect(result.stderr).toMatch(new RegExp(`state "${status}", not "ready"`))
+  })
+
+  it('overrides an ambient DATABASE_URL — the shared database never wins', () => {
+    writeState({ branchId: 'br-x', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' })
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:p@workspace-host/appdb' })
+    const { status, stdout } = boot({ DATABASE_URL: 'postgres://u:p@SHARED-production-host/appdb' })
+    expect(status).toBe(0)
+    expect(stdout).toBe('postgres://u:p@workspace-host/appdb')
+  })
+
+  it('reads the URL literally, so a $ in a generated password survives', () => {
+    writeState({ branchId: 'br-x', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' })
+    upsertEnvVars(join(sandbox, '.env.neondb'), { DATABASE_URL: 'postgres://u:pa$$w0rd@workspace-host/appdb' })
+    expect(boot({ HOME: sandbox }).stdout).toBe('postgres://u:pa$$w0rd@workspace-host/appdb')
+  })
+
+  it('refuses when the state is ready but the managed URL is absent', () => {
+    writeState({ branchId: 'br-x', branchName: 'workspace/feature-x', projectId: PROJECT, status: 'ready' })
+    upsertEnvVars(join(sandbox, '.env.neondb'), { NEON_PROJECT_ID: PROJECT })
+    const { status, stderr } = boot({ DATABASE_URL: 'postgres://u:p@SHARED-production-host/appdb' })
+    expect(status).toBe(1)
+    expect(stderr).toMatch(/does not define DATABASE_URL/)
   })
 })

@@ -131,6 +131,18 @@ Identity decides what a **new** branch is called. It never decides which branch 
 `WORKSPACE_NAME` is **never** read from `.env.neondb` — that file can be copied across workspaces.
 Set it in your shell, CI config, or orchestrator env instead.
 
+## Environment variables
+
+| Variable | Required by | Notes |
+|---|---|---|
+| `NEON_API_KEY` | all commands | Mirrored into `.env.neondb` so an orchestrator's archive hook is self-sufficient |
+| `NEON_PROJECT_ID` | all commands | Must match `state.json`'s `projectId`, or the command refuses before calling Neon |
+| `NEON_PARENT_BRANCH` | `provision` | The production branch **name or `br-…` id**. Prefer the id: it is resolved with a direct lookup, skipping the branch listing entirely, and it cannot be pointed at the wrong branch by a rename. |
+| `NEON_DATABASE_NAME` / `NEON_ROLE_NAME` | optional | Only needed when a branch hosts more than one database and the first is not the app's |
+| seed credentials | `provision` | Whatever the project's seed needs; absent means "skip seeding" |
+
+`WORKSPACE_NAME` is read from the process environment only, never from `.env.neondb`.
+
 ## When this applies
 
 - The project's database is on **Neon** (branching is a Neon feature).
@@ -167,7 +179,9 @@ Copy `scripts/neondb-branch.ts` and `scripts/load-env.cjs` into the project's `s
 - **Wire `knownApplicationTables()`** to the ORM's own model list, and remove its throw. For Prisma,
   `prismaKnownTables(Prisma.dmmf.datamodel)` is exported for exactly this and includes implicit
   many-to-many join tables — miss those and every project with an implicit m2m relation fails closed
-  on its own join table. For Drizzle, map the schema module through `getTableConfig`.
+  on its own join table. `Prisma.dmmf` comes from the `prisma-client-js` generator; on the newer
+  `prisma-client` generator, read the datamodel with `getDMMF` from `@prisma/internals` instead. For
+  Drizzle, map the schema module through `getTableConfig`.
 - `APP_SCHEMAS` — schemas whose base tables the purge may empty (defaults to `public`).
 - `PRESERVED_TABLES` — anything else the purge must keep. The migration ledger and every
   extension-owned table (PostGIS's `spatial_ref_sys` and friends) are detected automatically.

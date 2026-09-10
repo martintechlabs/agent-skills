@@ -239,6 +239,17 @@ export class NeonRequestError extends Error {
   ) {
     super(message)
   }
+
+  /**
+   * Whether re-sending could plausibly succeed. A 4xx other than 429 is Neon rejecting the request
+   * outright — ROOT_BRANCHES_LIMIT_EXCEEDED arrives this way — and retrying it just burns backoff on
+   * a verdict that will not change. 429 IS retryable and is NOT ambiguous: a rate-limited request
+   * was refused before it was processed, so it cannot have been half-applied.
+   */
+  get retryable(): boolean {
+    if (this.status === null) return true // a network-layer failure; ambiguity is tracked separately
+    return this.status >= 500 || this.status === 429
+  }
 }
 
 /** Creation intent that could not be resolved. Leaves `.neondb/state.json` at `creating`. */
@@ -581,8 +592,11 @@ export async function withRetry<T>(label: string, fn: () => T | Promise<T>, opti
     try {
       return await fn()
     } catch (error) {
-      const ambiguous = error instanceof NeonRequestError && error.ambiguous
-      const unretryable = error instanceof FatalError || error instanceof AmbiguousCreateError || (ambiguous && !retryAmbiguous)
+      const neonError = error instanceof NeonRequestError ? error : null
+      const unretryable =
+        error instanceof FatalError ||
+        error instanceof AmbiguousCreateError ||
+        (neonError !== null && (!neonError.retryable || (neonError.ambiguous && !retryAmbiguous)))
       if (unretryable || attempt >= attempts) throw error
       const waitMs = backoffMs(attempt)
       log(`[retry] ${label}: attempt ${attempt} failed; waiting ${waitMs / 1000}s before retry…`)
@@ -679,8 +693,9 @@ export function createNeonRestClient(apiKey: string, fetchImpl: typeof fetch = f
     }
     if (!response.ok) {
       const detail = (data as { message?: string } | null)?.message ?? text.slice(0, 300)
-      // 5xx and 429 leave a mutating request's outcome unknown; 4xx means Neon rejected it outright.
-      const ambiguous = response.status >= 500 || response.status === 429
+      // A 5xx leaves a mutating request's outcome unknown. A 4xx — 429 included — means Neon
+      // rejected it before applying anything, so the outcome is known even when it is a failure.
+      const ambiguous = response.status >= 500
       throw new NeonRequestError(`${method} ${path} → HTTP ${response.status}: ${detail}`, response.status, ambiguous)
     }
     return { status: response.status, data: data as T }
@@ -1074,9 +1089,25 @@ export function stripEnvVars(path: string, keys: string[]): void {
   else writeFileSync(path, `${kept.join('\n')}\n`, { mode: 0o600 })
 }
 
-/** Whether every managed DB var is present and non-empty in the environment. */
-export function managedUrlsPresent(env: NodeJS.ProcessEnv, names: string[] = DB_ENV_VARS): boolean {
-  return names.every((name) => typeof env[name] === 'string' && env[name] !== '')
+/**
+ * Which of `names` the managed env file actually defines. Deliberately reads the FILE and not
+ * process.env: an ambient DATABASE_URL exported by the shell or a shared .env would otherwise
+ * satisfy a check whose whole purpose is to prove this workspace has its own URL.
+ */
+export function managedVarsInFile(path: string, names: string[] = DB_ENV_VARS): string[] {
+  const raw = readEnvFileRaw(path)
+  if (!raw.trim()) return []
+  const wanted = new Set(names)
+  const found: string[] = []
+  for (const line of raw.split('\n')) {
+    const eq = line.indexOf('=')
+    if (eq === -1) continue
+    const key = line.slice(0, eq).trim()
+    if (!wanted.has(key)) continue
+    const value = line.slice(eq + 1).trim().replace(/^['"]|['"]$/g, '')
+    if (value !== '') found.push(key)
+  }
+  return found
 }
 
 /**
@@ -1252,10 +1283,31 @@ export async function provision(deps: Deps = defaultDeps()): Promise<void> {
     try {
       assertOwnedDisposableBranch(created.branch, { projectId, name: branchName, parentId: parent.id, parentLsn })
     } catch (error) {
+      // The id came back from our own POST, so this branch IS ours — but it is not what we asked
+      // for. Clean it up when it is provably disposable; when it is not (it came back flagged
+      // default/primary/protected, or in another project) leave it strictly alone and hand the
+      // problem to a human.
+      const disposable =
+        created.branch.project_id === projectId &&
+        typeof created.branch.name === 'string' &&
+        created.branch.name.startsWith(BRANCH_PREFIX) &&
+        created.branch.default !== true &&
+        created.branch.primary !== true &&
+        created.branch.protected !== true &&
+        typeof created.branch.id === 'string' &&
+        created.branch.id.startsWith('br-')
+      if (disposable) {
+        try {
+          await withRetry('delete unverifiable branch', () => deps.neon.deleteBranch(projectId, created.branch.id), idempotent(deps, 3))
+          clearState()
+        } catch (cleanupError) {
+          deps.warn(`[neondb-branch] WARNING: could not delete unverifiable branch ${created.branch.id} (${cleanupError instanceof Error ? cleanupError.message : cleanupError}).`)
+        }
+      }
       throw new FatalError(
         `${error instanceof Error ? error.message : error} — Neon reported creating branch ` +
-          `${created.branch.id ?? '(no id)'}; delete it in the console if it is yours, then delete ` +
-          `${stateFilePath()} and re-run provision.`,
+          `${created.branch.id ?? '(no id)'}${disposable ? ', which has been deleted again' : '; delete it in the console if it is yours'}. ` +
+          `Re-run provision once the cause is understood.`,
       )
     }
     const branchId = created.branch.id
@@ -1277,18 +1329,21 @@ export async function provision(deps: Deps = defaultDeps()): Promise<void> {
       })
       deps.log(`[purge] emptied ${plan.truncate.length} table(s); preserved ${plan.preserved.length} (${plan.preserved.join(', ') || 'none'})`)
 
-      // Only now are the URLs publishable: the database no longer holds production rows.
+      // Migrate and seed reach the branch through their child-process environment only — the
+      // provisioning migrator is the ONE thing allowed to touch a pending branch.
+      deps.log(`[${ORM}] applying migrations this checkout has that the parent did not…`)
+      await deps.deployMigrations(uri)
+      await deps.seed(uri)
+
+      // Publishing is the last thing that happens before `ready`, and it happens only after the
+      // purge was verified. Until this point nothing outside provisioning can reach the branch.
       upsertEnvVars(envFilePath(), {
         ...Object.fromEntries(DB_ENV_VARS.map((name) => [name, uri])),
         NEON_API_KEY: apiKey,
         NEON_PROJECT_ID: projectId,
         NEON_PARENT_BRANCH: parentRef,
       })
-      deps.log(`[neondb-branch] wrote ${DB_ENV_VARS.join(', ')} and Neon credentials → ${ENV_FILE}`)
-
-      deps.log(`[${ORM}] applying migrations this checkout has that the parent did not…`)
-      await deps.deployMigrations(uri)
-      await deps.seed(uri)
+      deps.log(`[neondb-branch] wrote ${DB_ENV_VARS.join(', ')} and Neon credentials → ${envFilePath()}`)
 
       writeState({ branchId, branchName, projectId, status: 'ready' })
       deps.log('✅ [neondb-branch] workspace database ready.')
@@ -1327,10 +1382,11 @@ export async function sync(deps: Deps = defaultDeps()): Promise<void> {
           'against it. Re-run `db:provision` to rebuild it (or `teardown` to release it).',
       )
     }
-    if (!managedUrlsPresent(process.env)) {
+    const missingUrls = DB_ENV_VARS.filter((name) => !managedVarsInFile(envFilePath()).includes(name))
+    if (missingUrls.length > 0) {
       throw new FatalError(
-        `${ENV_FILE} does not define ${DB_ENV_VARS.join(', ')} for this workspace. Re-run ` +
-          '`db:provision`. (Never fall back to an ambient DATABASE_URL — that is the shared database.)',
+        `${envFilePath()} does not define ${missingUrls.join(', ')} for this workspace. Re-run ` +
+          '`db:provision`. (An ambient DATABASE_URL does not count — that is the shared database.)',
       )
     }
 
