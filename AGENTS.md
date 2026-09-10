@@ -87,12 +87,19 @@ No repo-wide test command — each skill validates independently:
 bash skills/<category>/<skill-name>/tests/run.sh
 ```
 
-Present on at least `epic-manager`, `execute-tickets`, `plan-to-tickets`, and
-`github-lockdown`. These are plain-bash suites against `fake-gh`/`fake-codex`/`fake-yq`
-fixtures in each skill's `tests/` dir — no network calls, no real GitHub state. A test
-result line looks like `ok   <description>`; grep for `not ok` to find failures (the
-harness in some skills prints a stray `0 passed, 0 failed` line before the real
-results run — that's a known quirk of the runner, not a signal of anything).
+Present on at least `epic-manager`, `execute-tickets`, `plan-to-tickets`,
+`github-lockdown`, and `neondb-branch`. Most are plain-bash suites against
+`fake-gh`/`fake-codex`/`fake-yq` fixtures in each skill's `tests/` dir — no network
+calls, no real GitHub state. A test result line looks like `ok   <description>`; grep
+for `not ok` to find failures (the harness in some skills prints a stray
+`0 passed, 0 failed` line before the real results run — that's a known quirk of the
+runner, not a signal of anything).
+
+`neondb-branch` is the one exception to "no network": its script is TypeScript, not
+bash, so its `run.sh` bootstraps a throwaway harness (vitest + `@electric-sql/pglite` +
+typescript) in a temp dir outside this repo, typechecks with `tsc --noEmit`, and runs
+vitest there. It still needs no Neon credentials and no live database — the control
+plane is faked and the SQL runs in-process against PGlite.
 
 Before trusting a fixture-based test result for anything that touches `gh` output
 shape: verify the fixture matches what real `gh` actually returns (field names,
