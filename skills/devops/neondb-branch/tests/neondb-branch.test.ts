@@ -408,6 +408,7 @@ describe('provision', () => {
     await expect(provision(makeDeps({ seed: () => { throw new Error('seed failed') } }))).rejects.toThrow('seed failed')
     expect(readState()).toMatchObject({ branchId: childBranch().id, status: 'deleting' })
     expect(warnings.join('\n')).toMatch(/still present/)
+    expect(warnings.join('\n')).not.toMatch(/inherited production rows/)
   })
   it('walks creating → pending → ready, creating an ordinary child at the captured parent LSN', async () => {
     const transitions: string[] = []
@@ -472,6 +473,85 @@ describe('provision', () => {
     await expect(provision(makeDeps())).rejects.toThrow(/table\(s\) public\.invoices/)
     expect(existsSync(stateFile())).toBe(false) // cleaned up
     expect(neon.calls.filter((c) => c.startsWith('deleteBranch'))).toHaveLength(1)
+    expect(warnings.join('\n')).toMatch(/inherited production rows/)
+  })
+
+  it('warns that inherited production rows remain when TRUNCATE fails and the branch is still live', async () => {
+    upsertEnvVars(join(sandbox, '.env.neondb'), {
+      DATABASE_URL: 'postgres://u:p@stale-or-copied-host/appdb',
+      NEON_PROJECT_ID: PROJECT,
+    })
+    let envAtTruncate = ''
+    const originalConnect = sql.connect
+    sql = {
+      ...sql,
+      connect: async (uri) => {
+        const session = await originalConnect(uri)
+        return {
+          ...session,
+          client: {
+            query: async <T>(statement: string, params?: unknown[]) => {
+              if (statement.startsWith('TRUNCATE')) {
+                envAtTruncate = existsSync(join(sandbox, '.env.neondb'))
+                  ? readFileSync(join(sandbox, '.env.neondb'), 'utf8')
+                  : ''
+                throw new Error('TRUNCATE failed')
+              }
+              return session.client.query<T>(statement, params)
+            },
+          },
+        }
+      },
+    }
+    neon.deleteBranch = async () => 'deleted'
+    await expect(provision(makeDeps())).rejects.toThrow('TRUNCATE failed')
+    expect(readState()).toMatchObject({ branchId: childBranch().id, status: 'deleting' })
+    expect(warnings.join('\n')).toMatch(/inherited production rows/)
+    expect(warnings.join('\n')).toMatch(/still present/)
+    // Better to be stuck with no URL than to have one pointing at inherited production rows.
+    expect(envAtTruncate).not.toMatch(/DATABASE_URL/)
+    const envAfter = existsSync(join(sandbox, '.env.neondb')) ? readFileSync(join(sandbox, '.env.neondb'), 'utf8') : ''
+    expect(envAfter).not.toMatch(/DATABASE_URL/)
+    expect(envAfter).toMatch(/NEON_PROJECT_ID/)
+  })
+
+  it.each([false, true])('still cleans up when URL withdrawal fails before purging (delete fails: %s)', async (deleteFails) => {
+    // A directory deterministically fails env-file reads, including when tests run as root.
+    mkdirSync(join(sandbox, '.env.neondb'))
+    if (deleteFails) neon.failDeleteWith = new NeonRequestError('DELETE unavailable', 500, true)
+
+    await expect(provision(makeDeps())).rejects.toThrow(/EISDIR/)
+
+    expect(neon.calls).toContain(`deleteBranch(${PROJECT},${childBranch().id})`)
+    expect(neon.branches.has(childBranch().id)).toBe(deleteFails)
+    expect(readState()).toMatchObject({ branchId: childBranch().id, status: 'deleting' })
+    expect(warnings.join('\n')).toMatch(/could not withdraw DATABASE_URL/)
+    expect(warnings.join('\n')).toMatch(/inherited production rows/)
+    const cleanupWarning = warnings.at(-1)
+    if (deleteFails) {
+      expect(cleanupWarning).toMatch(/could not delete branch/)
+    } else {
+      expect(cleanupWarning).toMatch(/confirmed absent.*local cleanup failed/)
+      expect(cleanupWarning).toMatch(/Repair.*teardown/)
+      expect(cleanupWarning).not.toMatch(/could not delete branch|production rows/)
+    }
+    expect(existsSync(join(sandbox, '.neondb', 'lock'))).toBe(false)
+  })
+
+  it('preserves the purge error when URL withdrawal and branch deletion also fail', async () => {
+    const purgeError = new Error('purge planning failed')
+    neon.failDeleteWith = new NeonRequestError('DELETE unavailable', 500, true)
+
+    await expect(provision(makeDeps({ knownTables: async () => {
+      mkdirSync(join(sandbox, '.env.neondb'))
+      throw purgeError
+    } }))).rejects.toBe(purgeError)
+
+    expect(neon.calls).toContain(`deleteBranch(${PROJECT},${childBranch().id})`)
+    expect(readState()).toMatchObject({ branchId: childBranch().id, status: 'deleting' })
+    expect(warnings.join('\n')).toMatch(/could not withdraw DATABASE_URL/)
+    expect(warnings.join('\n')).toMatch(/inherited production rows/)
+    expect(warnings.join('\n')).toMatch(/DELETE unavailable/)
   })
 
   it('refuses a mismatched parent_lsn without deleting a branch it cannot prove it owns', async () => {

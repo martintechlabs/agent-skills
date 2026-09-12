@@ -14,12 +14,9 @@
 // row data, which removes the whole reason the previous design needed a second, disposable `tmp/*`
 // full-data clone to learn the parent's true applied-migration state.
 //
-// PRIVACY: NOT A BOUNDARY. An ordinary child initially CONTAINS production data, and Neon's history
-// window can retain that data in the branch's own snapshots even after the purge below. This design
-// trades the schema-only privacy property for root-slot correctness. Do NOT treat a workspace branch
-// as a redacted environment, do not "reset from parent" or restore it from production, and never
-// start the app against it before provisioning completes — the purge is the only thing that removes
-// production rows, and `load-env.cjs` refuses to boot until state reaches `ready`.
+// Do not "reset from parent" or restore a workspace branch from production, and never start the app
+// against it before provisioning completes. The purge is the only path that empties inherited rows,
+// and `load-env.cjs` refuses to boot until state reaches `ready`.
 //
 // LIFECYCLE STATE lives in .neondb/state.json (gitignored, credential-free, written atomically):
 //   { "branchId": "br-…", "branchName": "workspace/…", "projectId": "…", "status": "ready" }
@@ -261,6 +258,9 @@ export class NeonRequestError extends Error {
 
 /** Creation intent that could not be resolved. Leaves `.neondb/state.json` at `creating`. */
 export class AmbiguousCreateError extends Error {}
+
+/** Remote absence is confirmed; only local recovery files still need cleanup. */
+class LocalCleanupError extends Error {}
 
 // ── State file ───────────────────────────────────────────────────────────────
 
@@ -1268,8 +1268,17 @@ async function deleteRecordedBranch(deps: Deps, state: WorkspaceState, parentId?
   } else {
     deps.log(`[neondb-branch] branch ${branchId} was already gone — treating as torn down.`)
   }
-  stripEnvVars(envFilePath(), DB_ENV_VARS)
-  clearState()
+  try {
+    stripEnvVars(envFilePath(), DB_ENV_VARS)
+    clearState()
+  } catch (error) {
+    throw new LocalCleanupError(
+      `Branch ${branchId} is confirmed absent in Neon, but local cleanup failed ` +
+        `(${error instanceof Error ? error.message : error}). ` +
+        'Repair the local env/state/ownership-file path or permissions, then run teardown to finish cleanup.',
+      { cause: error },
+    )
+  }
 }
 
 export async function provision(deps: Deps = defaultDeps()): Promise<void> {
@@ -1362,7 +1371,12 @@ export async function provision(deps: Deps = defaultDeps()): Promise<void> {
     writeState({ branchId, branchName, projectId, status: 'pending' })
     deps.log(`[neon] created ${branchId} (parent ${created.branch.parent_id} @ ${created.branch.parent_lsn})`)
 
+    let purged = false
     try {
+      // No managed URL until the purge is verified and published below. A leftover DATABASE_URL
+      // (copied file, previous workspace) must not remain reachable during this window.
+      stripEnvVars(envFilePath(), DB_ENV_VARS)
+
       // The create response may list a different database/role first. Resolve the selected database
       // for this verified child explicitly, exactly as for the parent.
       const uri = await withRetry('fetch connection string', () => deps.neon.connectionUri(projectId, branchId), idempotent(deps, 5))
@@ -1377,6 +1391,7 @@ export async function provision(deps: Deps = defaultDeps()): Promise<void> {
         await verifyTablesEmpty(client, purgePlan.truncate)
         return purgePlan
       })
+      purged = true
       deps.log(`[purge] emptied ${plan.truncate.length} table(s); preserved ${plan.preserved.length} (${plan.preserved.join(', ') || 'none'})`)
 
       // Migrate and seed reach the branch through their child-process environment only — the
@@ -1399,16 +1414,42 @@ export async function provision(deps: Deps = defaultDeps()): Promise<void> {
       writeState({ branchId, branchName, projectId, status: 'ready' })
       deps.log('✅ [neondb-branch] workspace database ready.')
     } catch (error) {
-      deps.warn('[neondb-branch] setup failed after the branch was created — deleting it so the next attempt starts clean.')
+      // Withdraw URLs even if the leftover branch cannot be deleted — better to be stuck with no
+      // database than to have a file pointing at inherited production rows.
+      try {
+        stripEnvVars(envFilePath(), DB_ENV_VARS)
+      } catch (withdrawalError) {
+        deps.warn(
+          `[neondb-branch] WARNING: could not withdraw ${DB_ENV_VARS.join(', ')} from ${envFilePath()} ` +
+            `(${withdrawalError instanceof Error ? withdrawalError.message : withdrawalError}). ` +
+            'Do not connect using its URLs. Repair the env-file path/permissions and run teardown. Still attempting branch deletion.',
+        )
+      }
+      if (!purged) {
+        deps.warn(
+          `[neondb-branch] WARNING: inherited production rows are still on branch ${branchId} ` +
+            'because the purge did not finish. Do not connect to this branch. Deleting it so the ' +
+            'next attempt starts clean.',
+        )
+      } else {
+        deps.warn('[neondb-branch] setup failed after the branch was created — deleting it so the next attempt starts clean.')
+      }
       try {
         await deleteRecordedBranch(deps, { branchId, branchName, projectId, status: 'pending' }, parent.id)
       } catch (cleanupError) {
+        if (cleanupError instanceof LocalCleanupError) {
+          deps.warn(`[neondb-branch] WARNING: ${cleanupError.message}`)
+          throw error
+        }
         // Cleanup failed: KEEP the recovery state so teardown can still find the branch by id, and
         // say so loudly. Silently dropping the record is how a branch leaks forever.
+        const leftover = `[neondb-branch] WARNING: could not delete branch ${branchId} ` +
+          `(${cleanupError instanceof Error ? cleanupError.message : cleanupError}). ` +
+          `${stateFilePath()} still records it — run teardown to remove it.`
         deps.warn(
-          `[neondb-branch] WARNING: could not delete branch ${branchId} ` +
-            `(${cleanupError instanceof Error ? cleanupError.message : cleanupError}). ` +
-            `${stateFilePath()} still records it — run teardown to remove it.`,
+          !purged
+            ? `${leftover} Inherited production rows are still on it. Do not connect to it; delete it in the Neon console if teardown cannot.`
+            : leftover,
         )
       }
       throw error
