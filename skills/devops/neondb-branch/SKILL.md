@@ -16,7 +16,7 @@ description: >-
 disable-model-invocation: true
 metadata:
   author: martintechlabs
-  version: "0.2.0"
+  version: "0.2.1"
 ---
 
 # Per-workspace isolated Neon databases (Prisma or Drizzle, any git repo)
@@ -42,7 +42,7 @@ Each `provision()` run:
 6. Publishes `DATABASE_URL` (and any other `DB_ENV_VARS`) to `.env.neondb` after those steps succeed.
 7. Records `status: "ready"` in `.neondb/state.json`.
 
-## Why an ordinary child, and what it costs you
+## Why an ordinary child
 
 Neon **schema-only branches are root branches**: they have no parent, and `--parent` only names the
 schema donor. Root-branch allowances are 3 (Free), 5 (Launch), 25 (Scale) per project, so a handful
@@ -54,26 +54,6 @@ because migration history is table *data*. The previous design compensated by cl
 second time, with data, into a disposable `tmp/*` branch purely to read the real ledger rows back.
 An ordinary child inherits that ledger directly — so the second clone, the ledger read, and the
 baseline INSERT are all gone.
-
-> ### ⚠️ A workspace branch is not a privacy boundary
->
-> An ordinary child **initially contains production data**, and Neon's history window can retain
-> that data in the branch's own snapshots **even after the purge**. The purge empties the current
-> state; it does not erase history.
->
-> Consequences to take seriously:
->
-> - **Never start the app against a branch that has not finished provisioning.** `load-env.cjs`
->   refuses to boot unless `.neondb/state.json` reads `ready`, and `sync` gates the same way. Do not
->   remove either guard, and do not hand-write a `DATABASE_URL` that bypasses them.
-> - **Never "Reset from parent" or restore a workspace branch from production.** That re-materializes
->   every production row and nothing purges it afterwards — provisioning is the only code path that
->   purges, and it only runs on a branch it just created.
-> - **Do not treat these branches as redacted** for compliance, demos, screen-sharing, or handing a
->   connection string to a third party.
-> - If you need a genuine no-production-data guarantee, schema-only branching is the only Neon
->   mechanism that provides it — at the cost of a root-branch slot per workspace and the ledger
->   problem above.
 
 ## Lifecycle state: `.neondb/state.json`
 
@@ -326,9 +306,8 @@ limit is not, which is why the ceiling arrives without warning.
 
 **The fix:** 0.2.0 creates an ordinary child of production instead, which costs no root slot, and
 purges the production rows it inherits. That also deleted the disposable `tmp/*` clone the old design
-needed, since an ordinary child inherits the migration ledger directly. See "Why an ordinary child,
-and what it costs you" above for the trade-off that comes with it, and the privacy warning that goes
-with holding production data even briefly.
+needed, since an ordinary child inherits the migration ledger directly. See "Why an ordinary child"
+above.
 
 Alongside it, tracking moved from `.neondb/branch` (a branch *name*, plus an undocumented marker
 line) to `.neondb/state.json`, keyed on the branch **id**. A name is not proof of ownership: the old
@@ -403,7 +382,17 @@ root-branch slot.
   descendants stop provisioning before those hooks can run. Materialized views are classified too:
   their stored rows require explicit preservation or a project-specific purge design.
 - **URLs publish only after the purge is verified.** Until then the branch is reachable solely by the
-  provisioning migrator, through the URI in its child-process environment.
+  provisioning migrator, through the URI in its child-process environment. `load-env.cjs` refuses to
+  boot unless `.neondb/state.json` reads `ready`, and `sync` gates the same way — do not remove either
+  guard, and do not hand-write a `DATABASE_URL` that bypasses them.
+- **A failed purge is when inherited rows still matter.** If emptying the child fails, provisioning
+  warns that production rows are still on that branch, withdraws `DATABASE_URL` (and every other
+  `DB_ENV_VARS` entry) so nothing can connect, and tries to delete the branch. If deletion also fails,
+  the leftover-branch warning says the same: do not connect; teardown or delete it in Neon. Being
+  stuck with no database is the intended outcome.
+- **Never "Reset from parent" or restore a workspace branch from production.** That reloads the
+  parent's current rows and nothing purges them afterwards — provisioning is the only code path that
+  purges, and it only runs on a branch it just created.
 - **No blind retries on creation.** Only failures provably raised before the request reached Neon are
   retried. An ambiguous outcome leaves `status: "creating"` and fails loudly; the branch is never
   looked up, adopted, or deleted by name.
@@ -418,8 +407,6 @@ root-branch slot.
 
 ## Gotchas
 
-- **A workspace branch holds production data until the purge finishes, and its history may hold it
-  afterwards.** See the warning above. This is the central trade-off of this design.
 - **`provision()` discards workspace data on every re-run.** Anything you need across rebuilds goes
   in the seed script, not in ad hoc rows.
 - **`.env.neondb`'s `DATABASE_URL` is managed** — hand-edit the other vars freely, but not that one.
