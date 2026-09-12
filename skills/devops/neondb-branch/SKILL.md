@@ -55,6 +55,10 @@ second time, with data, into a disposable `tmp/*` branch purely to read the real
 An ordinary child inherits that ledger directly — so the second clone, the ledger read, and the
 baseline INSERT are all gone.
 
+Purging empties current application tables; it does not erase [Neon's restore history](https://neon.com/docs/manage/projects),
+which may retain inherited production data. A `ready` child is therefore not a redacted environment
+or a privacy boundary for demos, compliance, or third-party sharing.
+
 ## Lifecycle state: `.neondb/state.json`
 
 ```json
@@ -385,13 +389,15 @@ root-branch slot.
   provisioning migrator, through the URI in its child-process environment. `load-env.cjs` refuses to
   boot unless `.neondb/state.json` reads `ready`, and `sync` gates the same way — do not remove either
   guard, and do not hand-write a `DATABASE_URL` that bypasses them.
-- **A failed purge is when inherited rows still matter.** If emptying the child fails, provisioning
+- **Failed purges withdraw URLs and trigger cleanup.** If emptying the child fails, provisioning
   warns that production rows are still on that branch, withdraws `DATABASE_URL` (and every other
   `DB_ENV_VARS` entry) so nothing can connect, and tries to delete the branch. If deletion also fails,
   the leftover-branch warning says the same: do not connect; teardown or delete it in Neon. Being
   stuck with no database is the intended outcome. If a filesystem error prevents URL withdrawal,
   provisioning reports it with repair instructions and still attempts branch deletion, preserving
-  the original setup error and any unfinished cleanup state.
+  the original setup error and any unfinished cleanup state. If Neon confirms the branch is gone
+  but local cleanup fails, the error identifies the local path/permissions to repair before retrying
+  teardown; it does not claim the deleted branch still holds rows.
 - **Never "Reset from parent" or restore a workspace branch from production.** That reloads the
   parent's current rows and nothing purges them afterwards — provisioning is the only code path that
   purges, and it only runs on a branch it just created.

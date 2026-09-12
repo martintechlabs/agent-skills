@@ -109,3 +109,6 @@ Vitest + `@electric-sql/pglite` in a throwaway scratch harness for this repo's o
 2. Guard secondary withdrawal errors in provisioning recovery without weakening normal env-file
    errors or verified deletion. Keep the unreleased `0.2.1` version bump.
 3. Run strict TypeScript and the complete Vitest/PGlite harness; repeat both review axes and Greploop.
+4. For Greptile's first pass, retain concise history-retention guidance and reproduce misleading
+   warnings after confirmed deletion. Give local cleanup failures distinct errors and remediation
+   in the shared deletion helper, validate all callers, and rerun the full harness and Greploop.

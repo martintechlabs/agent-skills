@@ -210,3 +210,8 @@ after verified purging keeps the generic setup-failure warning. The startup and 
 
 URL withdrawal can itself fail on filesystem errors. Report that failure with remediation, preserve
 the original setup error, and still warn about the unpurged child and attempt branch deletion.
+
+Greptile correction: retain a concise explanation that purging current rows does not erase Neon's
+restore history or make the branch redacted. Distinguish confirmed remote deletion followed by local
+cleanup failure from an unconfirmed deletion; the former needs local path/permission repair, with
+no claim that the deleted branch still contains rows.

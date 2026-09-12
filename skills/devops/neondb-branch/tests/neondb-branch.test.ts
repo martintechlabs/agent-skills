@@ -527,6 +527,14 @@ describe('provision', () => {
     expect(readState()).toMatchObject({ branchId: childBranch().id, status: 'deleting' })
     expect(warnings.join('\n')).toMatch(/could not withdraw DATABASE_URL/)
     expect(warnings.join('\n')).toMatch(/inherited production rows/)
+    const cleanupWarning = warnings.at(-1)
+    if (deleteFails) {
+      expect(cleanupWarning).toMatch(/could not delete branch/)
+    } else {
+      expect(cleanupWarning).toMatch(/confirmed absent.*local cleanup failed/)
+      expect(cleanupWarning).toMatch(/Repair.*teardown/)
+      expect(cleanupWarning).not.toMatch(/could not delete branch|production rows/)
+    }
     expect(existsSync(join(sandbox, '.neondb', 'lock'))).toBe(false)
   })
 

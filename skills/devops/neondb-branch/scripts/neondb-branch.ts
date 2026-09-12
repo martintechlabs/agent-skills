@@ -259,6 +259,9 @@ export class NeonRequestError extends Error {
 /** Creation intent that could not be resolved. Leaves `.neondb/state.json` at `creating`. */
 export class AmbiguousCreateError extends Error {}
 
+/** Remote absence is confirmed; only local recovery files still need cleanup. */
+class LocalCleanupError extends Error {}
+
 // ── State file ───────────────────────────────────────────────────────────────
 
 export type LifecycleStatus = 'creating' | 'pending' | 'ready' | 'deleting'
@@ -1265,8 +1268,17 @@ async function deleteRecordedBranch(deps: Deps, state: WorkspaceState, parentId?
   } else {
     deps.log(`[neondb-branch] branch ${branchId} was already gone — treating as torn down.`)
   }
-  stripEnvVars(envFilePath(), DB_ENV_VARS)
-  clearState()
+  try {
+    stripEnvVars(envFilePath(), DB_ENV_VARS)
+    clearState()
+  } catch (error) {
+    throw new LocalCleanupError(
+      `Branch ${branchId} is confirmed absent in Neon, but local cleanup failed ` +
+        `(${error instanceof Error ? error.message : error}). ` +
+        'Repair the local env/state/ownership-file path or permissions, then run teardown to finish cleanup.',
+      { cause: error },
+    )
+  }
 }
 
 export async function provision(deps: Deps = defaultDeps()): Promise<void> {
@@ -1425,6 +1437,10 @@ export async function provision(deps: Deps = defaultDeps()): Promise<void> {
       try {
         await deleteRecordedBranch(deps, { branchId, branchName, projectId, status: 'pending' }, parent.id)
       } catch (cleanupError) {
+        if (cleanupError instanceof LocalCleanupError) {
+          deps.warn(`[neondb-branch] WARNING: ${cleanupError.message}`)
+          throw error
+        }
         // Cleanup failed: KEEP the recovery state so teardown can still find the branch by id, and
         // say so loudly. Silently dropping the record is how a branch leaks forever.
         const leftover = `[neondb-branch] WARNING: could not delete branch ${branchId} ` +
