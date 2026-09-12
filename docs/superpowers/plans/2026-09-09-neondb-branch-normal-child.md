@@ -101,3 +101,11 @@ Vitest + `@electric-sql/pglite` in a throwaway scratch harness for this repo's o
    into per-worktree Git metadata, validate before API access and startup, and clear after deletion.
 3. Correct Prisma join table schema selection; update installation and verification instructions
    for the shared helper and receipt. Run all tests and request the next Greptile review.
+
+### 0.2.1 warning recovery review
+
+1. Reproduce URL-withdrawal filesystem failures before purging and during failed setup, including
+   failed remote cleanup. Assert warnings, deletion attempts, retained state, and original errors.
+2. Guard secondary withdrawal errors in provisioning recovery without weakening normal env-file
+   errors or verified deletion. Keep the unreleased `0.2.1` version bump.
+3. Run strict TypeScript and the complete Vitest/PGlite harness; repeat both review axes and Greploop.

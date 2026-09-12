@@ -200,3 +200,13 @@ Share these validators between the TypeScript CLI and CommonJS startup loader.
 This protects against accidental copying/corruption of workspace files, not an attacker who can
 rewrite both workspace files and private Git metadata. Prisma implicit join tables also use the
 schema of the alphabetically first participating model, following Prisma's documented convention.
+
+### 0.2.1 purge-failure warnings
+
+Replace the standing privacy notice with an operational warning when the child's purge has not
+completed. Withdraw managed database URLs before purging and on setup failure, attempt verified
+branch deletion, and retain recovery state when cleanup fails. A later migration/seed failure
+after verified purging keeps the generic setup-failure warning. The startup and no-reset guards stay.
+
+URL withdrawal can itself fail on filesystem errors. Report that failure with remediation, preserve
+the original setup error, and still warn about the unpurged child and attempt branch deletion.

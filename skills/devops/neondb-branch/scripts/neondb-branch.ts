@@ -1404,7 +1404,15 @@ export async function provision(deps: Deps = defaultDeps()): Promise<void> {
     } catch (error) {
       // Withdraw URLs even if the leftover branch cannot be deleted — better to be stuck with no
       // database than to have a file pointing at inherited production rows.
-      stripEnvVars(envFilePath(), DB_ENV_VARS)
+      try {
+        stripEnvVars(envFilePath(), DB_ENV_VARS)
+      } catch (withdrawalError) {
+        deps.warn(
+          `[neondb-branch] WARNING: could not withdraw ${DB_ENV_VARS.join(', ')} from ${envFilePath()} ` +
+            `(${withdrawalError instanceof Error ? withdrawalError.message : withdrawalError}). ` +
+            'Do not connect using its URLs. Repair the env-file path/permissions and run teardown. Still attempting branch deletion.',
+        )
+      }
       if (!purged) {
         deps.warn(
           `[neondb-branch] WARNING: inherited production rows are still on branch ${branchId} ` +

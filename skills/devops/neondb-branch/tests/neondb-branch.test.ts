@@ -515,6 +515,37 @@ describe('provision', () => {
     expect(envAfter).toMatch(/NEON_PROJECT_ID/)
   })
 
+  it.each([false, true])('still cleans up when URL withdrawal fails before purging (delete fails: %s)', async (deleteFails) => {
+    // A directory deterministically fails env-file reads, including when tests run as root.
+    mkdirSync(join(sandbox, '.env.neondb'))
+    if (deleteFails) neon.failDeleteWith = new NeonRequestError('DELETE unavailable', 500, true)
+
+    await expect(provision(makeDeps())).rejects.toThrow(/EISDIR/)
+
+    expect(neon.calls).toContain(`deleteBranch(${PROJECT},${childBranch().id})`)
+    expect(neon.branches.has(childBranch().id)).toBe(deleteFails)
+    expect(readState()).toMatchObject({ branchId: childBranch().id, status: 'deleting' })
+    expect(warnings.join('\n')).toMatch(/could not withdraw DATABASE_URL/)
+    expect(warnings.join('\n')).toMatch(/inherited production rows/)
+    expect(existsSync(join(sandbox, '.neondb', 'lock'))).toBe(false)
+  })
+
+  it('preserves the purge error when URL withdrawal and branch deletion also fail', async () => {
+    const purgeError = new Error('purge planning failed')
+    neon.failDeleteWith = new NeonRequestError('DELETE unavailable', 500, true)
+
+    await expect(provision(makeDeps({ knownTables: async () => {
+      mkdirSync(join(sandbox, '.env.neondb'))
+      throw purgeError
+    } }))).rejects.toBe(purgeError)
+
+    expect(neon.calls).toContain(`deleteBranch(${PROJECT},${childBranch().id})`)
+    expect(readState()).toMatchObject({ branchId: childBranch().id, status: 'deleting' })
+    expect(warnings.join('\n')).toMatch(/could not withdraw DATABASE_URL/)
+    expect(warnings.join('\n')).toMatch(/inherited production rows/)
+    expect(warnings.join('\n')).toMatch(/DELETE unavailable/)
+  })
+
   it('refuses a mismatched parent_lsn without deleting a branch it cannot prove it owns', async () => {
     neon = fakeNeon({ created: childBranch({ parent_lsn: '0/DEADBEEF' }) })
     await expect(provision(makeDeps())).rejects.toThrow(/parent_lsn .* not the captured/)

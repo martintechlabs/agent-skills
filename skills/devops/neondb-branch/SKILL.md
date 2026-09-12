@@ -389,7 +389,9 @@ root-branch slot.
   warns that production rows are still on that branch, withdraws `DATABASE_URL` (and every other
   `DB_ENV_VARS` entry) so nothing can connect, and tries to delete the branch. If deletion also fails,
   the leftover-branch warning says the same: do not connect; teardown or delete it in Neon. Being
-  stuck with no database is the intended outcome.
+  stuck with no database is the intended outcome. If a filesystem error prevents URL withdrawal,
+  provisioning reports it with repair instructions and still attempts branch deletion, preserving
+  the original setup error and any unfinished cleanup state.
 - **Never "Reset from parent" or restore a workspace branch from production.** That reloads the
   parent's current rows and nothing purges them afterwards — provisioning is the only code path that
   purges, and it only runs on a branch it just created.
