@@ -3,7 +3,7 @@ name: ship-ready-pr-loop
 description: Use when hardening a completed change or pull request through iterative review until it is ready to ship.
 metadata:
   author: stephen-martin
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # Ship-Ready PR Loop
@@ -38,9 +38,8 @@ If commands are not obvious, inspect package files, CI config, Makefiles, README
 
 Choose the first mechanism that can actually run in the current harness:
 
-1. `/code-review max` when the harness exposes it. Invoke it as a skill or slash action; never run it as a shell command.
-2. The `codex-review` skill when it is available and usable. Follow that skill against the intended PR base.
-3. Direct Codex CLI review when `codex exec review` is available. Set `BASE_REF` through exactly one of these mutually exclusive paths:
+1. `/open-code-review-delegate review and fix` when the `open-code-review-delegate` skill is available and the `ocr` CLI is installed (`ocr --version`). Invoke it as a skill or slash action with the argument `review and fix` (the literal phrase its fix step keys on); never run it as a shell command. Scope it to the intended PR base: range mode with `--from <base> --to HEAD` for committed work (use the known intended base, or resolve one with the discovery in mechanism 2), plus workspace mode for uncommitted and untracked changes, combined into one pass. Map its severities onto this loop: `critical` → Critical, `high` → Major, `medium`/`low` → Minor or lower. Its own fix step applies only critical/high fixes, which matches the Critical/Major scope here; still triage each finding and run validation after it fixes anything. Its file-coverage summary must show every reviewable file as reviewed or skipped with a reason.
+2. Direct Codex CLI review when `codex exec review` is available. Set `BASE_REF` through exactly one of these mutually exclusive paths:
 
    - **Known intended PR base:** Assign its exact local or remote ref to `BASE_REF`, then verify that it resolves to a commit:
 
@@ -49,7 +48,7 @@ Choose the first mechanism that can actually run in the current harness:
      git rev-parse --verify --quiet "${BASE_REF}^{commit}" >/dev/null
      ```
 
-     If verification fails, optionally resolve or fetch that same intended base when doing so is in scope, then verify the same ref again. Never substitute `origin/HEAD`, `main`, or `master` for a different known intended base. If the intended base remains unresolved, do not invoke Codex. Record why and fall through to native self-review.
+     If verification fails, optionally resolve or fetch that same intended base when doing so is in scope, then verify the same ref again. Never substitute `origin/HEAD`, `main`, or `master` for a different known intended base. If the intended base remains unresolved, do not invoke Codex. Record why and fall through to the next mechanism.
 
    - **No intended PR base known:** Resolve `BASE_REF` in this order:
 
@@ -82,9 +81,10 @@ Choose the first mechanism that can actually run in the current harness:
    codex exec review --base "$BASE_REF" -o /tmp/codex-review.txt
    ```
 
-   If no base resolves, do not invoke Codex with an empty or unresolvable base. Fall through to native self-review and record why.
+   If no base resolves, do not invoke Codex with an empty or unresolvable base. Fall through to the next mechanism and record why.
 
    Use `--uncommitted` when needed. If committed and uncommitted scopes both contain part of the change, review both and combine their findings into one pass.
+3. Matt Pocock's `code-review` skill ([aihero.dev/skills-code-review](https://www.aihero.dev/skills-code-review)) when it is installed. This is a user-installed skill from `mattpocock/skills` (`npx skills add mattpocock/skills --skill code-review`, project-level or with `-g` globally), not a built-in skill of Claude, Codex, Grok, or any other agent. Identify it by its description (a two-axis Standards and Spec review since a fixed point), not by the `/code-review` name alone, which other tools also use. Invoke it with the resolved base as the fixed point (use the known intended base, or the discovery in mechanism 2), plus the spec or issue path when one exists; if none exists, say so, so it skips the Spec axis instead of waiting for an answer. It reviews only `<base>...HEAD`, so commit the change before invoking it. It assigns no severities and applies no fixes, so classify each finding yourself: a missing or wrongly implemented spec requirement, or a documented-standard violation that causes a real defect, can be Critical or Major; code-smell findings are judgement calls and count as Minor unless they hide a real defect.
 4. Native self-review when none of the preceding mechanisms can run.
 
 Keep a working mechanism for later passes when possible. If it cannot start or becomes unavailable, fall through to the next mechanism and record the transition. An unavailable preferred reviewer is not a blocker while another mechanism remains.
