@@ -59,6 +59,7 @@ Skills the coding agent reaches for while working.
 |-------|--------------|
 | [`consult-codex`](skills/coding/consult-codex/SKILL.md) | Gets a second opinion from Codex (the OpenAI coding agent) when the agent is genuinely stuck or weighing competing technical approaches. |
 | [`codex-review`](skills/coding/codex-review/SKILL.md) | Gets a second-opinion code review from Codex on a branch, PR, diff, or commit, then triages the findings on their merits. |
+| [`greptile-value`](skills/coding/greptile-value/SKILL.md) | Periodically reads historical PRs and Greptile findings, recommends test and review-instruction upgrades, and measures extra serious catches when earlier review evidence exists. Uses GitHub CLI; no Greptile CLI needed. |
 | [`ship-ready-pr-loop`](skills/coding/ship-ready-pr-loop/SKILL.md) | Drives a change from review findings to a ship-ready PR: fixes Critical/Major issues, then loops Greptile until it reaches 5/5. |
 | [`optimize-agents-md`](skills/coding/optimize-agents-md/SKILL.md) | Audits and patches a repo's AGENTS.md for a fast, safe SDLC — reinforcing TDD, brainstorming, verification, and subagent dispatch — generating one from scratch only if none exists, and keeps CLAUDE.md as a one-line pointer to it. |
 | [`git-merge-origin-main`](skills/coding/git-merge-origin-main/SKILL.md) | Safely merges the latest `origin/main` into the current non-main branch, with hard stops for dirty working trees, in-progress Git operations, detached HEAD, and conflicts. |
