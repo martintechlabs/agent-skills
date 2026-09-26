@@ -3,7 +3,7 @@ name: ship-ready-pr-loop
 description: Use when hardening a completed change or pull request through iterative review until it is ready to ship.
 metadata:
   author: stephen-martin
-  version: "0.3.1"
+  version: "0.4.0"
 ---
 
 # Ship-Ready PR Loop
@@ -171,9 +171,28 @@ Target score: **5/5**
 
 Review all Greploop findings. Fix anything required to reach 5/5. Do not game the score; fix the underlying issue.
 
+Before every Greploop pass, reuse a completed review of the current head commit instead of requesting another:
+
+```bash
+HEAD_SHA=$(gh pr view <PR_NUMBER> --json headRefOid -q .headRefOid)
+test "$HEAD_SHA" = "$(git rev-parse HEAD)" || echo "Push local commits before this pass."
+gh api "repos/{owner}/{repo}/commits/$HEAD_SHA/check-runs" \
+  --jq '.check_runs[] | select(.name | test("greptile"; "i")) | "\(.status) \(.conclusion)"'
+gh api --paginate "repos/{owner}/{repo}/pulls/<PR_NUMBER>/reviews" |
+  jq -r --arg sha "$HEAD_SHA" '.[] | select(.user.login | test("greptile"; "i")) | select(.commit_id == $sha) | .submitted_at'
+```
+
+- If local `HEAD` differs from `HEAD_SHA`, push first; the review must describe the pushed commit.
+- If a Greptile check run on `HEAD_SHA` is `completed`, or a Greptile review has `commit_id` equal to `HEAD_SHA`, that review is current. Invoke Greploop with the instruction to read those results and not post a new `@greptile review` trigger.
+- Request a new review only when the head commit has no completed Greptile review.
+
+A pass that reuses a current review counts toward the pass limit.
+
 ### 8. Repeat the Greploop loop
 
 Repeat the Greploop skill or slash action, then fix remaining issues.
+
+Request at most one review per fix batch. Commit and push fixes as you make them, but request the next review only after every fix for the current findings is committed, pushed, and validated. Never request a review per commit. With manual-only Greptile reviews (`"autoReview": []`), pushes start no reviews. If the repository still reviews on push, push once per pass so each push maps to one review, and let the reuse check in step 7 pick up that review instead of requesting another.
 
 Stop when either:
 
