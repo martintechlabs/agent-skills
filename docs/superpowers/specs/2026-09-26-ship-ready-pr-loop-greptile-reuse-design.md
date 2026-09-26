@@ -14,10 +14,10 @@ Stop the Greploop phase from spending Greptile reviews that add no information: 
 
 Before every Greploop pass:
 
-1. Confirm the local `HEAD` equals the PR's `headRefOid`. If not, push first; the review must describe the pushed commit.
-2. Look for a Greptile check run on `headRefOid` with status `completed`, or a Greptile PR review whose `commit_id` equals `headRefOid`.
-3. If one exists, that review is current. Invoke Greploop with the instruction to read those results and not post a new trigger.
-4. Request a new review only when the head commit has no completed Greptile review.
+1. Confirm the local `HEAD` equals the PR's `headRefOid`. If not, stop, push, and rerun the check from the start so it queries the new head.
+2. Require the Greptile check run on `headRefOid` to be `completed` with conclusion `success`. A cancelled, timed-out, skipped, or failed check is not a review.
+3. Require Greptile's summary to show a confidence score whose `Last reviewed commit` link ends in `headRefOid`. A score for another commit is stale. (A PR review object alone is not enough: a clean 5/5 review posts none, and a review object carries no score.)
+4. When both hold, invoke Greploop with the instruction to read those results and not post a new trigger. Otherwise request a new review.
 
 A pass that reuses a current review counts toward the five-pass limit, because it yields a score and findings the same way a new review does.
 

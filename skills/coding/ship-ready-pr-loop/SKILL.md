@@ -171,20 +171,26 @@ Target score: **5/5**
 
 Review all Greploop findings. Fix anything required to reach 5/5. Do not game the score; fix the underlying issue.
 
-Before every Greploop pass, reuse a completed review of the current head commit instead of requesting another:
+Before every Greploop pass, reuse a completed review of the current head commit instead of requesting another. Run this check from the top each time; if local commits are unpushed, it stops, and you push and run it again:
 
 ```bash
 HEAD_SHA=$(gh pr view <PR_NUMBER> --json headRefOid -q .headRefOid)
-test "$HEAD_SHA" = "$(git rev-parse HEAD)" || echo "Push local commits before this pass."
-gh api "repos/{owner}/{repo}/commits/$HEAD_SHA/check-runs" \
-  --jq '.check_runs[] | select(.name | test("greptile"; "i")) | "\(.status) \(.conclusion)"'
-gh api --paginate "repos/{owner}/{repo}/pulls/<PR_NUMBER>/reviews" |
-  jq -r --arg sha "$HEAD_SHA" '.[] | select(.user.login | test("greptile"; "i")) | select(.commit_id == $sha) | .submitted_at'
+if [ "$HEAD_SHA" != "$(git rev-parse HEAD)" ]; then
+  echo "Local HEAD is not the PR head. Push, then rerun this check." >&2
+else
+  gh api "repos/{owner}/{repo}/commits/$HEAD_SHA/check-runs" \
+    --jq '.check_runs[] | select(.name | test("greptile"; "i")) | "\(.status) \(.conclusion)"'
+  gh pr view <PR_NUMBER> --json body -q .body |
+    grep -o 'greptile_confidence_score:[0-9]\|Last reviewed commit:.*/commit/[0-9a-f]\{40\}'
+fi
 ```
 
-- If local `HEAD` differs from `HEAD_SHA`, push first; the review must describe the pushed commit.
-- If a Greptile check run on `HEAD_SHA` is `completed`, or a Greptile review has `commit_id` equal to `HEAD_SHA`, that review is current. Invoke Greploop with the instruction to read those results and not post a new `@greptile review` trigger.
-- Request a new review only when the head commit has no completed Greptile review.
+Reuse the review only when all of these hold:
+
+- The Greptile check run on `HEAD_SHA` is `completed` with conclusion `success`. A cancelled, timed-out, skipped, or failed check is not a review.
+- Greptile's summary shows a confidence score, and its `Last reviewed commit` link ends in `HEAD_SHA`. A score that names another commit is stale.
+
+When both hold, invoke Greploop with the instruction to read those results and not post a new `@greptile review` trigger. Otherwise, request a new review.
 
 A pass that reuses a current review counts toward the pass limit.
 
