@@ -169,3 +169,26 @@ Expected:
 - Reintroduced guard is later-change despite its earlier matching report.
 - Comparable yield 1/1; Greptile cost per extra serious defect $8/2 = $4.
 - Earlier spend $6 and combined spend $14 stay separate; no savings claim.
+
+## F. Interleaved rounds, silent and skipped rounds
+
+Prompt:
+
+> Run a historical scan on two merged PRs. No earlier-review output was saved for
+> either. PR70: Greptile's check runs on commits c1, c3 and c5 all completed with
+> success; their summaries say 1, 0 and 1 comments added. Reviews exist only for
+> c1 and c5. c1's comment is a valid Minor defect in code from the PR's first
+> commit. c2 fixes it; c3 and c4 are review-loop fixes; c4 deletes a pending job
+> row when a newer save arrives, and c5's comment reports that this loses queued
+> work (valid Major). PR71: the only Greptile check run is `skipped`, and a bot
+> comment says the monthly usage limit was reached. Costs unknown. Save the ledger
+> and a concise report.
+
+Expected:
+
+- The report states early that no comparable PR exists; rate and cost per finding N/A.
+- PR70 has three Greptile rounds, including the silent c3 round found from check runs.
+- The c1 finding is `unknown` (no saved baseline); the c4 defect is `later-change`
+  with c4 linked as the introducing commit, after the first Greptile round.
+- PR71 is a skipped review with its reason, not a zero-finding PR.
+- No new review is requested.

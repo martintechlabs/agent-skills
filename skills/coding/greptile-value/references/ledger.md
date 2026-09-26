@@ -67,9 +67,9 @@ totals. Name the run/cohort for every count.
 Retain all pre-Greptile findings and fixes here, including findings absent from a
 later clean pass: <IDs, evidence and fix SHAs>.
 
-| Greptile round | Account | Completed / captured UTC | Reviewed SHA | Evidence URLs / local snapshots | Gaps |
-|---|---|---|---|---|---|
-| <round> | <author> | <times or unknown> | <SHA or unknown> | <PR body, reviews, inline, issue comments; all pages> | <gaps or none> |
+| Greptile round | Account | Check run status / conclusion / summary | Completed / captured UTC | Reviewed SHA | Baseline pass for this round | Evidence URLs / local snapshots | Gaps |
+|---|---|---|---|---|---|---|---|
+| <round> | <author> | <e.g. completed/success, "N files reviewed, M comments added"; skipped + reason> | <times or unknown> | <SHA or unknown> | <latest saved earlier pass before this round, or none> | <PR body, reviews, inline, issue comments, check runs on every commit; all pages> | <gaps or none> |
 
 - Comparable: <yes/no and reason; known later-change findings do not alone exclude a PR>.
 - Costs/usage for this PR: <source, amount/units/currency, rounds, allocation or unknown>.

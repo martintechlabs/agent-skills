@@ -39,6 +39,11 @@ Use GitHub CLI (`gh`) to read reviews already posted on GitHub. **No Greptile CL
 is required.** No scheduler is installed: invoke this skill when the periodic check
 is wanted. Ask only for scope or location that cannot be inferred.
 
+Expect a historical run to find **zero comparable PRs** unless a workflow saved
+full earlier-review output before Greptile ran. PR bodies seldom keep it, and
+Greptile often reviews at PR creation. Tell the user at the start that the report
+will give patterns and upgrades, but no extra-finding rate.
+
 If the user requests a prospective pilot, record its next-ten-eligible-PR rule and
 reviewer mechanism before results. Keep that cohort separate from history. A branch
 can identify an entry until a PR exists. Use the capture step below as preparation;
@@ -79,14 +84,28 @@ gh pr view <pr> --repo <owner/repo> --json number,url,body,baseRefOid,headRefOid
 gh api --paginate --slurp repos/<owner/repo>/pulls/<pr>/reviews
 gh api --paginate --slurp repos/<owner/repo>/pulls/<pr>/comments
 gh api --paginate --slurp repos/<owner/repo>/issues/<pr>/comments
-gh api --paginate "repos/<owner/repo>/commits/<sha>/check-runs?per_page=100" \
-  --jq '.check_runs[] | select(.name | test("greptile"; "i"))'
+# --slurp returns an array of pages: use .[][] in jq.
+# Greptile check runs on every PR commit (one line per SHA; zsh-safe):
+gh api --paginate repos/<owner/repo>/pulls/<pr>/commits --jq '.[].sha' |
+  while read -r sha; do
+    gh api --paginate "repos/<owner/repo>/commits/$sha/check-runs?per_page=100" \
+      --jq ".check_runs[] | select(.name | test(\"greptile\"; \"i\")) | {sha: \"$sha\", status, conclusion, started_at, completed_at, summary: .output.summary}"
+  done
 ```
 
-Run the check-run query for each candidate reviewed SHA. Only a `completed`
-run with conclusion `success` proves that a review finished. A Greptile summary
-can include a `Last reviewed commit: .../commit/<sha>` link. Use this link as
-reviewed-SHA evidence for that summary snapshot.
+Query every PR commit, not only review `commit_id`s: a round that adds no comments
+leaves no review object. Each check run is one Greptile round. Only a `completed`
+run with conclusion `success` proves that a review finished. Its `output.summary`
+(for example "N files reviewed, M comments added") cross-checks that round's
+mentions. A summary's own round count can disagree with the check runs; record
+the disagreement. A Greptile summary can include a `Last reviewed commit:
+.../commit/<sha>` link. Use this link as reviewed-SHA evidence for that summary
+snapshot.
+
+A skipped round is not a clean round. Record a check run that is `skipped`,
+`cancelled`, `neutral` or failed, or a bot notice (for example a usage limit), as a
+skipped round with its reason. A PR with no Greptile check run and no Greptile
+comments has no review; do not count it as zero findings.
 
 Save output to separate, dated local files. Check command success and every page;
 access failures are gaps, not empty results. Include review bodies, inline threads
@@ -129,6 +148,18 @@ For each valid defect, assign one attribution:
 | `later-change` | The defect was introduced or reintroduced after the baseline; link the introducing diff. |
 | `greptile-only` | The defect existed in the earlier reviewed scope; complete pre-Greptile reports omit it. Link the reports and code proving both facts. |
 | `unknown` | Missing/contaminated baseline, uncertain SHA or scope, unavailable code, or another attribution gap. |
+
+Reviewers often alternate: Greptile reviews at PR creation, then review passes,
+fixes and more Greptile rounds follow. Set the baseline **per Greptile round**. It
+is the latest earlier-review pass that completed before that round started and
+whose full output was saved. A pass that ran after any Greptile round and could
+see its findings is contaminated for later rounds. Attribute each finding against
+the round that first reported it. If no saved pass precedes that round, the
+attribution is `unknown`, unless the introducing commit comes after the PR's
+first Greptile round. Such a defect is `later-change`: no pre-Greptile review saw
+it. Link that commit, and note when it was a fix for an earlier Greptile finding.
+If an unsaved review pass may have covered that commit before the reporting
+round, record this in the finding's gaps; it is not evidence either way.
 
 Check reintroduction before assigning `both`. A defect outside the earlier scope
 is unknown, not a miss. For invalid, non-defect or unresolved claims use attribution
