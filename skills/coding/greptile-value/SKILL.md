@@ -79,7 +79,14 @@ gh pr view <pr> --repo <owner/repo> --json number,url,body,baseRefOid,headRefOid
 gh api --paginate --slurp repos/<owner/repo>/pulls/<pr>/reviews
 gh api --paginate --slurp repos/<owner/repo>/pulls/<pr>/comments
 gh api --paginate --slurp repos/<owner/repo>/issues/<pr>/comments
+gh api --paginate "repos/<owner/repo>/commits/<sha>/check-runs?per_page=100" \
+  --jq '.check_runs[] | select(.name | test("greptile"; "i"))'
 ```
+
+Run the check-run query for each candidate reviewed SHA. Only a `completed`
+run with conclusion `success` proves that a review finished. A Greptile summary
+can include a `Last reviewed commit: .../commit/<sha>` link. Use this link as
+reviewed-SHA evidence for that summary snapshot.
 
 Save output to separate, dated local files. Check command success and every page;
 access failures are gaps, not empty results. Include review bodies, inline threads
