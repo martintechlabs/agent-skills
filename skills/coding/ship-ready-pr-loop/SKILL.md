@@ -180,17 +180,24 @@ if [ "$HEAD_SHA" != "$(git rev-parse HEAD)" ]; then
 else
   gh api "repos/{owner}/{repo}/commits/$HEAD_SHA/check-runs" \
     --jq '.check_runs[] | select(.name | test("greptile"; "i")) | "\(.status) \(.conclusion)"'
-  gh pr view <PR_NUMBER> --json body -q .body |
-    grep -o 'greptile_confidence_score:[0-9]\|Last reviewed commit:.*/commit/[0-9a-f]\{40\}'
+  # Greptile writes its summary to the PR description or to one of its PR comments.
+  {
+    gh pr view <PR_NUMBER> --json body -q .body
+    gh api --paginate "repos/{owner}/{repo}/issues/<PR_NUMBER>/comments" |
+      jq -rs 'add | map(select((.user.login | test("greptile"; "i")) and (.body | contains("greptile_confidence_score"))))
+              | sort_by(.updated_at) | last | .body // empty'
+  } | grep -o 'greptile_confidence_score:[0-9]\|Last reviewed commit:.*/commit/[0-9a-f]\{40\}'
 fi
 ```
+
+If the check run is `queued` or `in_progress`, a review of `HEAD_SHA` is already running. Do not request another; let Greploop wait for it, then run this check again.
 
 Reuse the review only when all of these hold:
 
 - The Greptile check run on `HEAD_SHA` is `completed` with conclusion `success`. A cancelled, timed-out, skipped, or failed check is not a review.
-- Greptile's summary shows a confidence score, and its `Last reviewed commit` link ends in `HEAD_SHA`. A score that names another commit is stale.
+- A Greptile summary (in the PR description or a Greptile PR comment) shows a confidence score, and its `Last reviewed commit` link ends in `HEAD_SHA`. A score that names another commit is stale.
 
-When both hold, invoke Greploop with the instruction to read those results and not post a new `@greptile review` trigger. Otherwise, request a new review.
+When both hold, invoke Greploop with the instruction to read those results and not post a new `@greptile review` trigger. When no review of `HEAD_SHA` is running or reusable, request a new review.
 
 A pass that reuses a current review counts toward the pass limit.
 
