@@ -3,7 +3,7 @@ name: ship-ready-pr-loop
 description: Use when hardening a completed change or pull request through iterative review until it is ready to ship.
 metadata:
   author: stephen-martin
-  version: "0.3.0"
+  version: "0.4.0"
 ---
 
 # Ship-Ready PR Loop
@@ -38,7 +38,7 @@ If commands are not obvious, inspect package files, CI config, Makefiles, README
 
 Choose the first mechanism that can actually run in the current harness:
 
-1. `/open-code-review-delegate review and fix` when the `open-code-review-delegate` skill is available and the `ocr` CLI is installed (`ocr --version`). Invoke it as a skill or slash action with the argument `review and fix` (the literal phrase its fix step keys on); never run it as a shell command. Scope it to the intended PR base: range mode with `--from <base> --to HEAD` for committed work (use the known intended base, or resolve one with the discovery in mechanism 2), plus workspace mode for uncommitted and untracked changes, combined into one pass. Map its severities onto this loop: `critical` → Critical, `high` → Major, `medium`/`low` → Minor or lower. Its own fix step applies only critical/high fixes, which matches the Critical/Major scope here; still triage each finding and run validation after it fixes anything. Its file-coverage summary must show every reviewable file as reviewed or skipped with a reason.
+1. `/open-code-review-delegate` when the `open-code-review-delegate` skill is available and the `ocr` CLI is installed (`ocr --version`). Invoke it as a skill or slash action for review only; never run it as a shell command, and never include the phrase `review and fix`, which makes it apply critical/high fixes before this loop triages them. Scope it to the intended PR base: range mode with `--from <base> --to HEAD` for committed work (use the known intended base, or resolve one with the discovery in mechanism 2), plus workspace mode for uncommitted and untracked changes, combined into one pass. Map its severities onto this loop: `critical` → Critical, `high` → Major, `medium`/`low` → Minor or lower. Triage its findings in step 3 and apply fixes in step 4, as with every other mechanism. Its file-coverage summary must show every reviewable file as reviewed or skipped with a reason.
 2. Direct Codex CLI review when `codex exec review` is available. Set `BASE_REF` through exactly one of these mutually exclusive paths:
 
    - **Known intended PR base:** Assign its exact local or remote ref to `BASE_REF`, then verify that it resolves to a commit:
@@ -84,7 +84,7 @@ Choose the first mechanism that can actually run in the current harness:
    If no base resolves, do not invoke Codex with an empty or unresolvable base. Fall through to the next mechanism and record why.
 
    Use `--uncommitted` when needed. If committed and uncommitted scopes both contain part of the change, review both and combine their findings into one pass.
-3. Matt Pocock's `code-review` skill ([aihero.dev/skills-code-review](https://www.aihero.dev/skills-code-review)) when it is installed. This is a user-installed skill from `mattpocock/skills` (`npx skills add mattpocock/skills --skill code-review`, project-level or with `-g` globally), not a built-in skill of Claude, Codex, Grok, or any other agent. Identify it by its description (a two-axis Standards and Spec review since a fixed point), not by the `/code-review` name alone, which other tools also use. Invoke it with the resolved base as the fixed point (use the known intended base, or the discovery in mechanism 2), plus the spec or issue path when one exists; if none exists, say so, so it skips the Spec axis instead of waiting for an answer. It reviews only `<base>...HEAD`, so commit the change before invoking it. It assigns no severities and applies no fixes, so classify each finding yourself: a missing or wrongly implemented spec requirement, or a documented-standard violation that causes a real defect, can be Critical or Major; code-smell findings are judgement calls and count as Minor unless they hide a real defect.
+3. Matt Pocock's `code-review` skill ([aihero.dev/skills-code-review](https://www.aihero.dev/skills-code-review)) when it is installed. This is a user-installed skill from `mattpocock/skills` (`npx skills add mattpocock/skills --skill code-review`, project-level or with `-g` globally), not a built-in skill of Claude, Codex, Grok, or any other agent. Identify it by its description (a two-axis Standards and Spec review since a fixed point), not by the `/code-review` name alone, which other tools also use. Invoke it with the resolved base as the fixed point (use the known intended base, or the discovery in mechanism 2), plus the spec or issue path when one exists; if none exists, say so, so it skips the Spec axis instead of waiting for an answer. It reviews only `<base>...HEAD`, so commit the change before every invocation, including repeat passes after step 4 fixes, then confirm `git status --porcelain` is empty; any file still listed is outside its review, so commit it or record why it is not part of the change. It assigns no severities and applies no fixes, so classify each finding yourself: a missing or wrongly implemented spec requirement, or a documented-standard violation that causes a real defect, can be Critical or Major; code-smell findings are judgement calls and count as Minor unless they hide a real defect.
 4. Native self-review when none of the preceding mechanisms can run.
 
 Keep a working mechanism for later passes when possible. If it cannot start or becomes unavailable, fall through to the next mechanism and record the transition. An unavailable preferred reviewer is not a blocker while another mechanism remains.
@@ -171,9 +171,41 @@ Target score: **5/5**
 
 Review all Greploop findings. Fix anything required to reach 5/5. Do not game the score; fix the underlying issue.
 
+Before every Greploop pass, reuse a completed review of the current head commit instead of requesting another. Run this check from the top each time; if local commits are unpushed, it stops, and you push and run it again:
+
+```bash
+HEAD_SHA=$(gh pr view <PR_NUMBER> --json headRefOid -q .headRefOid)
+if [ "$HEAD_SHA" != "$(git rev-parse HEAD)" ]; then
+  echo "Local HEAD is not the PR head. Push, then rerun this check." >&2
+else
+  gh api --paginate "repos/{owner}/{repo}/commits/$HEAD_SHA/check-runs?per_page=100" \
+    --jq '.check_runs[] | select(.name | test("greptile"; "i")) | "\(.status) \(.conclusion)"'
+  # Greptile writes its summary to the PR description or to one of its PR comments.
+  {
+    gh pr view <PR_NUMBER> --json body -q .body
+    gh api --paginate "repos/{owner}/{repo}/issues/<PR_NUMBER>/comments" |
+      jq -rs 'add | map(select((.user.login | test("greptile"; "i")) and (.body | contains("greptile_confidence_score"))))
+              | sort_by(.updated_at) | last | .body // empty'
+  } | grep -o 'greptile_confidence_score:[0-9]\|Last reviewed commit:.*/commit/[0-9a-f]\{40\}'
+fi
+```
+
+If the check run is `queued` or `in_progress`, a review of `HEAD_SHA` is already running. Do not request another; let Greploop wait for it, then run this check again. If the repository reviews on push and no Greptile check run exists yet right after a push, recheck every 10 seconds for up to 2 minutes before treating the check as absent; the automatic review may still be registering.
+
+Reuse the review only when all of these hold:
+
+- The Greptile check run on `HEAD_SHA` is `completed` with conclusion `success`. A cancelled, timed-out, skipped, or failed check is not a review.
+- A Greptile summary (in the PR description or a Greptile PR comment) shows a confidence score, and its `Last reviewed commit` link ends in `HEAD_SHA`. A score that names another commit is stale.
+
+When both hold, invoke Greploop with the instruction to read those results and not post a new `@greptile review` trigger. When no review of `HEAD_SHA` is running or reusable, request a new review.
+
+A pass that reuses a current review counts toward the pass limit.
+
 ### 8. Repeat the Greploop loop
 
 Repeat the Greploop skill or slash action, then fix remaining issues.
+
+Request at most one review per fix batch. Commit and push fixes as you make them, but request the next review only after every fix for the current findings is committed, pushed, and validated. Never request a review per commit. With manual-only Greptile reviews (`"autoReview": []`), pushes start no reviews. If the repository still reviews on push, push once per pass so each push maps to one review, and let the reuse check in step 7 pick up that review instead of requesting another.
 
 Stop when either:
 
