@@ -178,7 +178,7 @@ HEAD_SHA=$(gh pr view <PR_NUMBER> --json headRefOid -q .headRefOid)
 if [ "$HEAD_SHA" != "$(git rev-parse HEAD)" ]; then
   echo "Local HEAD is not the PR head. Push, then rerun this check." >&2
 else
-  gh api "repos/{owner}/{repo}/commits/$HEAD_SHA/check-runs" \
+  gh api --paginate "repos/{owner}/{repo}/commits/$HEAD_SHA/check-runs?per_page=100" \
     --jq '.check_runs[] | select(.name | test("greptile"; "i")) | "\(.status) \(.conclusion)"'
   # Greptile writes its summary to the PR description or to one of its PR comments.
   {
@@ -190,7 +190,7 @@ else
 fi
 ```
 
-If the check run is `queued` or `in_progress`, a review of `HEAD_SHA` is already running. Do not request another; let Greploop wait for it, then run this check again.
+If the check run is `queued` or `in_progress`, a review of `HEAD_SHA` is already running. Do not request another; let Greploop wait for it, then run this check again. If the repository reviews on push and no Greptile check run exists yet right after a push, recheck every 10 seconds for up to 2 minutes before treating the check as absent; the automatic review may still be registering.
 
 Reuse the review only when all of these hold:
 
