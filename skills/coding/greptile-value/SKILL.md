@@ -168,8 +168,13 @@ attribution: a real serious bug can have unknown attribution.
 
 ## Report and learn
 
-Update the ledger's report after each PR and at the pilot limit. Keep the user-facing
-report to about 250 words; put evidence detail in the ledger. Finding counts cover
+Produce two files. Beside the ledger, write `report.md` from
+[the report template](references/ledger.md#report-template): the file the user
+reads. Replace it on each run. It starts with the actions, then gives the counts
+and limits, and stays short. Tell the user that `ledger.md` is the evidence
+log for later runs and audits, and that they do not need to read it. Also update
+the ledger's own report section after each PR and at the pilot limit: it is the
+durable count record. Finding counts cover
 Greptile claims only. Keep earlier-only claims in the baseline history, outside those
 counts. Count canonical findings, not comments. Report selected, completed and **comparable** PRs separately.
 A comparable PR has a complete baseline for the change, verified Greptile completion,

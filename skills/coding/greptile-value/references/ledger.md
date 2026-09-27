@@ -9,6 +9,8 @@ and incomplete cases. Remove the example rows when filling the tables.
 ```markdown
 # Greptile value — <pilot>
 
+> Evidence log for later runs and audits. For actions, read [report.md](report.md).
+
 - Repository: <owner/repo>
 - Mode: <prospective or retrospective; selection date and rule>
 - Target / enrolled: <10 / count>
@@ -85,4 +87,39 @@ later clean pass: <IDs, evidence and fix SHAs>.
   code at baseline, intervening diff, introduction or reintroduction evidence>.
 - Disposition: <fixed/open/rejected/unknown; fix/test link if known>.
 - Gaps / dated corrections: <open question or changed assessment and why>.
+```
+
+## Report template
+
+Write this as `report.md` beside the ledger. Put actions first. Link each finding
+ID to its ledger block (`#finding-<id>` anchors). Keep it short: full evidence
+stays in the ledger.
+
+```markdown
+# Greptile value — <repo>, <run UTC>
+
+## What to do
+
+| # | Problem found (evidence) | Action | Where | Check it works |
+|---|---|---|---|---|
+| 1 | <defect class; PRs and finding IDs; recurring or single case> | <test assertion or review instruction> | <file or review step> | <how to prove it> |
+
+Each action needs the user's approval; this run changed nothing.
+
+Already covered, no action: <existing regressions or guidance>.
+If there is no action: "No upgrade needed this run."
+
+## What this run can and cannot say
+
+- PRs: <selected> selected, <completed> with Greptile completed, <comparable> comparable.
+- Extra serious findings from Greptile alone: <X/N on comparable PRs, or N/A + reason>.
+- Findings: <canonical> (<Critical/Major> serious, <Minor>, <non-defects/false positives/unresolved>).
+- Cost: <known amounts with source, or unknown for each reviewer>.
+- Limits: <sample size, missing baselines, other gaps>.
+
+## Next step
+
+<one bounded recommendation; acceptance policy unchanged>
+
+Evidence: [ledger.md](ledger.md). You do not need to read it to act on this report.
 ```
