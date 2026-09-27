@@ -49,7 +49,7 @@ totals. Name the run/cohort for every count.
   allocation, missing coverage — separately for Greptile and earlier reviewer>.
 - Cost per extra serious finding: <matched cohort calculation or N/A + reason>.
 - Upgrades (at most three): <class, independent PR/finding IDs, current gap,
-  target file/review step, concrete assertion or instruction, verification;
+  target test file or review doc, concrete assertion or instruction, verification;
   distinguish repeated misses from later changes, even with unknown attribution>.
 - Already covered / retired: <existing regressions or guidance, obsolete code>.
 - Recommendation: <bounded next step; acceptance policy unchanged>.
@@ -102,7 +102,7 @@ stays in the ledger.
 
 | # | Problem found (evidence) | Action | Where | Check it works |
 |---|---|---|---|---|
-| 1 | <defect class; PRs and finding IDs; recurring or single case> | <test assertion or review instruction> | <file or review step> | <how to prove it> |
+| 1 | <defect class; PRs and finding IDs; recurring or single case> | <test assertion or review instruction> | <test file, or the review doc linked from AGENTS.md (default `docs/code-review.md` + link)> | <how to prove it> |
 
 Each action needs the user's approval; this run changed nothing.
 

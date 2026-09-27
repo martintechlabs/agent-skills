@@ -198,8 +198,20 @@ use N/A. Do not invent prices or counterfactual savings.
 
 Inspect current tests and review instructions before proposing upgrades. Rank at
 most three gaps by verified impact and recurrence. For each, give the evidence PRs
-and finding IDs, target file or review step, concrete test assertion or proposed
-instruction, and how to check it works. If an existing regression already covers
+and finding IDs, target file, concrete test assertion or proposed instruction,
+and how to check it works.
+
+Every upgrade targets the scanned repo, in one of two places:
+
+- **Regression test:** the repo's own test files.
+- **Review or coding instruction:** the repo's review guidance document, linked
+  from its `AGENTS.md`. If `AGENTS.md` already links a review document, use it.
+  Otherwise the action is to create `docs/code-review.md` with the instruction and
+  add a link to it from `AGENTS.md`. If the repo has no `AGENTS.md`, say so and
+  let the user choose the file that agents read.
+
+Never target `ship-ready-pr-loop`, other skills, or Greptile settings. A process gap
+in how the loop is run becomes an instruction in the repo's review document. If an existing regression already covers
 the defect, record that protection; do not propose a duplicate. If code was retired,
 do not propose tests for it. Unknown attribution does not block these recommendations.
 
@@ -214,4 +226,5 @@ bugs both reviewers missed or prove that Greptile can safely be removed.
 
 With `ship-ready-pr-loop`, capture its earlier-review outputs before its Greptile
 phase, then read that phase's results after it completes under separate authorization.
-Do not invoke or rewrite the loop. Its acceptance gate stays unchanged.
+Do not invoke, rewrite or recommend changes to the loop. Its acceptance gate
+stays unchanged.
