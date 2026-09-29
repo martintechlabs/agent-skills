@@ -3,7 +3,7 @@ name: ship-ready-pr-loop
 description: Use when hardening a completed change or pull request through iterative review until it is ready to ship.
 metadata:
   author: stephen-martin
-  version: "0.4.0"
+  version: "0.5.0"
 ---
 
 # Ship-Ready PR Loop
@@ -38,7 +38,13 @@ If commands are not obvious, inspect package files, CI config, Makefiles, README
 
 Choose the first mechanism that can actually run in the current harness:
 
-1. `/open-code-review-delegate` when the `open-code-review-delegate` skill is available and the `ocr` CLI is installed (`ocr --version`). Invoke it as a skill or slash action for review only; never run it as a shell command, and never include the phrase `review and fix`, which makes it apply critical/high fixes before this loop triages them. Scope it to the intended PR base: range mode with `--from <base> --to HEAD` for committed work (use the known intended base, or resolve one with the discovery in mechanism 2), plus workspace mode for uncommitted and untracked changes, combined into one pass. Map its severities onto this loop: `critical` → Critical, `high` → Major, `medium`/`low` → Minor or lower. Triage its findings in step 3 and apply fixes in step 4, as with every other mechanism. Its file-coverage summary must show every reviewable file as reviewed or skipped with a reason.
+1. The `code-review-and-quality` skill ([skills.sh](https://www.skills.sh/addyosmani/agent-skills/code-review-and-quality)), a user-installed skill from `addyosmani/agent-skills` identified by its five-axis review (correctness, readability, architecture, security, performance). If it is missing, ask the user whether to install it. On a yes, install it globally so the target repo stays clean:
+
+   ```bash
+   npx -y skills add addyosmani/agent-skills --skill code-review-and-quality -g -y
+   ```
+
+   If the harness cannot load a newly installed skill until restart, read the installed `SKILL.md` (under `~/.agents/skills/code-review-and-quality/`) and follow it directly. If the user declines, no user is available to ask (an unattended run), or the install fails (no network, no `npx`), do not install; record why and fall through to mechanism 2. Invoke it as a skill for review only; never run it as a shell command. Point it at the complete change against the intended PR base (use the known intended base, or resolve one with the discovery in mechanism 2), including uncommitted and untracked files, plus the spec or issue path when one exists. Run it in a fresh subagent when the harness has one, so the reviewer does not share the author's context. It asks you to confirm before deleting dead code and to split oversized changes; record those as findings for step 3 instead of pausing the loop. Map its labels onto this loop: `Critical:` → Critical, an unprefixed (required) finding → Major, `Optional:`/`Consider:`/`Nit:`/`FYI` → Minor or lower. Its presumptive blockers (relocated complexity, oversized files, feature logic in shared modules, near-duplicate helpers, silent fallbacks) are Minor unless they hide a real defect. When it runs in the author's own context rather than a subagent, state: `code-review-and-quality ran in the author's context and is not an independent second opinion.`
 2. Direct Codex CLI review when `codex exec review` is available. Set `BASE_REF` through exactly one of these mutually exclusive paths:
 
    - **Known intended PR base:** Assign its exact local or remote ref to `BASE_REF`, then verify that it resolves to a commit:
@@ -84,7 +90,17 @@ Choose the first mechanism that can actually run in the current harness:
    If no base resolves, do not invoke Codex with an empty or unresolvable base. Fall through to the next mechanism and record why.
 
    Use `--uncommitted` when needed. If committed and uncommitted scopes both contain part of the change, review both and combine their findings into one pass.
-3. Matt Pocock's `code-review` skill ([aihero.dev/skills-code-review](https://www.aihero.dev/skills-code-review)) when it is installed. This is a user-installed skill from `mattpocock/skills` (`npx skills add mattpocock/skills --skill code-review`, project-level or with `-g` globally), not a built-in skill of Claude, Codex, Grok, or any other agent. Identify it by its description (a two-axis Standards and Spec review since a fixed point), not by the `/code-review` name alone, which other tools also use. Invoke it with the resolved base as the fixed point (use the known intended base, or the discovery in mechanism 2), plus the spec or issue path when one exists; if none exists, say so, so it skips the Spec axis instead of waiting for an answer. It reviews only `<base>...HEAD`, so commit the change before every invocation, including repeat passes after step 4 fixes, then confirm `git status --porcelain` is empty; any file still listed is outside its review, so commit it or record why it is not part of the change. It assigns no severities and applies no fixes, so classify each finding yourself: a missing or wrongly implemented spec requirement, or a documented-standard violation that causes a real defect, can be Critical or Major; code-smell findings are judgement calls and count as Minor unless they hide a real defect.
+3. Matt Pocock's `code-review` skill ([skills.sh](https://www.skills.sh/mattpocock/skills/code-review)), a user-installed skill from `mattpocock/skills`, not a built-in skill of Claude, Codex, Grok, or any other agent. Identify it by its description (a two-axis Standards and Spec review since a fixed point), not by the `/code-review` name alone, which other tools also use. If it is missing when this mechanism is reached, ask the user whether to install it. On a yes, install it globally so the target repo stays clean:
+
+   ```bash
+   npx -y skills add mattpocock/skills --skill code-review -g -y
+   ```
+
+   Do not install over an existing `~/.agents/skills/code-review` that is a different skill. If the harness cannot load a newly installed skill until restart, read `~/.agents/skills/code-review/SKILL.md` and follow it directly. If the user declines, no user is available to ask (an unattended run), or the install fails, do not install; record why and fall through to mechanism 4.
+
+   It expects the one-time per-repo setup from [`setup-matt-pocock-skills`](https://www.skills.sh/mattpocock/skills/setup-matt-pocock-skills), which writes `docs/agents/issue-tracker.md`. If that file is missing from the target repo, ask the user whether to run the setup now. On a yes, install the setup skill globally if it is missing (`npx -y skills add mattpocock/skills --skill setup-matt-pocock-skills -g -y`), then ask the user to run `/setup-matt-pocock-skills`: it disables model invocation and asks the user questions, so the agent cannot run it alone. Its output (`docs/agents/*.md` and an `## Agent skills` block in `CLAUDE.md` or `AGENTS.md`) changes the target repo, so commit it separately and list it in the PR description. If the user declines or no user is available, skip the setup and still run the review; pass the spec or issue path directly, because the skill cannot fetch issues without the setup.
+
+   Invoke it with the resolved base as the fixed point (use the known intended base, or the discovery in mechanism 2), plus the spec or issue path when one exists; if none exists, say so, so it skips the Spec axis instead of waiting for an answer. It reviews only `<base>...HEAD`, so commit the change before every invocation, including repeat passes after step 4 fixes, then confirm `git status --porcelain` is empty; any file still listed is outside its review, so commit it or record why it is not part of the change. It assigns no severities and applies no fixes, so classify each finding yourself: a missing or wrongly implemented spec requirement, or a documented-standard violation that causes a real defect, can be Critical or Major; code-smell findings are judgement calls and count as Minor unless they hide a real defect.
 4. Native self-review when none of the preceding mechanisms can run.
 
 Keep a working mechanism for later passes when possible. If it cannot start or becomes unavailable, fall through to the next mechanism and record the transition. An unavailable preferred reviewer is not a blocker while another mechanism remains.
@@ -157,7 +173,7 @@ The PR description must include:
 - Any mechanism transition and why it occurred.
 - Any remaining findings and why they were not fixed.
 - Any false positives and rationale.
-- The native-review transparency note when native self-review was used.
+- The transparency note when native self-review, or `code-review-and-quality` without a subagent, was used.
 
 Use a concise PR title that describes the actual risk reduced.
 
@@ -233,7 +249,7 @@ If the review loop reaches five passes with valid Critical/Major findings, or Gr
 
 - Do not stop solely because a preferred review mechanism is unavailable.
 - Do not run a slash action as a shell command.
-- Do not present native self-review as independent review.
+- Do not present native self-review, or `code-review-and-quality` run in the author's context, as independent review.
 - Do not fix low-priority issues unless needed for a Critical/Major fix or Greploop 5/5.
 - Do not perform broad rewrites.
 - Do not change public APIs unless required.
