@@ -124,7 +124,7 @@ For native self-review:
 
 For every mechanism:
 
-- Give every entry in `docs/agents/greptile-lessons.md` to the reviewer as an extra checklist: check the change against each entry's Pattern and Check. A change that matches an entry is a Major finding.
+- Give every entry in `docs/agents/greptile-lessons.md` to the reviewer as an extra checklist: check the change against each entry's Pattern and Check. A change that matches an entry is a Major finding. When the mechanism cannot take extra instructions (such as `codex exec review`), check the entries yourself in the same pass.
 - Classify findings as Critical, Major, Minor, or lower priority.
 - Triage each finding on its merits.
 - Act only on valid Critical and Major findings.
