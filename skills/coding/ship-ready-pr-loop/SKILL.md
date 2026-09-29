@@ -3,7 +3,7 @@ name: ship-ready-pr-loop
 description: Use when hardening a completed change or pull request through iterative review until it is ready to ship.
 metadata:
   author: stephen-martin
-  version: "0.6.0"
+  version: "0.6.1"
 ---
 
 # Ship-Ready PR Loop
@@ -177,7 +177,7 @@ The PR description must include:
 - Any mechanism transition and why it occurred.
 - Any remaining findings and why they were not fixed.
 - Any false positives and rationale.
-- The number of Greptile lessons checked, and any that matched.
+- The number of Greptile lessons checked, any that matched, and the entries added or updated during the run.
 - The transparency note when native self-review, or `code-review-and-quality` without a subagent, was used.
 
 Use a concise PR title that describes the actual risk reduced.
@@ -263,6 +263,8 @@ Before you add an entry, read the whole file and compare the finding against eve
 Create the file with a `# Greptile lessons` heading if it does not exist. Keep at most 40 entries: when over, merge related entries, then drop the oldest entries seen once.
 
 Never write the lessons file in a separate commit after Greploop reports 5/5. That commit makes the 5/5 stale for the new head, and a repository that reviews on push starts another paid review. A 5/5 pass has no findings, so it never needs a lessons write.
+
+When the Greploop loop ends, update the existing PR description with the lesson entries added or updated during the run (or `none`), even if the pass limit was reached. Preserve any Greptile score and reviewed-commit block.
 
 ## Acceptance Criteria
 
