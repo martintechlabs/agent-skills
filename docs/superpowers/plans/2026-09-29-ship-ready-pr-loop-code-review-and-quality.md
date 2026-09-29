@@ -1,0 +1,12 @@
+# Ship-Ready code-review-and-quality Mechanism Implementation Plan
+
+**Goal:** Implement `docs/superpowers/specs/2026-09-29-ship-ready-pr-loop-code-review-and-quality-design.md` in `skills/coding/ship-ready-pr-loop/SKILL.md`.
+
+**Architecture:** Documentation-only change to step 2, the PR description list, and the hard rules. No scripts, references, manifest entries, or README changes.
+
+## Tasks
+
+- [x] Step 2: replace mechanism 1 (OCR delegate) with `code-review-and-quality`, including scope, subagent preference, severity mapping, and non-interactive handling.
+- [x] Extend the transparency note and hard rule to cover `code-review-and-quality` run in the author's context.
+- [x] Bump `metadata.version` to 0.5.0 (mechanism change).
+- [x] Validate: `git diff --check`; no remaining OCR references in the skill.

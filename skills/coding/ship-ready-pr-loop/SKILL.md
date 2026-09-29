@@ -3,7 +3,7 @@ name: ship-ready-pr-loop
 description: Use when hardening a completed change or pull request through iterative review until it is ready to ship.
 metadata:
   author: stephen-martin
-  version: "0.4.0"
+  version: "0.5.0"
 ---
 
 # Ship-Ready PR Loop
@@ -38,7 +38,7 @@ If commands are not obvious, inspect package files, CI config, Makefiles, README
 
 Choose the first mechanism that can actually run in the current harness:
 
-1. `/open-code-review-delegate` when the `open-code-review-delegate` skill is available and the `ocr` CLI is installed (`ocr --version`). Invoke it as a skill or slash action for review only; never run it as a shell command, and never include the phrase `review and fix`, which makes it apply critical/high fixes before this loop triages them. Scope it to the intended PR base: range mode with `--from <base> --to HEAD` for committed work (use the known intended base, or resolve one with the discovery in mechanism 2), plus workspace mode for uncommitted and untracked changes, combined into one pass. Map its severities onto this loop: `critical` → Critical, `high` → Major, `medium`/`low` → Minor or lower. Triage its findings in step 3 and apply fixes in step 4, as with every other mechanism. Its file-coverage summary must show every reviewable file as reviewed or skipped with a reason.
+1. The `code-review-and-quality` skill when it is installed. This is a user-installed skill from `addyosmani/agent-skills` (`npx skills add addyosmani/agent-skills --skill code-review-and-quality`), identified by its five-axis review (correctness, readability, architecture, security, performance). Invoke it as a skill for review only; never run it as a shell command. Point it at the complete change against the intended PR base (use the known intended base, or resolve one with the discovery in mechanism 2), including uncommitted and untracked files, plus the spec or issue path when one exists. Run it in a fresh subagent when the harness has one, so the reviewer does not share the author's context. It asks you to confirm before deleting dead code and to split oversized changes; record those as findings for step 3 instead of pausing the loop. Map its labels onto this loop: `Critical:` → Critical, an unprefixed (required) finding → Major, `Optional:`/`Consider:`/`Nit:`/`FYI` → Minor or lower. Its presumptive blockers (relocated complexity, oversized files, feature logic in shared modules, near-duplicate helpers, silent fallbacks) are Minor unless they hide a real defect. When it runs in the author's own context rather than a subagent, state: `code-review-and-quality ran in the author's context and is not an independent second opinion.`
 2. Direct Codex CLI review when `codex exec review` is available. Set `BASE_REF` through exactly one of these mutually exclusive paths:
 
    - **Known intended PR base:** Assign its exact local or remote ref to `BASE_REF`, then verify that it resolves to a commit:
@@ -157,7 +157,7 @@ The PR description must include:
 - Any mechanism transition and why it occurred.
 - Any remaining findings and why they were not fixed.
 - Any false positives and rationale.
-- The native-review transparency note when native self-review was used.
+- The transparency note when native self-review, or `code-review-and-quality` without a subagent, was used.
 
 Use a concise PR title that describes the actual risk reduced.
 
@@ -233,7 +233,7 @@ If the review loop reaches five passes with valid Critical/Major findings, or Gr
 
 - Do not stop solely because a preferred review mechanism is unavailable.
 - Do not run a slash action as a shell command.
-- Do not present native self-review as independent review.
+- Do not present native self-review, or `code-review-and-quality` run in the author's context, as independent review.
 - Do not fix low-priority issues unless needed for a Critical/Major fix or Greploop 5/5.
 - Do not perform broad rewrites.
 - Do not change public APIs unless required.
