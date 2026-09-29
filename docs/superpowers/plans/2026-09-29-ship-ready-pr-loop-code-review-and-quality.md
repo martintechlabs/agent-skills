@@ -9,6 +9,7 @@
 - [x] Step 2: replace mechanism 1 (OCR delegate) with `code-review-and-quality`, including scope, subagent preference, severity mapping, and non-interactive handling.
 - [x] Step 2: when missing, ask the user, and on a yes install the skill globally; read the installed `SKILL.md` if the harness cannot load it before restart; fall through when declined, unattended, or the install fails.
 - [x] Step 2: apply the same ask-then-install flow to mechanism 3 (Matt Pocock's `code-review`), without overwriting a different `code-review` skill.
+- [x] Step 2: when mechanism 3 runs and `docs/agents/issue-tracker.md` is missing, offer the one-time `setup-matt-pocock-skills` setup (user-run), commit its output separately, and review anyway when declined.
 - [x] Extend the transparency note and hard rule to cover `code-review-and-quality` run in the author's context.
 - [x] Bump `metadata.version` to 0.5.0 (mechanism change).
 - [x] Validate: `git diff --check`; no remaining OCR references in the skill.

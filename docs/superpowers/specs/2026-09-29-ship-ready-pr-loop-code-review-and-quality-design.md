@@ -17,6 +17,8 @@ Replace the open-code-review (OCR) delegate as the first review mechanism with t
 
 Same install flow when it is missing and mechanism 3 is reached: ask first, install globally on a yes, read the installed `SKILL.md` if the harness cannot load it before restart, and fall through to native self-review when declined, unattended, or the install fails. Never overwrite a different skill already installed as `code-review`.
 
+The skill expects the one-time per-repo setup from `setup-matt-pocock-skills` (`docs/agents/issue-tracker.md`). When that file is missing, ask the user whether to run the setup. On a yes, install the setup skill globally if needed, then have the user run `/setup-matt-pocock-skills`: it sets `disable-model-invocation: true` and is interactive. Its output changes the target repo, so it goes in a separate commit and is listed in the PR description. When declined or unattended, run the review without it and pass the spec or issue path directly.
+
 ## Out of scope
 
 - Reordering mechanisms 2–4.
