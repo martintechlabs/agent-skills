@@ -7,7 +7,7 @@
 ## Tasks
 
 - [x] Step 2: replace mechanism 1 (OCR delegate) with `code-review-and-quality`, including scope, subagent preference, severity mapping, and non-interactive handling.
-- [x] Step 2: install the skill globally when missing; read the installed `SKILL.md` if the harness cannot load it before restart; fall through on install failure.
+- [x] Step 2: when missing, ask the user, and on a yes install the skill globally; read the installed `SKILL.md` if the harness cannot load it before restart; fall through when declined, unattended, or the install fails.
 - [x] Extend the transparency note and hard rule to cover `code-review-and-quality` run in the author's context.
 - [x] Bump `metadata.version` to 0.5.0 (mechanism change).
 - [x] Validate: `git diff --check`; no remaining OCR references in the skill.
