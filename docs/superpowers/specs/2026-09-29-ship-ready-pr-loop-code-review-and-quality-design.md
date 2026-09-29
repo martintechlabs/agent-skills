@@ -13,6 +13,10 @@ Replace the open-code-review (OCR) delegate as the first review mechanism with t
 - Severity mapping: `Critical:` → Critical; unprefixed (required) → Major; `Optional:`/`Consider:`/`Nit:`/`FYI` → Minor or lower. Its presumptive blockers are Minor unless they hide a real defect.
 - Its interactive prompts (confirm dead-code deletion, split oversized changes) become findings for triage; they do not pause the loop.
 
+### Matt Pocock's `code-review` (mechanism 3)
+
+Same install flow when it is missing and mechanism 3 is reached: ask first, install globally on a yes, read the installed `SKILL.md` if the harness cannot load it before restart, and fall through to native self-review when declined, unattended, or the install fails. Never overwrite a different skill already installed as `code-review`.
+
 ## Out of scope
 
 - Reordering mechanisms 2–4.
