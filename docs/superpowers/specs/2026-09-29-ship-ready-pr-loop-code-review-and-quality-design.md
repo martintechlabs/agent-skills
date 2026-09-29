@@ -7,6 +7,7 @@ Replace the open-code-review (OCR) delegate as the first review mechanism with t
 ## Behavior
 
 - Mechanism 1 becomes `code-review-and-quality` when it is installed. OCR is removed; no fallback to it remains.
+- Missing skill: install it globally (`npx -y skills add addyosmani/agent-skills --skill code-review-and-quality -g -y`) so the target repo stays clean. If the harness cannot load it before restart, read the installed `SKILL.md` and follow it. If the install fails, fall through to Codex.
 - Scope: the complete change against the intended PR base (same base resolution as mechanism 2), including uncommitted and untracked files, plus the spec or issue path when one exists.
 - Run it in a fresh subagent when the harness has one. The skill runs inside the host agent, so in the author's own context it is not an independent review and must carry a transparency note, like native self-review.
 - Severity mapping: `Critical:` → Critical; unprefixed (required) → Major; `Optional:`/`Consider:`/`Nit:`/`FYI` → Minor or lower. Its presumptive blockers are Minor unless they hide a real defect.
