@@ -3,7 +3,7 @@ name: ship-ready-pr-loop
 description: Use when hardening a completed change or pull request through iterative review until it is ready to ship.
 metadata:
   author: stephen-martin
-  version: "0.5.0"
+  version: "0.6.0"
 ---
 
 # Ship-Ready PR Loop
@@ -15,10 +15,11 @@ Take a completed change from review findings to a ship-ready PR.
 The goal is:
 
 1. Select the strongest available review mechanism.
-2. Fix all valid Critical and Major issues.
-3. Create or update the PR.
-4. Run `/greploop`.
-5. Iterate until Greploop reaches 5/5 or the maximum pass count is reached.
+2. Check the change against the repository's Greptile lessons.
+3. Fix all valid Critical and Major issues.
+4. Create or update the PR.
+5. Run `/greploop`.
+6. Record new Greptile lessons and iterate until Greploop reaches 5/5 or the maximum pass count is reached.
 
 Keep the work narrow. Do not perform broad cleanup, style refactors, architecture rewrites, or low-priority fixes unless they directly resolve a Critical/Major issue or are required for Greploop 5/5.
 
@@ -33,6 +34,8 @@ Before making changes:
 - Identify the project's validation commands: tests, typecheck, lint, and build.
 
 If commands are not obvious, inspect package files, CI config, Makefiles, README files, or project docs.
+
+Read `docs/agents/greptile-lessons.md` in the target repository if it exists. It lists patterns that Greptile caught on earlier PRs after the step-3 review missed them. A missing file is not an error; the first run with a lesson creates it (step 8).
 
 ### 2. Select the review mechanism
 
@@ -121,6 +124,7 @@ For native self-review:
 
 For every mechanism:
 
+- Give every entry in `docs/agents/greptile-lessons.md` to the reviewer as an extra checklist: check the change against each entry's Pattern and Check. A change that matches an entry is a Major finding. When the mechanism cannot take extra instructions (such as `codex exec review`), check the entries yourself in the same pass.
 - Classify findings as Critical, Major, Minor, or lower priority.
 - Triage each finding on its merits.
 - Act only on valid Critical and Major findings.
@@ -173,6 +177,7 @@ The PR description must include:
 - Any mechanism transition and why it occurred.
 - Any remaining findings and why they were not fixed.
 - Any false positives and rationale.
+- The number of Greptile lessons checked, and any that matched.
 - The transparency note when native self-review, or `code-review-and-quality` without a subagent, was used.
 
 Use a concise PR title that describes the actual risk reduced.
@@ -182,6 +187,8 @@ Use a concise PR title that describes the actual risk reduced.
 Invoke `/greploop` as the Greploop skill or slash action. Never run it as a shell command.
 
 Greploop is a hard acceptance gate.
+
+Greptile reviews are expensive. Before the first Greptile review, confirm that every entry in `docs/agents/greptile-lessons.md` was checked against the change and that no match remains unfixed.
 
 Target score: **5/5**
 
@@ -232,6 +239,31 @@ Maximum Greploop passes: **5**
 
 After each Greploop fix pass, rerun relevant validation commands.
 
+#### Record Greptile lessons
+
+In each Greptile fix batch, update `docs/agents/greptile-lessons.md` and commit it with the fixes, before the push that precedes the next review. Record only valid Greptile findings that the step-3 review missed. Do not record false positives or findings that the step-3 review already caught.
+
+Write each lesson as a general pattern, not a file or line diff, so that it also catches similar code:
+
+```md
+## <short pattern name>
+- Pattern: <what goes wrong, in general terms>
+- Check: <how to find it in a diff: a grep, or a question to ask of the change>
+- Seen: <count>, last <YYYY-MM-DD> (PR #<n>)
+```
+
+Record a finding only when it passes every one of these tests. If it fails one, do not record it:
+
+- **It can recur.** It is a class of mistake that another change in this repository could make again. A one-off typo, a wrong constant, or a fix tied to a single line is not a lesson.
+- **It has a concrete Check.** You can write a grep or a specific yes/no question that finds it in a diff. "Be careful with X" is not a Check.
+- **Nothing else already catches it.** A linter, type checker, test, or the repository's existing docs do not already enforce it.
+
+Before you add an entry, read the whole file and compare the finding against every existing entry by what goes wrong, not by wording. If an entry covers the same mistake, update that entry: increase its count, set the date, and widen its Pattern or Check if the new finding is broader. Add a new entry only when no existing entry covers the finding. If two existing entries describe the same mistake, merge them into one and add their counts.
+
+Create the file with a `# Greptile lessons` heading if it does not exist. Keep at most 40 entries: when over, merge related entries, then drop the oldest entries seen once.
+
+Never write the lessons file in a separate commit after Greploop reports 5/5. That commit makes the 5/5 stale for the new head, and a repository that reviews on push starts another paid review. A 5/5 pass has no findings, so it never needs a lessons write.
+
 ## Acceptance Criteria
 
 The work is complete only when:
@@ -259,6 +291,8 @@ If the review loop reaches five passes with valid Critical/Major findings, or Gr
 - Do not skip validation after code changes.
 - Do not create a PR that hides remaining blockers.
 - Do not claim Greploop is 5/5 unless the latest run confirms it.
+- Do not request a Greptile review before checking the change against every Greptile lesson.
+- Do not commit Greptile lessons after Greploop reports 5/5; commit them with the fixes they describe.
 
 ## Final Response Format
 
@@ -280,6 +314,10 @@ Validation:
 
 Fixed:
 - <issue>
+
+Greptile lessons:
+- Checked: <number>, matched: <number>
+- Added or updated: <entry names, or none>
 
 Remaining:
 - None
