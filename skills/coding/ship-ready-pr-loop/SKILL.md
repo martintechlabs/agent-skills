@@ -252,7 +252,15 @@ Write each lesson as a general pattern, not a file or line diff, so that it also
 - Seen: <count>, last <YYYY-MM-DD> (PR #<n>)
 ```
 
-Create the file with a `# Greptile lessons` heading if it does not exist. When a finding matches an existing entry, increase its count and date instead of adding an entry; widen the entry if the new finding is broader. Keep at most 40 entries: when over, merge related entries, then drop the oldest entries seen once.
+Record a finding only when it passes every one of these tests. If it fails one, do not record it:
+
+- **It can recur.** It is a class of mistake that another change in this repository could make again. A one-off typo, a wrong constant, or a fix tied to a single line is not a lesson.
+- **It has a concrete Check.** You can write a grep or a specific yes/no question that finds it in a diff. "Be careful with X" is not a Check.
+- **Nothing else already catches it.** A linter, type checker, test, or the repository's existing docs do not already enforce it.
+
+Before you add an entry, read the whole file and compare the finding against every existing entry by what goes wrong, not by wording. If an entry covers the same mistake, update that entry: increase its count, set the date, and widen its Pattern or Check if the new finding is broader. Add a new entry only when no existing entry covers the finding. If two existing entries describe the same mistake, merge them into one and add their counts.
+
+Create the file with a `# Greptile lessons` heading if it does not exist. Keep at most 40 entries: when over, merge related entries, then drop the oldest entries seen once.
 
 Never write the lessons file in a separate commit after Greploop reports 5/5. That commit makes the 5/5 stale for the new head, and a repository that reviews on push starts another paid review. A 5/5 pass has no findings, so it never needs a lessons write.
 

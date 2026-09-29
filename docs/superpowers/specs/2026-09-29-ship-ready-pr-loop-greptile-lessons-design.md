@@ -32,7 +32,8 @@ Each entry is a generalized pattern, not a file or line diff, and must be checka
 ### Record
 
 - Record only valid Greptile findings that the step-3 review missed. Do not record false positives or findings the step-3 review already caught.
-- Dedupe on write: when a finding matches an existing entry, bump its count and date instead of adding an entry. Generalize the entry when the new finding widens it.
+- Quality bar: record a finding only if it can recur, has a concrete Check (a grep or a yes/no question), and is not already caught by a linter, type checker, test, or repository docs. One-off typos and single-line fixes are not lessons.
+- Dedupe on write: read the whole file and compare the finding with every entry by what goes wrong, not by wording. A match updates that entry (count, date, wider Pattern or Check) instead of adding one. Merge existing entries that describe the same mistake.
 - Keep at most 40 entries. When over, merge related entries, then drop the oldest entries seen once.
 - Write the lessons update in the same commit as the Greptile fixes it describes. Never add a lessons-only commit after Greploop reports 5/5: it makes the 5/5 stale for the new head, and a review-on-push repository starts another paid review. The final 5/5 pass has no findings, so it never needs a lessons write.
 
