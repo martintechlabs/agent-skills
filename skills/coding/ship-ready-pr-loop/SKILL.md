@@ -3,7 +3,7 @@ name: ship-ready-pr-loop
 description: Use when hardening a completed change or pull request through iterative review until it is ready to ship.
 metadata:
   author: stephen-martin
-  version: "0.7.1"
+  version: "0.8.0"
 ---
 
 # Ship-Ready PR Loop
@@ -15,11 +15,9 @@ Take a completed change from review findings to a ship-ready PR.
 The goal is:
 
 1. Select the strongest available review mechanism.
-2. Check the change against the repository's Kodus lessons.
-3. Fix all valid Critical and Major issues.
-4. Create or update the PR.
-5. Run the `kodus-loop` skill.
-6. Record new Kodus lessons until the Kodus loop completes or reaches its pass limit.
+2. Fix all valid Critical and Major issues.
+3. Create or update the PR.
+4. Run the `kodus-loop` skill until it completes or reaches its pass limit.
 
 Keep the work narrow. Do not perform broad cleanup, style refactors, architecture rewrites, or low-priority fixes unless they directly resolve a Critical/Major issue or are required to complete the Kodus loop.
 
@@ -39,8 +37,6 @@ Check that Kodus is installed on the repository with kodus-loop's install check 
 
 - **Kody check run found** on the current branch's PR or the last 20 PRs: Kodus is installed. Continue.
 - **None found:** with no PR yet, there is no `HEAD_SHA`, so run §0 over the last 20 PRs only. Missing check runs do not prove that Kodus is absent: an app installed after the last PR push leaves no check run until the next push. Tell the user that Kodus could not be confirmed, give kodus-loop's numbered fix steps (not its "not installed" message), and ask whether Kodus is installed now. On a yes, continue: step 7 pushes before kodus-loop runs, and kodus-loop's step 0 checks again after that push and stops if Kodus is still missing. On a no, or if no user is available to ask (an unattended run), stop before any review work.
-
-Read `docs/agents/kodus-lessons.md` in the target repository if it exists. It lists patterns that Kody (the Kodus review bot) caught on earlier PRs after the step-3 review missed them. A missing file is not an error; the first run with a lesson creates it (step 8).
 
 ### 2. Select the review mechanism
 
@@ -129,7 +125,6 @@ For native self-review:
 
 For every mechanism:
 
-- Give every entry in `docs/agents/kodus-lessons.md` to the reviewer as an extra checklist: check the change against each entry's Pattern and Check. A change that matches an entry is a Major finding. When the mechanism cannot take extra instructions (such as `codex exec review`), check the entries yourself in the same pass.
 - Classify findings as Critical, Major, Minor, or lower priority.
 - Triage each finding on its merits.
 - Act only on valid Critical and Major findings.
@@ -182,7 +177,6 @@ The PR description must include:
 - Any mechanism transition and why it occurred.
 - Any remaining findings and why they were not fixed.
 - Any false positives and rationale.
-- The number of Kodus lessons checked, any that matched, and the entries added or updated during the run.
 - The transparency note when native self-review, or `code-review-and-quality` without a subagent, was used.
 
 Use a concise PR title that describes the actual risk reduced.
@@ -193,8 +187,6 @@ Invoke the `kodus-loop` skill. Never run it as a shell command.
 
 The Kodus loop is a hard acceptance gate. It passes when Kody's review of the PR head commit is complete and no Kody review thread is unresolved. Kody gives no score.
 
-Before the first Kodus review, confirm that every entry in `docs/agents/kodus-lessons.md` was checked against the change and that no match remains unfixed.
-
 Push every local commit before you invoke it: `git rev-parse HEAD` must equal the PR's `headRefOid`. Automatic Kodus reviews are normally off, so kodus-loop triggers each review itself and reuses a completed review of the head commit when one exists. Do not post `@kody start-review` yourself.
 
 Fix every valid Kody finding. Do not resolve threads to pass the gate: fix the underlying issue, or reply with the reason a finding is wrong.
@@ -204,33 +196,6 @@ Fix every valid Kody finding. Do not resolve threads to pass the gate: fix the u
 kodus-loop runs its own review, fix, and push passes, at most 5. One review per fix batch. Do not restart it after it stops at its pass limit; report the remaining blockers instead. If it stops because Kodus did not respond, skipped the review, or failed twice, the gate cannot pass: stop and report that as a blocker. Do not fall back to another reviewer for this gate.
 
 After each Kodus fix batch, rerun relevant validation commands before the push.
-
-#### Record Kodus lessons
-
-In each Kodus fix batch (kodus-loop step E), update `docs/agents/kodus-lessons.md` and commit it with the fixes, before the push that precedes the next review. Record only valid Kody findings that the step-3 review missed. Do not record false positives or findings that the step-3 review already caught.
-
-Write each lesson as a general pattern, not a file or line diff, so that it also catches similar code:
-
-```md
-## <short pattern name>
-- Pattern: <what goes wrong, in general terms>
-- Check: <how to find it in a diff: a grep, or a question to ask of the change>
-- Seen: <count>, last <YYYY-MM-DD> (PR #<n>)
-```
-
-Record a finding only when it passes every one of these tests. If it fails one, do not record it:
-
-- **It can recur.** It is a class of mistake that another change in this repository could make again. A one-off typo, a wrong constant, or a fix tied to a single line is not a lesson.
-- **It has a concrete Check.** You can write a grep or a specific yes/no question that finds it in a diff. "Be careful with X" is not a Check.
-- **Nothing else already catches it.** A linter, type checker, test, or the repository's existing docs do not already enforce it.
-
-Before you add an entry, read the whole file and compare the finding against every existing entry by what goes wrong, not by wording. If an entry covers the same mistake, update that entry: increase its count, set the date, and widen its Pattern or Check if the new finding is broader. Add a new entry only when no existing entry covers the finding. If two existing entries describe the same mistake, merge them into one and add their counts.
-
-Create the file with a `# Kodus lessons` heading if it does not exist. Keep at most 40 entries: when over, merge related entries, then drop the oldest entries seen once.
-
-Never write the lessons file in a separate commit after the Kodus loop completes. That commit moves the head, so the completed review no longer covers it. A completing pass has no findings, so it never needs a lessons write.
-
-When the Kodus loop ends, update the existing PR description with the lesson entries added or updated during the run (or `none`), even if the pass limit was reached. If Kody wrote a summary into the description (PR summaries enabled), keep it.
 
 ## Acceptance Criteria
 
@@ -259,8 +224,6 @@ If the review loop reaches five passes with valid Critical/Major findings, or th
 - Do not skip validation after code changes.
 - Do not create a PR that hides remaining blockers.
 - Do not claim the Kodus loop completed unless its latest run confirms it.
-- Do not request a Kodus review before checking the change against every Kodus lesson.
-- Do not commit Kodus lessons after the Kodus loop completes; commit them with the fixes they describe.
 
 ## Final Response Format
 
@@ -282,10 +245,6 @@ Validation:
 
 Fixed:
 - <issue>
-
-Kodus lessons:
-- Checked: <number>, matched: <number>
-- Added or updated: <entry names, or none>
 
 Remaining:
 - None
