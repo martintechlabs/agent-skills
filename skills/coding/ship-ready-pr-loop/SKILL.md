@@ -38,8 +38,7 @@ If commands are not obvious, inspect package files, CI config, Makefiles, README
 Check that Kodus is installed on the repository with kodus-loop's install check (its step 0, reference §0). The check reads Kody check runs, and Kodus creates them only on pushes to a PR.
 
 - **Kody check run found** on the current branch's PR or the last 20 PRs: Kodus is installed. Continue.
-- **A PR exists and none is found:** stop before any review work, because the step-7 gate can never pass. Give the user kodus-loop's "Kodus is not installed" explanation and fix steps.
-- **No PR exists yet and none is found:** with no PR, there is no `HEAD_SHA`, so run §0 over the last 20 PRs only. A Kodus app installed since those PRs cannot show up until a PR is pushed. Give the same explanation and fix steps, then ask the user whether Kodus is installed now. On a yes, continue: kodus-loop's step 0 checks again after step 6 opens the PR, and stops there if Kodus is still missing. If no user is available to ask (an unattended run), stop.
+- **None found:** with no PR yet, there is no `HEAD_SHA`, so run §0 over the last 20 PRs only. Missing check runs do not prove that Kodus is absent: an app installed after the last PR push leaves no check run until the next push. Tell the user that Kodus could not be confirmed, give kodus-loop's numbered fix steps (not its "not installed" message), and ask whether Kodus is installed now. On a yes, continue: step 7 pushes before kodus-loop runs, and kodus-loop's step 0 checks again after that push and stops if Kodus is still missing. On a no, or if no user is available to ask (an unattended run), stop before any review work.
 
 Read `docs/agents/kodus-lessons.md` in the target repository if it exists. It lists patterns that Kody (the Kodus review bot) caught on earlier PRs after the step-3 review missed them. A missing file is not an error; the first run with a lesson creates it (step 8).
 

@@ -69,15 +69,18 @@ query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){
     | (.comments.nodes | length > 1 and last.author.login==$bot) as $rebuttal
     | select((.isResolved|not) or $rebuttal)
     | {id, isResolved, isOutdated, rebuttal: $rebuttal, path, line: (.line // .originalLine),
-       commentId: .comments.nodes[0].databaseId, lastReply: (if $rebuttal then .comments.nodes[-1].body[0:2000] else null end),
+       commentId: .comments.nodes[0].databaseId,
+       lastReplyId: (if $rebuttal then .comments.nodes[-1].databaseId else null end),
+       lastReply: (if $rebuttal then .comments.nodes[-1].body[0:2000] else null end),
        severity: (.comments.nodes[0].body | capture("severity_level-(?<s>[a-z]+)").s // "unknown")}'
 ```
 
 `rebuttal: true` means Kody replied last in a thread it started, after someone else
 replied. Kody does not reopen a resolved thread when it replies, so `isResolved`
-alone misses it. Once you answer the rebuttal, your reply is last and the thread
-drops out. Threads with more than 50 comments are cut off; that does not happen
-in practice.
+alone misses it. The reply is not always a rebuttal: on a re-review Kody often
+confirms the fix, and the thread keeps `rebuttal: true` because Kody stays last.
+Decide from `lastReply` and track `lastReplyId` as handled. Threads with more than
+50 comments are cut off; that does not happen in practice.
 
 The REST endpoint `pulls/<PR>/comments` has no resolution state. Use GraphQL
 `isResolved` to decide what is unresolved.

@@ -109,14 +109,17 @@ Post at most one trigger per pass. Never post a trigger while a Kody check run o
    its comments in place, so do not judge "new" by timestamp. Keep a list of the
    comment ids you already handled this run; only an id not on that list is a new
    finding. A suggestion with no inline thread is still a finding.
-4. Look for Kody rebuttals: the same §2 query also returns resolved Kody threads
+4. Look for Kody replies: the same §2 query also returns resolved Kody threads
    whose last comment is a Kody reply (`rebuttal: true`). Kody answers inside the
-   thread and does not reopen it. Reconsider each rebuttal in D.
+   thread and does not reopen it. Read `lastReply`. Kody often confirms a fix
+   ("I verified the fix…"); add that `lastReplyId` to the handled list. When Kody
+   disagrees, reconsider the thread in D, then add its `lastReplyId` to the list.
+   Only a `lastReplyId` not on the list is new.
 
 ### C. Exit check
 
 Stop when the step-A review is current **and** B found zero unresolved Kody threads
-and no unhandled PR-level suggestions or Kody rebuttals. Also stop at the pass
+and no unhandled PR-level suggestions or Kody replies. Also stop at the pass
 limit.
 
 ### D. Triage and fix
