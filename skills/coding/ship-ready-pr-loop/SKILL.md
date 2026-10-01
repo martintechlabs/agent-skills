@@ -3,7 +3,7 @@ name: ship-ready-pr-loop
 description: Use when hardening a completed change or pull request through iterative review until it is ready to ship.
 metadata:
   author: stephen-martin
-  version: "0.7.0"
+  version: "0.7.1"
 ---
 
 # Ship-Ready PR Loop
@@ -35,7 +35,11 @@ Before making changes:
 
 If commands are not obvious, inspect package files, CI config, Makefiles, README files, or project docs.
 
-Check that Kodus is installed on the repository with kodus-loop's install check (its step 0, reference §0). If it finds no Kody check run on the current branch's PR or the last 20 PRs, stop before any review work: the step-7 gate can never pass. Give the user kodus-loop's "Kodus is not installed" explanation and fix steps. If no PR exists yet and recent PRs show no Kody check run, give the same stop.
+Check that Kodus is installed on the repository with kodus-loop's install check (its step 0, reference §0). The check reads Kody check runs, and Kodus creates them only on pushes to a PR.
+
+- **Kody check run found** on the current branch's PR or the last 20 PRs: Kodus is installed. Continue.
+- **A PR exists and none is found:** stop before any review work, because the step-7 gate can never pass. Give the user kodus-loop's "Kodus is not installed" explanation and fix steps.
+- **No PR exists yet and none is found:** with no PR, there is no `HEAD_SHA`, so run §0 over the last 20 PRs only. A Kodus app installed since those PRs cannot show up until a PR is pushed. Give the same explanation and fix steps, then ask the user whether Kodus is installed now. On a yes, continue: kodus-loop's step 0 checks again after step 6 opens the PR, and stops there if Kodus is still missing. If no user is available to ask (an unattended run), stop.
 
 Read `docs/agents/kodus-lessons.md` in the target repository if it exists. It lists patterns that Kody (the Kodus review bot) caught on earlier PRs after the step-3 review missed them. A missing file is not an error; the first run with a lesson creates it (step 8).
 

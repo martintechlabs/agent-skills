@@ -170,9 +170,9 @@ Otherwise post the trigger and keep its id:
 TRIGGER_ID=$(gh api "repos/$REPO/issues/$PR/comments" -f body="@kody start-review" --jq .id)
 ```
 
-Kody reacts on that comment. Observed: 🎉 `hooray` when the review finishes. The docs
-also list 🚀 `rocket` (running), 👀 `eyes` (skipped), 😕 `confused` (error), and
-👎 `-1` (no license), but 🚀 was not seen on real triggers. Use reactions as a
+Kody reacts on that comment. Observed: 🚀 `rocket` within 30 s while the review
+runs, replaced by 🎉 `hooray` when it finishes. The docs also list 👀 `eyes`
+(skipped), 😕 `confused` (error), and 👎 `-1` (no license). Use reactions as a
 secondary signal; the check run is the primary one.
 
 ```bash
