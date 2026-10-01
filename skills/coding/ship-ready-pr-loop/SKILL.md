@@ -35,6 +35,8 @@ Before making changes:
 
 If commands are not obvious, inspect package files, CI config, Makefiles, README files, or project docs.
 
+Check that Kodus is installed on the repository with kodus-loop's install check (its step 0, reference §0). If it finds no Kody check run on the current branch's PR or the last 20 PRs, stop before any review work: the step-7 gate can never pass. Give the user kodus-loop's "Kodus is not installed" explanation and fix steps. If no PR exists yet and recent PRs show no Kody check run, give the same stop.
+
 Read `docs/agents/kodus-lessons.md` in the target repository if it exists. It lists patterns that Kody (the Kodus review bot) caught on earlier PRs after the step-3 review missed them. A missing file is not an error; the first run with a lesson creates it (step 8).
 
 ### 2. Select the review mechanism

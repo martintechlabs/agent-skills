@@ -36,6 +36,14 @@ From live, read-only `gh` queries against public Kodus-reviewed PRs:
 
 ## Decisions
 
+- **Install check first.** GitHub does not let a user token list app
+  installations. Instead, the skill looks for a `Kody Code Review` check run on the
+  PR head and the last 20 PR heads. Kodus adds one on every PR push even with
+  automatic reviews off (seen on martintechlabs/agent-skills#46: `skipped`,
+  "Automated Review is disabled"). None found → stop with an explanation and fix
+  steps, and post no trigger. A "Automated Review is disabled" skip means "trigger a
+  review", not "stop".
+
 - **GitHub only.** This is the only platform the skill supports. Every query is
   verified against real output.
 - **Web review only.** Reviews come from Kody on the GitHub PR. The skill does not

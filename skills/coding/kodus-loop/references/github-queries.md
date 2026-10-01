@@ -18,6 +18,23 @@ HEAD_SHA=$(gh pr view "$PR" --json headRefOid -q .headRefOid)
 KODY_SLUG=kody-ai   # replace with app.slug from §1 once a Kody check run exists
 ```
 
+## §0 Is Kodus installed?
+
+Prints the bot's app slug, or nothing when no Kody check run exists on this PR's
+head or the last 20 PR heads:
+
+```bash
+KODY_SLUG=$( { echo "$HEAD_SHA"; gh pr list -R "$REPO" --state all --limit 20 --json headRefOid -q '.[].headRefOid'; } \
+  | while read -r sha; do
+      gh api "repos/$REPO/commits/$sha/check-runs?check_name=Kody%20Code%20Review" \
+        --jq '.check_runs[0].app.slug // empty' 2>/dev/null
+    done | head -n 1 )
+```
+
+GitHub does not let a normal `gh` login list a repository's app installations
+(`repos/<repo>/installation` needs an app JWT; `orgs/<org>/installations` needs the
+`admin:org` scope). The check-run history is the evidence this skill uses.
+
 ## §1 Newest Kody check run on the head commit
 
 ```bash
@@ -31,6 +48,7 @@ Empty output means no Kody check run exists on this commit yet. Seen outcomes:
 | ------ | ---------- | ------------ | ------------------------ |
 | `completed` | `success` | Code Review Complete | Review finished successfully. Suggestions (if any) were posted as PR/file comments. |
 | `completed` | `skipped` | Code Review Skipped | No New Commits (No changes detected since last review) |
+| `completed` | `skipped` | Code Review Skipped | Automated Review is disabled — Enable 'Automated Code Review' in General Settings |
 | `completed` | `failure` | Code Review Failed | - Rate limit reached on the provider (...). Try again in a few minutes. (Kody also posts a "Code Review Could Not Complete" PR comment.) |
 
 `max_by(.id)` picks the newest run when a commit has more than one. Keep its `id`:

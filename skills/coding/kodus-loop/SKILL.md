@@ -25,8 +25,41 @@ first pass.
 
 - `gh auth status` is green and the remote is GitHub.
 - The working tree is clean, or every change in it belongs to this PR.
-- Kodus is installed on the repository. Automatic reviews are normally off, so this
-  skill triggers every review itself.
+- Automatic reviews are normally off, so this skill triggers every review itself.
+
+## 0. Check that Kodus is installed
+
+Run this before anything else, including before you post a trigger.
+
+When the Kodus GitHub App can see a repository, it adds a `Kody Code Review` check
+run on every push to a PR, even with automatic reviews off (the run is `skipped`
+with "Automated Review is disabled"). Look for that check run on this PR's head and
+on the heads of the last 20 PRs (reference §0). If you just pushed, recheck every
+10 s for up to 2 minutes before you decide.
+
+- **Found:** Kodus is installed. Use the check run's `app.slug` as the bot login.
+- **Not found:** stop. Do not post `@kody start-review`. Tell the user:
+
+```
+Kodus is not installed on <owner/repo>, so the Kodus review loop cannot run.
+
+Why: there is no "Kody Code Review" check run on this PR or on the last 20 PRs.
+Kodus adds that check on every PR push when its GitHub App can see the repository,
+even when automatic reviews are off.
+
+How to fix:
+1. Kodus cloud: sign in at https://app.kodus.io, connect GitHub, and install the
+   Kodus GitHub App when prompted. Then select <owner/repo> as a repository to review.
+2. App already installed? Give it access to this repository:
+   - Organization: https://github.com/organizations/<owner>/settings/installations
+   - Personal account: https://github.com/settings/installations
+   Open the Kodus app → Configure → Repository access, and add <owner/repo>.
+3. Self-hosted Kodus: install your own Kodus GitHub App on <owner/repo>.
+4. Connected Kodus with a personal access token instead of the app? This loop needs
+   the GitHub App: only an app can create the check runs it reads.
+
+Then push a commit to the PR and run the loop again.
+```
 
 ## Loop
 
@@ -44,6 +77,7 @@ failure is part of the same pass.
 | ----- | ------ |
 | `queued` / `in_progress` | A review is running. Do not trigger. Poll (step 4). |
 | `completed` + `success` | Review is current. Go to B. |
+| `completed` + `skipped`, summary says "Automated Review is disabled" | Kodus is installed but did not review this head. Treat it as "no check run" below. |
 | `completed` + `skipped`, summary says no new commits or only merge commits | An earlier review covers this head (for example, after you merged `main` in). Go to B. |
 | `completed` + `skipped`, any other reason | Stop. Report the reason (file limit, draft, branch not in scope, all files ignored). Looping cannot fix it. |
 | `completed` + `failure` | Read Kody's newest PR comment for the reason (reference §4). Stop on a license or configuration error. Otherwise wait 3–5 minutes (a rate limit says "try again in a few minutes"), then post `@kody start-review` once. Only a check run with a higher `id` than the failed one is the retry; the old failed run does not count. A second consecutive failure stops the loop. |
