@@ -54,7 +54,7 @@ Empty output means no Kody check run exists on this commit yet. Seen outcomes:
 `max_by(.id)` picks the newest run when a commit has more than one. Keep its `id`:
 after a re-trigger, only a run with a higher `id` is the new review.
 
-## §2 Unresolved Kody review threads
+## §2 Unresolved Kody threads and rebuttals
 
 ```bash
 gh api graphql --paginate -F owner="$OWNER" -F repo="$NAME" -F pr="$PR" -f query='
@@ -63,13 +63,21 @@ query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){
     reviewThreads(first:100,after:$endCursor){
       pageInfo{hasNextPage endCursor}
       nodes{id isResolved isOutdated path line originalLine
-        comments(first:1){nodes{databaseId author{login} body}}}}}}}' \
+        comments(first:50){nodes{databaseId author{login} body}}}}}}}' \
   | jq --arg bot "$KODY_SLUG" '.data.repository.pullRequest.reviewThreads.nodes[]
-    | select(.isResolved|not)
     | select(.comments.nodes[0].author.login==$bot)
-    | {id, isOutdated, path, line: (.line // .originalLine), commentId: .comments.nodes[0].databaseId,
+    | (.comments.nodes | length > 1 and last.author.login==$bot) as $rebuttal
+    | select((.isResolved|not) or $rebuttal)
+    | {id, isResolved, isOutdated, rebuttal: $rebuttal, path, line: (.line // .originalLine),
+       commentId: .comments.nodes[0].databaseId, lastReply: (if $rebuttal then .comments.nodes[-1].body[0:2000] else null end),
        severity: (.comments.nodes[0].body | capture("severity_level-(?<s>[a-z]+)").s // "unknown")}'
 ```
+
+`rebuttal: true` means Kody replied last in a thread it started, after someone else
+replied. Kody does not reopen a resolved thread when it replies, so `isResolved`
+alone misses it. Once you answer the rebuttal, your reply is last and the thread
+drops out. Threads with more than 50 comments are cut off; that does not happen
+in practice.
 
 The REST endpoint `pulls/<PR>/comments` has no resolution state. Use GraphQL
 `isResolved` to decide what is unresolved.
@@ -137,16 +145,23 @@ gh api graphql -f query='mutation{
 
 ## §6 Trigger a review
 
-Before you post, look for a trigger you already posted for this head (for example,
-after an interrupted run). Reuse it if it is newer than the head commit and Kody has
-not finished it:
+Before you post, look for a pending trigger (for example, after an interrupted run).
+Reuse your newest `@kody start-review` only when Kody has not reacted to it yet and
+it is under 5 minutes old. The commit date is not the push time, so it cannot prove
+a trigger belongs to this head. A trigger Kody already answered, or one it ignored
+for 5 minutes, is not reused; post a new one.
 
 ```bash
-HEAD_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq .commit.committer.date)
 ME=$(gh api user --jq .login)
-gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
-  | jq -rs --arg me "$ME" --arg since "$HEAD_DATE" \
-    'add[] | select(.user.login==$me and (.body|startswith("@kody start-review")) and .created_at > $since) | .id'
+SINCE=$(date -u -v-5M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+CAND=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
+  | jq -rs --arg me "$ME" --arg since "$SINCE" \
+    '[add[] | select(.user.login==$me and (.body|startswith("@kody start-review")) and .created_at > $since)]
+     | max_by(.created_at) // empty | .id')
+if [ -n "$CAND" ] && [ "$(gh api "repos/$REPO/issues/comments/$CAND/reactions" \
+     --jq "map(select(.user.login==\"${KODY_SLUG}[bot]\")) | length")" = 0 ]; then
+  TRIGGER_ID=$CAND
+fi
 ```
 
 Otherwise post the trigger and keep its id:

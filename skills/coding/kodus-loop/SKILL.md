@@ -3,7 +3,7 @@ name: kodus-loop
 description: Iteratively drive a GitHub pull request through Kodus code review until Kody (the Kodus review bot) has completed a review of the current head commit and no Kody review thread is left unresolved. Waits for or triggers the Kody review, fixes valid findings, replies to and resolves false positives, pushes, and repeats for up to 5 passes. Use when the user says "run the Kodus loop", "get Kody to sign off on this PR", "fix all the Kody comments", "kodus loop", or wants a PR fully cleaned up against Kodus review. Works only through Kody's review on the GitHub PR. Use greploop instead when the repository reviews with Greptile.
 metadata:
   author: stephen-martin
-  version: "0.1.0"
+  version: "0.1.1"
 ---
 
 # Kodus Loop
@@ -81,11 +81,16 @@ failure is part of the same pass.
 | `completed` + `skipped`, summary says no new commits or only merge commits | An earlier review covers this head (for example, after you merged `main` in). Go to B. |
 | `completed` + `skipped`, any other reason | Stop. Report the reason (file limit, draft, branch not in scope, all files ignored). Looping cannot fix it. |
 | `completed` + `failure` | Read Kody's newest PR comment for the reason (reference §4). Stop on a license or configuration error. Otherwise wait 3–5 minutes (a rate limit says "try again in a few minutes"), then post `@kody start-review` once. Only a check run with a higher `id` than the failed one is the retry; the old failed run does not count. A second consecutive failure stops the loop. |
-| no check run | No review of this head exists. Reuse a trigger you already posted for this head, or post `@kody start-review` (reference §6). Keep the comment id. |
+| no check run | No review of this head exists. Reuse a pending trigger (reference §6: yours, under 5 minutes old, no Kody reaction yet), or post `@kody start-review`. Keep the comment id. |
 
 4. Poll every 30 s for up to 30 minutes (a full review can take over 10 minutes)
-   until a Kody check run on `HEAD_SHA` newer than the saved `id` is `completed`.
-   Kody's reaction on the trigger comment is a secondary signal (reference §6). If
+   until the review you wait for is `completed`:
+   - **Review already running** (`queued` / `in_progress` row): wait for the saved
+     run itself. Do not wait for a newer `id`; none will come.
+   - **After a trigger:** wait for a Kody check run on `HEAD_SHA` with an `id`
+     higher than the saved one (any `id` if there was no run).
+
+   Then apply the table in step 3 to that run. Kody's reaction on the trigger comment is a secondary signal (reference §6). If
    no new check run and no Kody reaction appear within 5 minutes of the trigger,
    stop and report that Kodus did not respond (it may not be installed on this
    repository). On timeout, stop and report. Never read findings from an older
@@ -104,9 +109,9 @@ Post at most one trigger per pass. Never post a trigger while a Kody check run o
    its comments in place, so do not judge "new" by timestamp. Keep a list of the
    comment ids you already handled this run; only an id not on that list is a new
    finding. A suggestion with no inline thread is still a finding.
-4. Re-read the Kody threads you resolved in earlier passes. If Kody replied after
-   your reply (it answers inside threads), the thread is open business: reconsider
-   it in D.
+4. Look for Kody rebuttals: the same §2 query also returns resolved Kody threads
+   whose last comment is a Kody reply (`rebuttal: true`). Kody answers inside the
+   thread and does not reopen it. Reconsider each rebuttal in D.
 
 ### C. Exit check
 
@@ -134,8 +139,8 @@ broken code to get another review.
 
 1. If you changed no code this pass (every finding was declined or already
    addressed), skip to step 4. Do not make an empty commit.
-2. Stage only the files you changed: `git add <paths>`. Do not use `git add -A`,
-   then `git commit -m "fix: address Kodus review feedback (kodus-loop pass N)"`.
+2. Stage only the files you changed: `git add <paths>`. Do not use `git add -A`.
+   Then commit: `git commit -m "fix: address Kodus review feedback (kodus-loop pass N)"`.
 3. `git push`
 4. Resolve each Kody thread you fixed or answered (reference §5). Resolve a thread
    only after its fix is pushed or its reply is posted.
