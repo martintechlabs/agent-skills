@@ -45,9 +45,11 @@ From live, read-only `gh` queries against public Kodus-reviewed PRs:
 - **Hard stops:** `skipped` for any other reason (file limit, draft, branch,
   ignored files), `👎` unlicensed, two consecutive `failure`s, 5 passes, or a
   10-minute wait with no completed check.
-- **Trigger discipline:** after a push, wait up to 2 minutes for an automatic check
-  run to appear before posting `@kody start-review`. Never post a trigger while a
-  Kody check run on `HEAD_SHA` is queued or in progress. One review per fix batch.
+- **Trigger discipline:** automatic reviews are off by default, so the skill posts
+  `@kody start-review` whenever no Kody check run exists on `HEAD_SHA`. Never post a
+  trigger while a Kody check run on `HEAD_SHA` is queued or in progress. One review
+  per fix batch. Progress is read from the check run and from Kody's reaction on the
+  trigger comment; no response within 2 minutes stops the loop.
 - **Thread handling:** resolve only `kody-ai` threads. A false positive gets a reply
   with the reason before it is resolved. Never resolve human threads.
 - **Commits:** stage only the files the fixes touched (no `git add -A`).

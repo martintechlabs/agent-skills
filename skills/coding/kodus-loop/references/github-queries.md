@@ -114,8 +114,18 @@ gh api graphql -f query='mutation{
 
 ## §6 Trigger a review
 
+Post the trigger and keep its id:
+
 ```bash
-gh pr comment "$PR" --body "@kody start-review"
+TRIGGER_ID=$(gh api "repos/$REPO/issues/$PR/comments" -f body="@kody start-review" --jq .id)
+```
+
+Kody shows progress as a reaction on that comment (🚀 `rocket` running, 🎉 `hooray`
+done, 👀 `eyes` skipped, 😕 `confused` error, 👎 `-1` no license):
+
+```bash
+gh api "repos/$REPO/issues/comments/$TRIGGER_ID/reactions" \
+  --jq '.[] | select(.user.login=="kody-ai[bot]") | .content'
 ```
 
 Optional focus: `@kody start-review focus on <area>`. A focus is a priority, not a

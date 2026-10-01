@@ -25,9 +25,8 @@ first pass.
 
 - `gh auth status` is green and the remote is GitHub.
 - The working tree is clean, or every change in it belongs to this PR.
-- Kodus is installed on the repository. If no `Kody Code Review` check run and no
-  `kody-ai[bot]` comment exists on this PR or its recent commits, ask the user to
-  confirm before you post `@kody start-review`.
+- Kodus is installed on the repository. Automatic reviews are normally off, so this
+  skill triggers every review itself.
 
 ## Loop
 
@@ -47,11 +46,14 @@ failure is part of the same pass.
 | `completed` + `skipped`, summary says no new commits or only merge commits | An earlier review covers this head (for example, after you merged `main` in). Go to B. |
 | `completed` + `skipped`, any other reason | Stop. Report the reason (file limit, draft, branch not in scope, all files ignored). Looping cannot fix it. |
 | `completed` + `failure` | Read Kody's newest PR comment for the reason (reference §4). Stop on a license or configuration error. Otherwise wait 3–5 minutes (a rate limit says "try again in a few minutes"), then post `@kody start-review` once. A second consecutive failure stops the loop. |
-| no check run, just after a push | The automatic review may still be registering. Recheck every 10 s for up to 2 minutes. |
-| no check run after that wait | Cadence is `manual` or `auto_pause`. Re-read §1 once more, then post `@kody start-review` only if there is still no check run. |
+| no check run | No review of this head exists. Post `@kody start-review` (reference §6) and keep the comment id. |
 
-4. Poll every 10 s for up to 10 minutes until the check run is `completed`. On
-   timeout, stop and report. Never read findings from an older commit's review.
+4. Poll every 10 s for up to 10 minutes until the check run on `HEAD_SHA` is
+   `completed`. Also read Kody's reaction on your trigger comment (reference §6):
+   🎉 done, 👀 skipped, 😕 error, 👎 no license. If neither a check run nor a
+   reaction appears within 2 minutes of the trigger, stop and report that Kodus did
+   not respond (it may not be installed on this repository). On timeout, stop and
+   report. Never read findings from an older commit's review.
 
 Post at most one trigger per pass. Never post a trigger while a Kody check run on
 `HEAD_SHA` is queued or in progress.
@@ -101,8 +103,8 @@ broken code to get another review.
 3. `git push`
 4. Resolve each Kody thread you fixed or answered (reference §5). Resolve a thread
    only after its fix is pushed or its reply is posted.
-5. Go back to A. The push normally starts the next review. Step A waits for it
-   instead of posting a second trigger.
+5. Go back to A. A push does not start a review, so step A posts the next
+   trigger.
 
 One review per fix batch: commit all fixes for the pass, then push once.
 
