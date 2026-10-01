@@ -36,7 +36,8 @@ failure is part of the same pass.
 ### A. Get a review of `HEAD_SHA`
 
 1. Push any committed work: `git push`.
-2. Read the newest Kody check run on `HEAD_SHA` (reference §1).
+2. Read the newest Kody check run on `HEAD_SHA` (reference §1). Save its `id` and
+   take the bot login from its `app.slug`; self-hosted installs use their own app.
 3. Act on its state:
 
 | State | Action |
@@ -45,15 +46,16 @@ failure is part of the same pass.
 | `completed` + `success` | Review is current. Go to B. |
 | `completed` + `skipped`, summary says no new commits or only merge commits | An earlier review covers this head (for example, after you merged `main` in). Go to B. |
 | `completed` + `skipped`, any other reason | Stop. Report the reason (file limit, draft, branch not in scope, all files ignored). Looping cannot fix it. |
-| `completed` + `failure` | Read Kody's newest PR comment for the reason (reference §4). Stop on a license or configuration error. Otherwise wait 3–5 minutes (a rate limit says "try again in a few minutes"), then post `@kody start-review` once. A second consecutive failure stops the loop. |
-| no check run | No review of this head exists. Post `@kody start-review` (reference §6) and keep the comment id. |
+| `completed` + `failure` | Read Kody's newest PR comment for the reason (reference §4). Stop on a license or configuration error. Otherwise wait 3–5 minutes (a rate limit says "try again in a few minutes"), then post `@kody start-review` once. Only a check run with a higher `id` than the failed one is the retry; the old failed run does not count. A second consecutive failure stops the loop. |
+| no check run | No review of this head exists. Reuse a trigger you already posted for this head, or post `@kody start-review` (reference §6). Keep the comment id. |
 
-4. Poll every 10 s for up to 10 minutes until the check run on `HEAD_SHA` is
-   `completed`. Also read Kody's reaction on your trigger comment (reference §6):
-   🎉 done, 👀 skipped, 😕 error, 👎 no license. If neither a check run nor a
-   reaction appears within 2 minutes of the trigger, stop and report that Kodus did
-   not respond (it may not be installed on this repository). On timeout, stop and
-   report. Never read findings from an older commit's review.
+4. Poll every 30 s for up to 30 minutes (a full review can take over 10 minutes)
+   until a Kody check run on `HEAD_SHA` newer than the saved `id` is `completed`.
+   Kody's reaction on the trigger comment is a secondary signal (reference §6). If
+   no new check run and no Kody reaction appear within 5 minutes of the trigger,
+   stop and report that Kodus did not respond (it may not be installed on this
+   repository). On timeout, stop and report. Never read findings from an older
+   commit's review.
 
 Post at most one trigger per pass. Never post a trigger while a Kody check run on
 `HEAD_SHA` is queued or in progress.

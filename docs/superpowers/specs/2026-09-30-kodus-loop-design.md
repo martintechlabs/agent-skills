@@ -21,7 +21,11 @@ From https://docs.kodus.io/en/how_to_use/code_review/flow and related pages:
 
 From live, read-only `gh` queries against public Kodus-reviewed PRs:
 
-- REST author login `kody-ai[bot]`; GraphQL author login `kody-ai`.
+- REST author login `kody-ai[bot]`; GraphQL author login `kody-ai` (Kodus cloud).
+  Self-hosted installs use their own app (seen: `kodus-27b[bot]`), so the skill reads
+  the login from the `Kody Code Review` check run's `app.slug`.
+- A full review can take about 11 minutes from trigger to completion. The only
+  reaction seen on real triggers is 🎉 at completion.
 - Check run name `Kody Code Review`. Outcomes seen: `success` ("Code Review
   Complete"), `skipped` ("Code Review Skipped", summary gives the reason, e.g.
   "No New Commits"), `failure` (review could not complete; Kody also posts a PR

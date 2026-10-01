@@ -196,7 +196,7 @@ Fix every valid Kody finding. Do not resolve threads to pass the gate: fix the u
 
 ### 8. Let the Kodus loop iterate
 
-kodus-loop runs its own review, fix, and push passes, at most 5. One review per fix batch. Do not restart it after it stops at its pass limit; report the remaining blockers instead.
+kodus-loop runs its own review, fix, and push passes, at most 5. One review per fix batch. Do not restart it after it stops at its pass limit; report the remaining blockers instead. If it stops because Kodus did not respond, skipped the review, or failed twice, the gate cannot pass: stop and report that as a blocker. Do not fall back to another reviewer for this gate.
 
 After each Kodus fix batch, rerun relevant validation commands before the push.
 
@@ -225,7 +225,7 @@ Create the file with a `# Kodus lessons` heading if it does not exist. Keep at m
 
 Never write the lessons file in a separate commit after the Kodus loop completes. That commit moves the head, so the completed review no longer covers it. A completing pass has no findings, so it never needs a lessons write.
 
-When the Kodus loop ends, update the existing PR description with the lesson entries added or updated during the run (or `none`), even if the pass limit was reached. Preserve any summary block Kody wrote into the description.
+When the Kodus loop ends, update the existing PR description with the lesson entries added or updated during the run (or `none`), even if the pass limit was reached. If Kody wrote a summary into the description (PR summaries enabled), keep it.
 
 ## Acceptance Criteria
 
