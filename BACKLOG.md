@@ -39,3 +39,11 @@ gets cleanly comparable inputs. The trend skill degrades gracefully without them
 Done — all seven skills are grouped under "CTO toolkit". Listed here only as a marker
 that the grouping decision was made deliberately; revisit if the suite grows enough to
 warrant sub-groups.
+
+## kodus-loop: non-GitHub platforms
+
+Kodus also supports GitLab, Forgejo, Azure DevOps, and Bitbucket. `kodus-loop` is
+GitHub-only because each query was verified against real `gh` output. Add another
+platform only after you verify its bot username, review-status signal (Azure DevOps
+and Bitbucket post status emoji as comments, not reactions), and thread-resolution
+API against a real Kodus-reviewed PR/MR.
