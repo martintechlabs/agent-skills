@@ -30,6 +30,7 @@
         "consult-codex",
         "codex-review",
         "ship-ready-pr-loop",
+        "kodus-loop",
         "optimize-agents-md",
         "git-merge-origin-main"
       ]
