@@ -31,7 +31,8 @@ first pass.
 
 ## Loop
 
-Repeat. **At most 5 review passes.**
+Repeat. **At most 5 passes.** A pass is one A→E cycle. A retry trigger after a
+failure is part of the same pass.
 
 ### A. Get a review of `HEAD_SHA`
 
@@ -43,11 +44,11 @@ Repeat. **At most 5 review passes.**
 | ----- | ------ |
 | `queued` / `in_progress` | A review is running. Do not trigger. Poll (step 4). |
 | `completed` + `success` | Review is current. Go to B. |
-| `completed` + `skipped`, summary has "No New Commits" | An earlier review covers this head. Go to B. |
+| `completed` + `skipped`, summary says no new commits or only merge commits | An earlier review covers this head (for example, after you merged `main` in). Go to B. |
 | `completed` + `skipped`, any other reason | Stop. Report the reason (file limit, draft, branch not in scope, all files ignored). Looping cannot fix it. |
-| `completed` + `failure` | Read Kody's newest PR comment for the reason (reference §4). Stop on a license or configuration error. Otherwise post `@kody start-review` once. A second consecutive failure stops the loop. |
+| `completed` + `failure` | Read Kody's newest PR comment for the reason (reference §4). Stop on a license or configuration error. Otherwise wait 3–5 minutes (a rate limit says "try again in a few minutes"), then post `@kody start-review` once. A second consecutive failure stops the loop. |
 | no check run, just after a push | The automatic review may still be registering. Recheck every 10 s for up to 2 minutes. |
-| no check run after that wait | Cadence is `manual` or `auto_pause`. Post `@kody start-review`. |
+| no check run after that wait | Cadence is `manual` or `auto_pause`. Re-read §1 once more, then post `@kody start-review` only if there is still no check run. |
 
 4. Poll every 10 s for up to 10 minutes until the check run is `completed`. On
    timeout, stop and report. Never read findings from an older commit's review.
@@ -61,13 +62,19 @@ Post at most one trigger per pass. Never post a trigger while a Kody check run o
    Never touch threads that humans started.
 2. For each thread, read the severity and category badges and the
    `Prompt for LLM` block (reference §3).
-3. Read Kody PR-level comments newer than the last push (reference §4). A
-   suggestion there with no inline thread is still a finding.
+3. Read Kody PR-level suggestion comments (reference §4, badge filter). Kody edits
+   its comments in place, so do not judge "new" by timestamp. Keep a list of the
+   comment ids you already handled this run; only an id not on that list is a new
+   finding. A suggestion with no inline thread is still a finding.
+4. Re-read the Kody threads you resolved in earlier passes. If Kody replied after
+   your reply (it answers inside threads), the thread is open business: reconsider
+   it in D.
 
 ### C. Exit check
 
 Stop when the step-A review is current **and** B found zero unresolved Kody threads
-and no new PR-level suggestions. Also stop at the pass limit.
+and no unhandled PR-level suggestions or Kody rebuttals. Also stop at the pass
+limit.
 
 ### D. Triage and fix
 
@@ -77,15 +84,20 @@ For each finding, read the code in context and decide:
 - **False positive or won't fix:** do not change code. Reply on the thread with a
   one-to-two sentence reason (reference §5).
 - **Outdated thread** (`isOutdated: true`): check if the current code still has the
-  problem. If it does not, reply "Addressed in <sha>" and resolve the thread.
+  problem. If it does not, reply "Addressed in <sha>" and resolve the thread. If it
+  does, treat it as Valid.
+- **PR-level suggestion:** fix it, or decline it in the final report. You cannot
+  resolve it; add its id to the handled list either way.
 
 Run the repository's tests, lint, and typecheck before you commit. Do not push
 broken code to get another review.
 
 ### E. Commit, resolve, push
 
-1. Stage only the files you changed: `git add <paths>`. Do not use `git add -A`.
-2. `git commit -m "fix: address Kodus review feedback (kodus-loop pass N)"`
+1. If you changed no code this pass (every finding was declined or already
+   addressed), skip to step 4. Do not make an empty commit.
+2. Stage only the files you changed: `git add <paths>`. Do not use `git add -A`,
+   then `git commit -m "fix: address Kodus review feedback (kodus-loop pass N)"`.
 3. `git push`
 4. Resolve each Kody thread you fixed or answered (reference §5). Resolve a thread
    only after its fix is pushed or its reply is posted.
@@ -113,7 +125,8 @@ Kodus loop complete.            (or: Kodus loop stopped: <reason>)
   Remaining:     0
 ```
 
-When stopped early, list every remaining finding as
+When the pass limit stops the loop after a push, say that the last push was never
+reviewed. When stopped early, list every remaining finding as
 `path:line [severity] one-line summary`, and give the next step (for example: assign
 a Kodus license, add the base branch to Kody's config, split the PR).
 

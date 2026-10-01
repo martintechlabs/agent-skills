@@ -39,7 +39,10 @@ From live, read-only `gh` queries against public Kodus-reviewed PRs:
   shapes.
 - **Exit:** the newest `Kody Code Review` check run on `HEAD_SHA` is `completed`
   with `success` (or `skipped` with "No New Commits", which means an earlier review
-  covers this head) AND zero unresolved review threads started by `kody-ai`.
+  covers this head; a merge-only skip counts the same) AND zero unresolved review
+  threads started by `kody-ai` AND no unhandled PR-level suggestion or Kody
+  rebuttal. Handled PR-level comments are tracked by id, because Kody edits its
+  comments in place.
 - **Hard stops:** `skipped` for any other reason (file limit, draft, branch,
   ignored files), `👎` unlicensed, two consecutive `failure`s, 5 passes, or a
   10-minute wait with no completed check.

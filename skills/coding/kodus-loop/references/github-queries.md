@@ -39,12 +39,12 @@ query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){
   repository(owner:$owner,name:$repo){pullRequest(number:$pr){
     reviewThreads(first:100,after:$endCursor){
       pageInfo{hasNextPage endCursor}
-      nodes{id isResolved isOutdated path line
+      nodes{id isResolved isOutdated path line originalLine
         comments(first:1){nodes{databaseId author{login} body}}}}}}}' \
   --jq '.data.repository.pullRequest.reviewThreads.nodes[]
     | select(.isResolved|not)
     | select(.comments.nodes[0].author.login=="kody-ai")
-    | {id, isOutdated, path, line, commentId: .comments.nodes[0].databaseId,
+    | {id, isOutdated, path, line: (.line // .originalLine), commentId: .comments.nodes[0].databaseId,
        severity: (.comments.nodes[0].body | capture("severity_level-(?<s>[a-z]+)").s // "unknown")}'
 ```
 
@@ -71,14 +71,29 @@ A Kody inline comment body starts with shields.io badges, then the finding:
 
 ## §4 Kody PR-level comments
 
+Kody edits its PR comments in place (a status comment's `updated_at` moves on later
+reviews), so use two separate filters.
+
+Suggestions (carry the `kody code-review` badge; status comments do not):
+
 ```bash
 gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
-  --jq '.[] | select(.user.login=="kody-ai[bot]") | {id, updated_at, body: .body[0:2000]}'
+  --jq '.[] | select(.user.login=="kody-ai[bot]")
+    | select(.body | test("badge/kody-code--review"))
+    | select(.body | test("Code Review Complete|Kody Review Complete|Could Not Complete") | not)
+    | {id, updated_at, body: .body[0:2000]}'
 ```
 
-Use the newest by `updated_at`. A failed review posts
-`## Code Review Could Not Complete ⚠️` with a `**Reason:**` line. Kody also appends a
-collapsible "Kody Guide" block to its comments; ignore that block.
+Failure reason (newest status comment by `updated_at`):
+
+```bash
+gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
+  --jq '[.[] | select(.user.login=="kody-ai[bot]")
+    | select(.body | test("Could Not Complete"))] | max_by(.updated_at) // empty
+    | .body | capture("\\*\\*Reason:\\*\\* (?<r>[^\\n]*)").r'
+```
+
+Kody also appends a collapsible "Kody Guide" block to its comments; ignore it.
 
 ## §5 Reply to and resolve a thread
 
