@@ -8,7 +8,6 @@ Spec: `docs/superpowers/specs/2026-09-30-kodus-loop-design.md`
    `references/github-queries.md`.
 3. Add `kodus-loop` to the "Coding" grouping in `skills.sh.json` and to README's
    Coding table.
-4. Add a `BACKLOG.md` entry for non-GitHub platforms.
-5. Re-run every read-only query in the skill against a public PR and show the
+4. Re-run every read-only query in the skill against a public PR and show the
    output. State that the full loop was not run live.
-6. Commit, push, open a ready-for-review PR.
+5. Commit, push, open a ready-for-review PR.

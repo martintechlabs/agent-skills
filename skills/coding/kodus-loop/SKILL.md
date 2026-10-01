@@ -1,6 +1,6 @@
 ---
 name: kodus-loop
-description: Iteratively drive a GitHub pull request through Kodus code review until Kody (the Kodus review bot) has completed a review of the current head commit and no Kody review thread is left unresolved. Waits for or triggers the Kody review, fixes valid findings, replies to and resolves false positives, pushes, and repeats for up to 5 passes. Use when the user says "run the Kodus loop", "get Kody to sign off on this PR", "fix all the Kody comments", "kodus loop", or wants a PR fully cleaned up against Kodus review. GitHub only. Use greploop instead when the repository reviews with Greptile, and the Kodus CLI (`kodus review --prompt-only`) for a local review of uncommitted changes before any PR exists.
+description: Iteratively drive a GitHub pull request through Kodus code review until Kody (the Kodus review bot) has completed a review of the current head commit and no Kody review thread is left unresolved. Waits for or triggers the Kody review, fixes valid findings, replies to and resolves false positives, pushes, and repeats for up to 5 passes. Use when the user says "run the Kodus loop", "get Kody to sign off on this PR", "fix all the Kody comments", "kodus loop", or wants a PR fully cleaned up against Kodus review. Works only through Kody's review on the GitHub PR. Use greploop instead when the repository reviews with Greptile.
 metadata:
   author: stephen-martin
   version: "0.1.0"
@@ -139,3 +139,5 @@ a Kodus license, add the base branch to Kody's config, split the PR).
 - Do not use `@kody review --force` unless the user asks. A "No New Commits" skip
   means the head is already reviewed.
 - Do not merge the PR.
+- Do not install or run the Kodus CLI (`kodus`). Get every review from Kody on the
+  GitHub PR.

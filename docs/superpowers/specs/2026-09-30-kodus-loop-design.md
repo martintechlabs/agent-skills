@@ -18,8 +18,6 @@ From https://docs.kodus.io/en/how_to_use/code_review/flow and related pages:
 - Status reactions: 🚀 processing, 🎉 done, 👀 skipped, 👎 unlicensed, 😕 error.
 - No confidence score. Reactions to suggestions do not train future reviews; Kody
   Rules and `@kody remember` do.
-- A separate local flow exists: `kodus review --prompt-only` (Kodus CLI), with its
-  own vendor skill.
 
 From live, read-only `gh` queries against public Kodus-reviewed PRs:
 
@@ -34,9 +32,10 @@ From live, read-only `gh` queries against public Kodus-reviewed PRs:
 
 ## Decisions
 
-- **GitHub only.** Every query is verified against real output. GitLab, Forgejo,
-  Azure DevOps, and Bitbucket go to `BACKLOG.md` until someone can verify their
-  shapes.
+- **GitHub only.** This is the only platform the skill supports. Every query is
+  verified against real output.
+- **Web review only.** Reviews come from Kody on the GitHub PR. The skill does not
+  install or run the Kodus CLI.
 - **Exit:** the newest `Kody Code Review` check run on `HEAD_SHA` is `completed`
   with `success` (or `skipped` with "No New Commits", which means an earlier review
   covers this head; a merge-only skip counts the same) AND zero unresolved review
