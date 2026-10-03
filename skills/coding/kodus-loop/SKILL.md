@@ -1,9 +1,20 @@
 ---
 name: kodus-loop
-description: Iteratively drive a GitHub pull request through Kodus code review until Kody (the Kodus review bot) has completed a review of the current head commit and no Kody review thread is left unresolved. Waits for or triggers the Kody review, fixes valid findings, replies to and resolves false positives, pushes, and repeats for up to 5 passes. On a merged or closed PR, it runs a closeout instead: it asks Kody in each thread to mark the matching Kody Issue resolved or dismissed, so the Kodus Issues page does not keep them open. Use when the user says "run the Kodus loop", "get Kody to sign off on this PR", "fix all the Kody comments", "kodus loop", "close out the Kody issues", "Kody issues still show open", or wants a PR fully cleaned up against Kodus review. Works only through Kody on the GitHub PR. Use greploop instead when the repository reviews with Greptile.
+description: >-
+  Iteratively drive a GitHub pull request through Kodus code review until Kody (the
+  Kodus review bot) has completed a review of the current head commit and no Kody
+  review thread is left unresolved. Waits for or triggers the Kody review, fixes valid
+  findings, replies to and resolves false positives, pushes, and repeats for up to 5
+  passes. On a merged or closed PR, it runs a closeout instead: it asks Kody in each
+  thread to mark the matching Kody Issue resolved or dismissed, so the Kodus Issues
+  page does not keep them open. Use when the user says "run the Kodus loop", "get Kody
+  to sign off on this PR", "fix all the Kody comments", "kodus loop", "close out the
+  Kody issues", "Kody issues still show open", or wants a PR fully cleaned up against
+  Kodus review. Works only through Kody on the GitHub PR. Use greploop instead when
+  the repository reviews with Greptile.
 metadata:
   author: stephen-martin
-  version: "0.2.0"
+  version: "0.2.1"
 ---
 
 # Kodus Loop

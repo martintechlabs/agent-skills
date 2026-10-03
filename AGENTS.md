@@ -82,7 +82,12 @@ context, not summarized back from a subagent).
 
 ## Validation strategy
 
-No repo-wide test command — each skill validates independently:
+One repo-wide check: `bash scripts/check-frontmatter.sh` parses every `SKILL.md`
+frontmatter as YAML and checks that `name` and `description` exist and that `name`
+matches the directory. CI runs it on every PR (`.github/workflows/validate.yml`).
+`npx skills` skips a skill whose frontmatter does not parse and reports only "Failed
+to update". So a `description` that contains `: ` or quotes must use a block scalar
+(`description: >-`). Otherwise, each skill validates independently:
 
 ```bash
 bash skills/<category>/<skill-name>/tests/run.sh
