@@ -16,6 +16,9 @@ Exact queries, field shapes, and the bot's two login spellings are in
 [references/github-queries.md](references/github-queries.md). Read it before the
 first pass.
 
+At the start of this invocation, set `RUN_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)`.
+Keep it unchanged across passes. The reply limit counts only this run's replies.
+
 ## Inputs
 
 - **PR number** (optional). Without it, use the PR for the current branch:
@@ -80,6 +83,12 @@ Then push a commit to the PR and run the loop again.
 Repeat. **At most 5 passes.** A pass is one A→E cycle. A retry trigger after a
 failure is part of the same pass.
 
+Keep a pending-findings list across passes, separate from GitHub's resolution
+state and the handled-reply list. Add a disputed or valid remaining finding even
+if its GitHub thread is resolved. Remove it only after its fix is pushed and the
+exchange ends in agreement or timeout with no known valid defect left. An
+unresolved dispute stays pending and blocks completion at the pass limit.
+
 ### A. Get a review of `HEAD_SHA`
 
 1. Push any committed work: `git push`.
@@ -131,13 +140,15 @@ Post at most one trigger per pass. Never post a trigger while a Kody check run o
 
 ### C. Exit check
 
-Stop when the step-A review is current **and** B found zero unresolved Kody threads
-and no unhandled PR-level suggestions or Kody replies. Also stop at the pass
-limit.
+Stop successfully when the step-A review is current **and** B found zero unresolved
+Kody threads, no unhandled PR-level suggestions or Kody replies, and the
+pending-findings list is empty. At the pass limit, stop and report every remaining
+finding, including pending findings on resolved threads.
 
 ### D. Triage and fix
 
-For each finding, read the code in context and decide:
+For each finding from B and the pending-findings list, read the code in context
+and decide:
 
 - **Valid** (any severity): fix it. Fix `critical` and `high` first. When Kody's
   suggested code is acceptable, use it. Kodus compares each push with the
@@ -165,8 +176,8 @@ broken code to get another review.
    - Fixed: `Fixed in <short sha>. <what changed, with path:line>. <the test that
      covers it, or how you checked it>.` Start with `Fixed in`; the closeout uses
      it to tell fixed threads from declined ones.
-   - Declined: one or two sentences with the concrete reason (the code, a caller, a
-     config, or a convention that makes the finding wrong).
+   - Declined: `Declined: <reason>`, with the code, caller, config, or convention
+     that makes the finding wrong. The prefix records an explicit decision.
 5. Wait for Kody's answers and respond with
    [Talking with Kody](#talking-with-kody-in-a-thread). Resolve a thread when Kody
    agrees, or when it does not answer in time. Leave it unresolved when Kody still
@@ -191,11 +202,11 @@ if it accepts the fix or the reason. Read it and answer what it actually says.
 | ------------- | ------------- |
 | Agrees: verified the fix, accepts the reason | Done. Resolve the thread (loop only). |
 | Offers to change a Kody Issue ("would you like me to mark it resolved?", "say the word") | Loop: Kody agrees, so treat it as agreement. Do not say yes: this PR's issues do not exist until it closes, and an attempt fails (seen live: "the comment id isn't the issue id"). Closeout: say yes as an instruction, with the lookup (below). |
-| Says the problem is still there, or only partly fixed | Check its claim in the code. If it is right, the finding is Valid again: leave the thread unresolved for the next pass (loop), or report it (closeout). If it is wrong, reply once with stronger evidence: the exact `path:line`, the test name, or the command output. |
+| Says the problem is still there, or only partly fixed | Check its claim in the code. Loop: add it to pending findings even if the thread is resolved; a valid defect goes to D. Closeout: report a valid defect without changing issue status. If Kody is wrong, reply once with stronger evidence: the exact `path:line`, the test name, or command output. Keep the dispute pending until the exchange ends. |
 | Asks a question ("which line?", "what about X?") | Answer it with the concrete fact. |
 | Says no open Kody Issue matches (closeout) | Done. Kodus already counts the suggestion as implemented. |
 | Says the status update failed, or it could not find the issue (closeout) | Reply with the lookup again, and add the file, the PR number, and the first line of the finding. The usual cause is that Kody passed the comment id as the issue id. |
-| No answer in 5 minutes | Loop: resolve and note "Kody did not answer". Closeout: report it to check by hand. |
+| No answer in 5 minutes | Loop: resolve and note "Kody did not answer" only if no known valid defect remains; clear that pending entry. Closeout: report it to check by hand. |
 
 3. To make Kody act, write an instruction, not a question. Kody changes a Kody Issue
    only when your latest message tells it to. Good: `@kody Yes, mark the Kody issue
@@ -203,8 +214,10 @@ if it accepts the fix or the reason. Read it and answer what it actually says.
 4. Post at most 3 replies of your own per thread in one run, counting the first. If
    Kody still has not agreed, stop the exchange and report the thread as disputed
    with Kody's last point. Never argue in circles; a third unchanged reason will
-   not convince it.
-5. Add each Kody reply id you handled to the handled list.
+   not convince it. Check this count before each reply, including E on later passes.
+5. Add each Kody reply id you handled to the handled list. This only prevents
+   reading the same reply twice; it does not clear a pending finding. Agreement
+   clears its pending entry once any required fix is pushed.
 
 ## Teaching Kody
 
@@ -249,10 +262,16 @@ reaction does not change an issue's status.
 
 | Class | Meaning | Reply |
 | ----- | ------- | ----- |
-| `fixed` | Your `Fixed in` / `Addressed in` reply, or resolved with no reply from you | `@kody Yes, mark the Kody issue for this finding as resolved now. It was fixed in <sha>. <LOOKUP>` |
-| `declined` | You replied with a reason | `@kody Yes, dismiss the Kody issue for this finding now. <one-sentence reason> <LOOKUP>` |
+| `fixed` | Your latest reply starts with `Fixed in` / `Addressed in` | `@kody Yes, mark the Kody issue for this finding as resolved now. It was fixed in <sha>. <LOOKUP>` |
+| `declined` | Your latest reply starts with `Declined:` | `@kody Yes, dismiss the Kody issue for this finding now. <one-sentence reason> <LOOKUP>` |
+| `needs-triage` | Other replies, or resolved without a reply from you | Read the full thread and verify the latest decision against code evidence. Use `fixed` or `declined` only if established; otherwise report it to check by hand without a status command. |
 | `unanswered` | Unresolved, no reply from you | None. List it in the report. |
 | `done` | A closeout reply is already there (an earlier closeout run) | None. Continue the exchange from Kody's newest answer in step 4. |
+
+   Before any status command, read later discussion and check that it supports
+   the proposed decision. A later dispute or retraction invalidates an earlier
+   `Fixed in` or `Declined:` reply until triaged. GitHub resolution alone is not
+   evidence of a fix or a decline.
 
    `<LOOKUP>` tells Kody how to find the issue. The thread's comment id is not the
    issue id, and Kody fails when it uses it. Write: `The comment id is not the issue

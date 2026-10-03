@@ -36,10 +36,11 @@ The user chose in-thread replies over a Kodus Team API key (no new secret).
   instead of the loop: for every Kody thread, reply
   `@kody Yes, mark the Kody issue for this finding as resolved/dismissed`, then read
   Kody's answer and report the threads it did not confirm.
-- **Classification.** Fixed = the thread has the user's `Fixed in` / `Addressed in`
-  reply, or it is resolved with no reply from the user (older runs and Kodus
-  auto-resolves). Declined = the user replied with a reason. Unresolved with no
-  reply = left alone and reported.
+- **Classification.** The latest user reply must state `Fixed in` / `Addressed in`
+  or `Declined:`. Other replies and resolution without a reply need triage from
+  the full thread and code evidence before a status command. A clarification is
+  not a decline. Unresolved with no reply = left alone and reported. An existing
+  closeout instruction resumes its exchange instead of posting a new instruction.
 - **Loop changes that make classification possible:** reply `Fixed in <sha>.` on a
   fixed thread before resolving it. Prefer Kody's suggested code when it is
   acceptable, so Kodus's own check marks it implemented and no issue is created.
@@ -55,7 +56,10 @@ disputes, asks a question, or offers to act. The skill reads that answer (refere
 instruction on an offer (closeout only), the lookup hint when an update fails. At
 most 3 replies per thread per run; after that the thread is reported as disputed.
 In the loop, a thread stays unresolved while Kody still disagrees, so the next pass
-picks it up.
+picks it up. Track pending findings independently of GitHub resolution state:
+a late rebuttal on a resolved thread must still block completion and enter the
+next fix batch. Count only replies posted since this run began toward the limit;
+keep older messages available to resume a closeout exchange.
 
 ## Rejected
 

@@ -14,3 +14,8 @@ Spec: `docs/superpowers/specs/2026-10-03-kodus-loop-issue-closeout-design.md`
 7. Talking with Kody section + reference §8; replies carry evidence; closeout
    reply carries the issue lookup hint. Verify §8 on PR #46 and the fixture.
 8. Live closeout run on a real merged PR (posts comments; needs user OK).
+9. Review hardening: require explicit latest dispositions in §7; route ambiguous
+   histories to evidence-based triage. Scope §8 reply counts to the current run.
+   Keep late rebuttals pending across passes even when GitHub marks them resolved.
+10. Add executable jq regression tests, run shell syntax checks, repeat read-only
+    checks on PR #46, and test the pending-finding scenario with a review agent.

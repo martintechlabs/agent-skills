@@ -206,21 +206,23 @@ query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){
     | .comments.nodes as $c
     | ([$c[] | select(.author.login==$me)]) as $mine
     | ([$mine[] | select(.body | startswith("@kody Yes,"))]) as $closeout
-    | ([$mine[] | select(.body | test("^(Fixed|Addressed) in "))]) as $fixed
+    | ($mine[-1].body // "") as $latest
+    | ($latest | test("^(Fixed|Addressed) in ")) as $fixed
     | {id, isResolved, path, line: (.line // .originalLine),
        commentId: $c[0].databaseId,
-       sha: ($fixed[0].body // "" | capture("in `?(?<s>[0-9a-f]{7,40})").s // null),
+       sha: (if $fixed then ($latest | capture("^(Fixed|Addressed) in `?(?<s>[0-9a-f]{7,40})").s // null) else null end),
        class: (if ($closeout|length) > 0 then "done"
-               elif ($fixed|length) > 0 then "fixed"
-               elif ($mine|length) > 0 then "declined"
-               elif .isResolved then "fixed"
+               elif $fixed then "fixed"
+               elif ($latest | startswith("Declined:")) then "declined"
+               elif ($mine|length) > 0 or .isResolved then "needs-triage"
                else "unanswered" end)}'
 ```
 
-A resolved thread with no reply from you is classed `fixed`: older loop versions
-resolved fixed threads without a reply, and Kodus resolves a thread itself when its
-check marks the suggestion implemented. In that second case Kody answers that no
-open issue matches, which is fine.
+These classes are candidates, not permission to change issue status. Read the
+full thread before posting. A later dispute or retraction needs triage. A resolved
+thread without a reply also needs triage: resolution does not tell you whether a
+finding was fixed or declined. Unmarked explanations and questions never imply
+a decline. The latest reply supplies the decision and SHA, not the oldest fix.
 
 Kody answers replies in its own threads, with or without a mention. The `@kody`
 prefix keeps the instruction explicit. Kody changes an issue only when your latest
@@ -229,8 +231,9 @@ message tells it to, so phrase the reply as an instruction, not a question.
 ## §8 Kody's answer to your newest reply
 
 For every Kody thread you replied in: your newest reply, how many replies you
-posted, and Kody's newest answer after it (`null` until Kody answers). Uses the same
-setup and `ME` as §7.
+posted in this run, and Kody's newest answer after it (`null` until Kody answers).
+Uses the same setup and `ME` as §7. `RUN_STARTED_AT` must be the UTC timestamp saved
+at invocation start, before any replies. Keep it unchanged across passes.
 
 ```bash
 gh api graphql --paginate -F owner="$OWNER" -F repo="$NAME" -F pr="$PR" -f query='
@@ -239,15 +242,15 @@ query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){
     reviewThreads(first:100,after:$endCursor){
       pageInfo{hasNextPage endCursor}
       nodes{id isResolved path line originalLine
-        comments(first:50){nodes{databaseId author{login} body}}}}}}}' \
-  | jq --arg bot "$KODY_SLUG" --arg me "$ME" '.data.repository.pullRequest.reviewThreads.nodes[]
+        comments(first:50){nodes{databaseId author{login} body createdAt}}}}}}}' \
+  | jq --arg bot "$KODY_SLUG" --arg me "$ME" --arg runStartedAt "${RUN_STARTED_AT:?Set RUN_STARTED_AT at invocation start}" '.data.repository.pullRequest.reviewThreads.nodes[]
     | select(.comments.nodes[0].author.login==$bot)
     | .comments.nodes as $c
     | ([$c | to_entries[] | select(.value.author.login==$me) | .key]) as $mine
     | select($mine | length > 0)
     | ([$c[($mine[-1]+1):][] | select(.author.login==$bot)] | last) as $answer
     | {id, isResolved, path, line: (.line // .originalLine),
-       myReplies: ($mine | length),
+       myReplies: ([$mine[] | $c[.] | select(.createdAt >= $runStartedAt)] | length),
        myLastReply: $c[$mine[-1]].body[0:300],
        answerId: $answer.databaseId,
        answer: ($answer.body // null | if . then .[0:2000] else null end)}'
