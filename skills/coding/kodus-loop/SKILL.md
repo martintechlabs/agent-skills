@@ -1,9 +1,9 @@
 ---
 name: kodus-loop
-description: Iteratively drive a GitHub pull request through Kodus code review until Kody (the Kodus review bot) has completed a review of the current head commit and no Kody review thread is left unresolved. Waits for or triggers the Kody review, fixes valid findings, replies to and resolves false positives, pushes, and repeats for up to 5 passes. Use when the user says "run the Kodus loop", "get Kody to sign off on this PR", "fix all the Kody comments", "kodus loop", or wants a PR fully cleaned up against Kodus review. Works only through Kody's review on the GitHub PR. Use greploop instead when the repository reviews with Greptile.
+description: Iteratively drive a GitHub pull request through Kodus code review until Kody (the Kodus review bot) has completed a review of the current head commit and no Kody review thread is left unresolved. Waits for or triggers the Kody review, fixes valid findings, replies to and resolves false positives, pushes, and repeats for up to 5 passes. On a merged or closed PR, it runs a closeout instead: it asks Kody in each thread to mark the matching Kody Issue resolved or dismissed, so the Kodus Issues page does not keep them open. Use when the user says "run the Kodus loop", "get Kody to sign off on this PR", "fix all the Kody comments", "kodus loop", "close out the Kody issues", "Kody issues still show open", or wants a PR fully cleaned up against Kodus review. Works only through Kody on the GitHub PR. Use greploop instead when the repository reviews with Greptile.
 metadata:
   author: stephen-martin
-  version: "0.1.1"
+  version: "0.2.0"
 ---
 
 # Kodus Loop
@@ -16,10 +16,27 @@ Exact queries, field shapes, and the bot's two login spellings are in
 [references/github-queries.md](references/github-queries.md). Read it before the
 first pass.
 
+At the start of this invocation, set `RUN_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)`.
+Keep it unchanged across passes. The reply limit counts only this run's replies.
+
 ## Inputs
 
 - **PR number** (optional). Without it, use the PR for the current branch:
   `gh pr view --json number -q .number`. Check out the PR branch if needed.
+
+Read the PR state first: `gh pr view "$PR" --json state -q .state`. If it is
+`MERGED` or `CLOSED`, skip step 0 and the loop, and run
+[Closeout](#closeout-merged-or-closed-pr).
+
+## GitHub threads and Kody Issues are separate
+
+Resolving a GitHub thread does not change anything in Kodus. Kodus keeps its own
+status for each suggestion. Only Kodus sets it: on every push it checks whether the
+new code implements the suggestion. When the PR closes, each suggestion that is
+still "not implemented" becomes an **Open Kody Issue**. That includes every finding
+you declined, and fixes that look different from Kody's suggested code. The loop
+cannot close these issues, because they do not exist until the PR closes. The
+closeout does that after the merge.
 
 ## Preconditions
 
@@ -66,6 +83,12 @@ Then push a commit to the PR and run the loop again.
 Repeat. **At most 5 passes.** A pass is one A→E cycle. A retry trigger after a
 failure is part of the same pass.
 
+Keep a pending-findings list across passes, separate from GitHub's resolution
+state and the handled-reply list. Add a disputed or valid remaining finding even
+if its GitHub thread is resolved. Remove it only after its fix is pushed and the
+exchange ends in agreement or timeout with no known valid defect left. An
+unresolved dispute stays pending and blocks completion at the pass limit.
+
 ### A. Get a review of `HEAD_SHA`
 
 1. Push any committed work: `git push`.
@@ -111,26 +134,29 @@ Post at most one trigger per pass. Never post a trigger while a Kody check run o
    finding. A suggestion with no inline thread is still a finding.
 4. Look for Kody replies: the same §2 query also returns resolved Kody threads
    whose last comment is a Kody reply (`rebuttal: true`). Kody answers inside the
-   thread and does not reopen it. Read `lastReply`. Kody often confirms a fix
-   ("I verified the fix…"); add that `lastReplyId` to the handled list. When Kody
-   disagrees, reconsider the thread in D, then add its `lastReplyId` to the list.
-   Only a `lastReplyId` not on the list is new.
+   thread and does not reopen it. Read `lastReply` and handle it with
+   [Talking with Kody](#talking-with-kody-in-a-thread). Only a `lastReplyId` not on
+   the handled list is new.
 
 ### C. Exit check
 
-Stop when the step-A review is current **and** B found zero unresolved Kody threads
-and no unhandled PR-level suggestions or Kody replies. Also stop at the pass
-limit.
+Stop successfully when the step-A review is current **and** B found zero unresolved
+Kody threads, no unhandled PR-level suggestions or Kody replies, and the
+pending-findings list is empty. At the pass limit, stop and report every remaining
+finding, including pending findings on resolved threads.
 
 ### D. Triage and fix
 
-For each finding, read the code in context and decide:
+For each finding from B and the pending-findings list, read the code in context
+and decide:
 
-- **Valid** (any severity): fix it. Fix `critical` and `high` first.
-- **False positive or won't fix:** do not change code. Reply on the thread with a
-  one-to-two sentence reason (reference §5).
+- **Valid** (any severity): fix it. Fix `critical` and `high` first. When Kody's
+  suggested code is acceptable, use it. Kodus compares each push with the
+  suggestion, and a fix in a different shape can stay "not implemented" and become
+  an Open Kody Issue.
+- **False positive or won't fix:** do not change code. You reply in step E.
 - **Outdated thread** (`isOutdated: true`): check if the current code still has the
-  problem. If it does not, reply "Addressed in <sha>" and resolve the thread. If it
+  problem. If it does not, treat it as fixed in the commit that removed it. If it
   does, treat it as Valid.
 - **PR-level suggestion:** fix it, or decline it in the final report. You cannot
   resolve it; add its id to the handled list either way.
@@ -145,12 +171,53 @@ broken code to get another review.
 2. Stage only the files you changed: `git add <paths>`. Do not use `git add -A`.
    Then commit: `git commit -m "fix: address Kodus review feedback (kodus-loop pass N)"`.
 3. `git push`
-4. Resolve each Kody thread you fixed or answered (reference §5). Resolve a thread
-   only after its fix is pushed or its reply is posted.
-5. Go back to A. A push does not start a review, so step A posts the next
+4. Reply on each Kody thread you handled (reference §5). Give Kody enough evidence
+   to check the fix itself, the way a reviewer would want it:
+   - Fixed: `Fixed in <short sha>. <what changed, with path:line>. <the test that
+     covers it, or how you checked it>.` Start with `Fixed in`; the closeout uses
+     it to tell fixed threads from declined ones.
+   - Declined: `Declined: <reason>`, with the code, caller, config, or convention
+     that makes the finding wrong. The prefix records an explicit decision.
+5. Wait for Kody's answers and respond with
+   [Talking with Kody](#talking-with-kody-in-a-thread). Resolve a thread when Kody
+   agrees, or when it does not answer in time. Leave it unresolved when Kody still
+   disagrees; the next pass picks it up in B.
+6. Go back to A. A push does not start a review, so step A posts the next
    trigger.
 
 One review per fix batch: commit all fixes for the pass, then push once.
+
+## Talking with Kody in a thread
+
+Kody answers replies in its own review threads, with or without `@kody`. A reply
+is the start of a short exchange, not the end of the thread. Kody's answer tells you
+if it accepts the fix or the reason. Read it and answer what it actually says.
+
+1. After you post, poll every 30 s for up to 5 minutes for a Kody reply after your
+   newest reply in each thread (reference §8). Post all of a pass's replies first,
+   then poll them together.
+2. Read Kody's answer and act on it:
+
+| Kody's answer | Your response |
+| ------------- | ------------- |
+| Agrees: verified the fix, accepts the reason | Done. Resolve the thread (loop only). |
+| Offers to change a Kody Issue ("would you like me to mark it resolved?", "say the word") | Loop: Kody agrees, so treat it as agreement. Do not say yes: this PR's issues do not exist until it closes, and an attempt fails (seen live: "the comment id isn't the issue id"). Closeout: say yes as an instruction, with the lookup (below). |
+| Says the problem is still there, or only partly fixed | Check its claim in the code. Loop: add it to pending findings even if the thread is resolved; a valid defect goes to D. Closeout: report a valid defect without changing issue status. If Kody is wrong, reply once with stronger evidence: the exact `path:line`, the test name, or command output. Keep the dispute pending until the exchange ends. |
+| Asks a question ("which line?", "what about X?") | Answer it with the concrete fact. |
+| Says no open Kody Issue matches (closeout) | Done. Kodus already counts the suggestion as implemented. |
+| Says the status update failed, or it could not find the issue (closeout) | Reply with the lookup again, and add the file, the PR number, and the first line of the finding. The usual cause is that Kody passed the comment id as the issue id. |
+| No answer in 5 minutes | Loop: resolve and note "Kody did not answer" only if no known valid defect remains; clear that pending entry. Closeout: report it to check by hand. |
+
+3. To make Kody act, write an instruction, not a question. Kody changes a Kody Issue
+   only when your latest message tells it to. Good: `@kody Yes, mark the Kody issue
+   for this finding as resolved now.` Not good: `Could you resolve this?`
+4. Post at most 3 replies of your own per thread in one run, counting the first. If
+   Kody still has not agreed, stop the exchange and report the thread as disputed
+   with Kody's last point. Never argue in circles; a third unchanged reason will
+   not convince it. Check this count before each reply, including E on later passes.
+5. Add each Kody reply id you handled to the handled list. This only prevents
+   reading the same reply twice; it does not clear a pending finding. Agreement
+   clears its pending entry once any required fix is pushed.
 
 ## Teaching Kody
 
@@ -176,6 +243,71 @@ reviewed. When stopped early, list every remaining finding as
 `path:line [severity] one-line summary`, and give the next step (for example: assign
 a Kodus license, add the base branch to Kody's config, split the PR).
 
+End every loop report with: `After the PR merges, run the Kodus loop on it again to
+close its Kody Issues.`
+
+## Closeout (merged or closed PR)
+
+Kodus creates Kody Issues when the PR closes. Kody's chat in a thread can change an
+issue's status, but it only acts when your latest message tells it to. A 👍
+reaction does not change an issue's status.
+
+1. Read `closedAt` (`gh pr view "$PR" --json closedAt`). If the PR closed less than
+   5 minutes ago, wait until 5 minutes have passed. Kodus creates the issues after
+   the close.
+2. Get the bot login from §1 on the PR's head commit. If that successful query is
+   empty, report "could not confirm from the head check" and use §0's last-20-PR
+   history lookup to recover the login. With a confirmed login, list every Kody
+   thread and its closeout class (§7), including threads from earlier commits.
+   If the login remains unconfirmed, post no status commands: report "check by
+   hand" and direct the user to check Kodus app access (the numbered "How to fix"
+   steps in [this skill's installation section](#0-check-that-kodus-is-installed))
+   and this PR's issues on the Kodus Issues page. A failed API command is not an
+   empty result: report the error, restore authentication/access or retry a
+   transient failure, and leave closeout unconfirmed until the reads succeed.
+3. For each thread, by class:
+
+| Class | Meaning | Reply |
+| ----- | ------- | ----- |
+| `fixed` | Your latest reply starts with `Fixed in` / `Addressed in` | `@kody Yes, mark the Kody issue for this finding as resolved now. It was fixed in <sha>. <LOOKUP>` |
+| `declined` | Your latest reply starts with `Declined:` | `@kody Yes, dismiss the Kody issue for this finding now. <one-sentence reason> <LOOKUP>` |
+| `needs-triage` | Other replies, or resolved without a reply from you | Read the full thread and verify the latest decision against code evidence. Use `fixed` or `declined` only if established; otherwise report it to check by hand without a status command. |
+| `unanswered` | Unresolved, no reply from you | None. List it in the report. |
+| `done` | A closeout reply is already there (an earlier closeout run) | None. Continue the exchange from Kody's newest answer in step 4. |
+
+   Before any status command, read later discussion and check that it supports
+   the proposed decision. A later dispute or retraction invalidates an earlier
+   `Fixed in` or `Declined:` reply until triaged. GitHub resolution alone is not
+   evidence of a fix or a decline.
+
+   `<LOOKUP>` tells Kody how to find the issue. The thread's comment id is not the
+   issue id, and Kody fails when it uses it. Write: `The comment id is not the issue
+   id: find the open issue with KODUS_LIST_KODY_ISSUES (repository <name>, file
+   <path>, from PR #<n>, "<finding title>") and update it with
+   KODUS_UPDATE_KODY_ISSUE_STATUS.` Use the `<sha>` from your earlier reply when
+   there is one; otherwise omit that sentence. Post each reply with §5.
+4. Wait for Kody's answers and respond with
+   [Talking with Kody](#talking-with-kody-in-a-thread) until Kody confirms that it
+   changed the issue, says no open issue matches, or the reply limit is reached. A
+   thread counts as closed out only when Kody says it changed the issue (or that
+   none is open). "I can do that" is not a confirmation: answer it with the
+   instruction.
+5. Do not resolve, unresolve, or edit any thread in the closeout.
+
+Report:
+
+```
+Kodus closeout complete.
+  PR:            #123 (merged)
+  Resolved:      4 (Kody confirmed)
+  Dismissed:     1 (Kody confirmed)
+  Check by hand: 2  (no answer, disputed, or not confirmed: path:line, Kody's last point)
+  Unanswered:    0
+```
+
+For each "check by hand" thread, tell the user to set the status on the Kodus
+Issues page (https://app.kodus.io, or their self-hosted Kodus).
+
 ## Hard rules
 
 - Do not resolve a thread that a human started.
@@ -185,5 +317,7 @@ a Kodus license, add the base branch to Kody's config, split the PR).
 - Do not use `@kody review --force` unless the user asks. A "No New Commits" skip
   means the head is already reviewed.
 - Do not merge the PR.
+- Do not ask Kody to change a Kody Issue while the PR is open. Do it only in the
+  closeout.
 - Do not install or run the Kodus CLI (`kodus`). Get every review from Kody on the
   GitHub PR.

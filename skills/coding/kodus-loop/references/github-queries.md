@@ -20,15 +20,28 @@ KODY_SLUG=kody-ai   # replace with app.slug from §1 once a Kody check run exist
 
 ## §0 Is Kodus installed?
 
-Prints the bot's app slug, or nothing when no Kody check run exists on this PR's
-head or the last 20 PR heads:
+Sets `KODY_SLUG` to the bot's app slug, or empty when successful reads find no Kody
+check on this PR's head or the last 20 PR heads. API errors stay visible and stop
+the Bash snippet with failure. Handle that error before continuing the workflow.
 
 ```bash
-KODY_SLUG=$( { echo "$HEAD_SHA"; gh pr list -R "$REPO" --state all --limit 20 --json headRefOid -q '.[].headRefOid'; } \
-  | while read -r sha; do
-      gh api "repos/$REPO/commits/$sha/check-runs?check_name=Kody%20Code%20Review" \
-        --jq '.check_runs[0].app.slug // empty' 2>/dev/null
-    done | head -n 1 )
+RECENT_HEADS=$(gh pr list -R "$REPO" --state all --limit 20 --json headRefOid -q '.[].headRefOid') || {
+  printf '%s\n' 'Kody history listing failed; fix the reported error and retry.' >&2
+  exit 1
+}
+KODY_SLUG=""
+while IFS= read -r sha; do
+  [ -n "$sha" ] || continue
+  KODY_SLUG=$(gh api "repos/$REPO/commits/$sha/check-runs?check_name=Kody%20Code%20Review" \
+    --jq '.check_runs[0].app.slug // empty') || {
+    printf '%s\n' 'Kody check lookup failed; fix the reported error and retry.' >&2
+    exit 1
+  }
+  if [ -n "$KODY_SLUG" ]; then break; fi
+done <<EOF
+${HEAD_SHA:-}
+$RECENT_HEADS
+EOF
 ```
 
 GitHub does not let a normal `gh` login list a repository's app installations
@@ -186,3 +199,75 @@ gh api "repos/$REPO/issues/comments/$TRIGGER_ID/reactions" \
 Optional focus: `@kody start-review focus on <area>`. A focus is a priority, not a
 filter. `@kody review --force` re-runs a skipped review. Use it only when the user
 asks.
+
+## §7 Closeout: every Kody thread with its class
+
+For a merged or closed PR. `ME` is the user that posts the loop's replies. GraphQL
+uses plain logins, without `[bot]`.
+
+```bash
+ME=$(gh api user --jq .login)
+gh api graphql --paginate -F owner="$OWNER" -F repo="$NAME" -F pr="$PR" -f query='
+query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){
+  repository(owner:$owner,name:$repo){pullRequest(number:$pr){
+    reviewThreads(first:100,after:$endCursor){
+      pageInfo{hasNextPage endCursor}
+      nodes{id isResolved path line originalLine
+        comments(first:50){nodes{databaseId author{login} body}}}}}}}' \
+  | jq --arg bot "$KODY_SLUG" --arg me "$ME" '.data.repository.pullRequest.reviewThreads.nodes[]
+    | select(.comments.nodes[0].author.login==$bot)
+    | .comments.nodes as $c
+    | ([$c[] | select(.author.login==$me)]) as $mine
+    | ([$mine[] | select(.body | startswith("@kody Yes,"))]) as $closeout
+    | ($mine[-1].body // "") as $latest
+    | ($latest | test("^(Fixed|Addressed) in ")) as $fixed
+    | {id, isResolved, path, line: (.line // .originalLine),
+       commentId: $c[0].databaseId,
+       sha: (if $fixed then ($latest | capture("^(Fixed|Addressed) in `?(?<s>[0-9a-f]{7,40})").s // null) else null end),
+       class: (if ($closeout|length) > 0 then "done"
+               elif $fixed then "fixed"
+               elif ($latest | startswith("Declined:")) then "declined"
+               elif ($mine|length) > 0 or .isResolved then "needs-triage"
+               else "unanswered" end)}'
+```
+
+These classes are candidates, not permission to change issue status. Read the
+full thread before posting. A later dispute or retraction needs triage. A resolved
+thread without a reply also needs triage: resolution does not tell you whether a
+finding was fixed or declined. Unmarked explanations and questions never imply
+a decline. The latest reply supplies the decision and SHA, not the oldest fix.
+
+Kody answers replies in its own threads, with or without a mention. The `@kody`
+prefix keeps the instruction explicit. Kody changes an issue only when your latest
+message tells it to, so phrase the reply as an instruction, not a question.
+
+## §8 Kody's answer to your newest reply
+
+For every Kody thread you replied in: your newest reply, how many replies you
+posted in this run, and Kody's newest answer after it (`null` until Kody answers).
+Uses the same setup and `ME` as §7. `RUN_STARTED_AT` must be the UTC timestamp saved
+at invocation start, before any replies. Keep it unchanged across passes.
+
+```bash
+gh api graphql --paginate -F owner="$OWNER" -F repo="$NAME" -F pr="$PR" -f query='
+query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){
+  repository(owner:$owner,name:$repo){pullRequest(number:$pr){
+    reviewThreads(first:100,after:$endCursor){
+      pageInfo{hasNextPage endCursor}
+      nodes{id isResolved path line originalLine
+        comments(first:50){nodes{databaseId author{login} body createdAt}}}}}}}' \
+  | jq --arg bot "$KODY_SLUG" --arg me "$ME" --arg runStartedAt "${RUN_STARTED_AT:?Set RUN_STARTED_AT at invocation start}" '.data.repository.pullRequest.reviewThreads.nodes[]
+    | select(.comments.nodes[0].author.login==$bot)
+    | .comments.nodes as $c
+    | ([$c | to_entries[] | select(.value.author.login==$me) | .key]) as $mine
+    | select($mine | length > 0)
+    | ([$c[($mine[-1]+1):][] | select(.author.login==$bot)] | last) as $answer
+    | {id, isResolved, path, line: (.line // .originalLine),
+       myReplies: ([$mine[] | $c[.] | select(.createdAt >= $runStartedAt)] | length),
+       myLastReply: $c[$mine[-1]].body[0:300],
+       answerId: $answer.databaseId,
+       answer: ($answer.body // null | if . then .[0:2000] else null end)}'
+```
+
+Poll until every thread you just replied in has an `answerId` that is not on your
+handled list, or 5 minutes pass. `myReplies` counts toward the 3-reply limit.
