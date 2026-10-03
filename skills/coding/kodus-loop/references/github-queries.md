@@ -186,3 +186,46 @@ gh api "repos/$REPO/issues/comments/$TRIGGER_ID/reactions" \
 Optional focus: `@kody start-review focus on <area>`. A focus is a priority, not a
 filter. `@kody review --force` re-runs a skipped review. Use it only when the user
 asks.
+
+## §7 Closeout: every Kody thread with its class
+
+For a merged or closed PR. `ME` is the user that posts the loop's replies. GraphQL
+uses plain logins, without `[bot]`.
+
+```bash
+ME=$(gh api user --jq .login)
+gh api graphql --paginate -F owner="$OWNER" -F repo="$NAME" -F pr="$PR" -f query='
+query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){
+  repository(owner:$owner,name:$repo){pullRequest(number:$pr){
+    reviewThreads(first:100,after:$endCursor){
+      pageInfo{hasNextPage endCursor}
+      nodes{id isResolved path line originalLine
+        comments(first:50){nodes{databaseId author{login} body}}}}}}}' \
+  | jq --arg bot "$KODY_SLUG" --arg me "$ME" '.data.repository.pullRequest.reviewThreads.nodes[]
+    | select(.comments.nodes[0].author.login==$bot)
+    | .comments.nodes as $c
+    | ([$c[] | select(.author.login==$me)]) as $mine
+    | ([$mine[] | select(.body | startswith("@kody Yes,"))]) as $closeout
+    | ([$mine[] | select(.body | test("^(Fixed|Addressed) in "))]) as $fixed
+    | {id, isResolved, path, line: (.line // .originalLine),
+       commentId: $c[0].databaseId,
+       sha: ($fixed[0].body // "" | capture("in `?(?<s>[0-9a-f]{7,40})").s // null),
+       class: (if ($closeout|length) > 0 then "done"
+               elif ($fixed|length) > 0 then "fixed"
+               elif ($mine|length) > 0 then "declined"
+               elif .isResolved then "fixed"
+               else "unanswered" end),
+       kodyAfterCloseout: (if ($closeout|length) > 0
+         then ($c | (map(.databaseId) | index($closeout[-1].databaseId)) as $i
+               | .[$i+1:] | map(select(.author.login==$bot)) | last | .body[0:1000])
+         else null end)}'
+```
+
+A resolved thread with no reply from you is classed `fixed`: older loop versions
+resolved fixed threads without a reply, and Kodus resolves a thread itself when its
+check marks the suggestion implemented. In that second case Kody answers that no
+open issue matches, which is fine.
+
+Kody answers replies in its own threads, with or without a mention. The `@kody`
+prefix keeps the instruction explicit. Kody changes an issue only when your latest
+message tells it to, so phrase the reply as an instruction, not a question.
