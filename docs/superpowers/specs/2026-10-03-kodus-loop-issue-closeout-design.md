@@ -47,6 +47,9 @@ The user chose in-thread replies over a Kodus Team API key (no new secret).
 - **Open-PR offers.** While the PR is open, no Kody Issue exists. A Kody offer to
   mark an issue is added to the handled list and not answered.
 - Version 0.1.1 → 0.2.0 (new capability).
+- **Missing head check.** Absence does not establish an empty closeout. Recover
+  the bot login from the last 20 PRs and inspect older threads. If identity or
+  thread data cannot be confirmed, report manual follow-up with remediation.
 
 ## Talking with Kody
 

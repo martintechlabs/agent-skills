@@ -255,9 +255,15 @@ reaction does not change an issue's status.
 1. Read `closedAt` (`gh pr view "$PR" --json closedAt`). If the PR closed less than
    5 minutes ago, wait until 5 minutes have passed. Kodus creates the issues after
    the close.
-2. Get the bot login from §1 on the PR's head commit. If §1 is empty, Kodus never
-   reviewed this head: report "nothing to close out" and stop. Then list every Kody
-   thread with its closeout class (reference §7).
+2. Get the bot login from §1 on the PR's head commit. If that successful query is
+   empty, report "could not confirm from the head check" and use §0's last-20-PR
+   history lookup to recover the login. With a confirmed login, list every Kody
+   thread and its closeout class (§7), including threads from earlier commits.
+   If the login remains unconfirmed, post no status commands: report "check by
+   hand" and direct the user to check Kodus app access (§0's numbered fix steps)
+   and this PR's issues on the Kodus Issues page. A failed API command is not an
+   empty result: report the error, restore authentication/access or retry a
+   transient failure, and leave closeout unconfirmed until the reads succeed.
 3. For each thread, by class:
 
 | Class | Meaning | Reply |

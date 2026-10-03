@@ -19,3 +19,6 @@ Spec: `docs/superpowers/specs/2026-10-03-kodus-loop-issue-closeout-design.md`
    Keep late rebuttals pending across passes even when GitHub marks them resolved.
 10. Add executable jq regression tests, run shell syntax checks, repeat read-only
     checks on PR #46, and test the pending-finding scenario with a review agent.
+11. Kodus feedback: recover closeout identity from check history when the head has
+    no check. Test missing-head, missing-history, and API-failure scenarios before
+    and after the instruction change; uncertain evidence must not report success.
