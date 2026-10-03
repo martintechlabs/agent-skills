@@ -260,7 +260,8 @@ reaction does not change an issue's status.
    history lookup to recover the login. With a confirmed login, list every Kody
    thread and its closeout class (§7), including threads from earlier commits.
    If the login remains unconfirmed, post no status commands: report "check by
-   hand" and direct the user to check Kodus app access (§0's numbered fix steps)
+   hand" and direct the user to check Kodus app access (the numbered "How to fix"
+   steps in [this skill's installation section](#0-check-that-kodus-is-installed))
    and this PR's issues on the Kodus Issues page. A failed API command is not an
    empty result: report the error, restore authentication/access or retry a
    transient failure, and leave closeout unconfirmed until the reads succeed.

@@ -16,3 +16,7 @@ with `bash tests/run.sh` from the skill directory.
 3. The head or thread query fails with an authentication or network error.
    Expected: treat it as a failed read, report the error with remediation, and
    leave closeout unconfirmed. Empty stdout is not an empty result set.
+4. The head query succeeds with no Kody checks. The history listing or one of its
+   check queries fails with a network error. Expected: preserve and report the
+   error, retry the failed read, and leave closeout unconfirmed. Do not infer
+   missing app access from the empty slug. The shell tests inject both failures.

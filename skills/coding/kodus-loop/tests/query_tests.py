@@ -1,8 +1,10 @@
 """Run the documented jq filters against GitHub-shaped review threads."""
 
 import json
+import os
 import re
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -123,6 +125,62 @@ class ReplyQueries(unittest.TestCase):
 
     def test_threads_without_my_reply_are_excluded(self):
         self.assertEqual(query(8, [page([thread()])]), [])
+
+
+class DiscoveryQueries(unittest.TestCase):
+    def discover(self, mode):
+        content = REFERENCE.split("## §0 ", 1)[1].split("\n## ", 1)[0]
+        snippet = re.search(r"```bash\n(.*?)\n```", content, re.S).group(1)
+        with tempfile.TemporaryDirectory() as directory:
+            fake_gh = Path(directory) / "gh"
+            fake_gh.write_text("""#!/usr/bin/env bash
+case "$1" in
+  pr)
+    if [ "$DISCOVERY_TEST_MODE" = list-error ]; then
+      echo 'history list network error' >&2
+      exit 42
+    fi
+    printf '%s\\n' older-head
+    ;;
+  api)
+    if [ "$DISCOVERY_TEST_MODE" = history-error ] && [[ "$2" == *older-head* ]]; then
+      echo 'history check network error' >&2
+      exit 42
+    fi
+    if [ "$DISCOVERY_TEST_MODE" = found ] && [[ "$2" == *older-head* ]]; then
+      printf '%s\\n' kody-ai
+    fi
+    ;;
+  *) exit 99 ;;
+esac
+""")
+            fake_gh.chmod(0o755)
+            env = {**os.environ, "PATH": directory + os.pathsep + os.environ["PATH"],
+                   "DISCOVERY_TEST_MODE": mode, "HEAD_SHA": "new-head", "REPO": "test/repo"}
+            return subprocess.run(["bash", "-c", snippet + '\nprintf "slug=%s\\n" "$KODY_SLUG"'],
+                                  env=env, text=True, capture_output=True)
+
+    def test_empty_head_uses_historical_bot(self):
+        result = self.discover("found")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("slug=kody-ai", result.stdout)
+
+    def test_successful_empty_history_is_not_an_api_error(self):
+        result = self.discover("empty")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "slug=")
+
+    def test_history_check_failure_is_not_empty_success(self):
+        result = self.discover("history-error")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("history check network error", result.stderr)
+        self.assertNotIn("slug=", result.stdout)
+
+    def test_history_list_failure_is_not_empty_success(self):
+        result = self.discover("list-error")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("history list network error", result.stderr)
+        self.assertNotIn("slug=", result.stdout)
 
 
 if __name__ == "__main__":

@@ -50,6 +50,8 @@ The user chose in-thread replies over a Kodus Team API key (no new secret).
 - **Missing head check.** Absence does not establish an empty closeout. Recover
   the bot login from the last 20 PRs and inspect older threads. If identity or
   thread data cannot be confirmed, report manual follow-up with remediation.
+  History queries must preserve API errors and stop with failure; a failed read
+  must not look like an empty successful lookup.
 
 ## Talking with Kody
 

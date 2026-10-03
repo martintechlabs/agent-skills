@@ -22,3 +22,6 @@ Spec: `docs/superpowers/specs/2026-10-03-kodus-loop-issue-closeout-design.md`
 11. Kodus feedback: recover closeout identity from check history when the head has
     no check. Test missing-head, missing-history, and API-failure scenarios before
     and after the instruction change; uncertain evidence must not report success.
+12. Execute §0 against controlled `gh` failures for history listing and check
+    reads. Preserve stderr and fail the snippet on either error; verify the real
+    read-only lookup, and link remediation to the skill's installation section.

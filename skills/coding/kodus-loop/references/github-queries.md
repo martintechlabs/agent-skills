@@ -20,15 +20,28 @@ KODY_SLUG=kody-ai   # replace with app.slug from §1 once a Kody check run exist
 
 ## §0 Is Kodus installed?
 
-Prints the bot's app slug, or nothing when no Kody check run exists on this PR's
-head or the last 20 PR heads:
+Sets `KODY_SLUG` to the bot's app slug, or empty when successful reads find no Kody
+check on this PR's head or the last 20 PR heads. API errors stay visible and stop
+the Bash snippet with failure. Handle that error before continuing the workflow.
 
 ```bash
-KODY_SLUG=$( { echo "$HEAD_SHA"; gh pr list -R "$REPO" --state all --limit 20 --json headRefOid -q '.[].headRefOid'; } \
-  | while read -r sha; do
-      gh api "repos/$REPO/commits/$sha/check-runs?check_name=Kody%20Code%20Review" \
-        --jq '.check_runs[0].app.slug // empty' 2>/dev/null
-    done | head -n 1 )
+RECENT_HEADS=$(gh pr list -R "$REPO" --state all --limit 20 --json headRefOid -q '.[].headRefOid') || {
+  printf '%s\n' 'Kody history listing failed; fix the reported error and retry.' >&2
+  exit 1
+}
+KODY_SLUG=""
+while IFS= read -r sha; do
+  [ -n "$sha" ] || continue
+  KODY_SLUG=$(gh api "repos/$REPO/commits/$sha/check-runs?check_name=Kody%20Code%20Review" \
+    --jq '.check_runs[0].app.slug // empty') || {
+    printf '%s\n' 'Kody check lookup failed; fix the reported error and retry.' >&2
+    exit 1
+  }
+  if [ -n "$KODY_SLUG" ]; then break; fi
+done <<EOF
+${HEAD_SHA:-}
+$RECENT_HEADS
+EOF
 ```
 
 GitHub does not let a normal `gh` login list a repository's app installations
