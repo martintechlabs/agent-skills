@@ -129,8 +129,8 @@ Post at most one trigger per pass. Never post a trigger while a Kody check run o
    ("I verified the fix…"); add that `lastReplyId` to the handled list. When Kody
    disagrees, reconsider the thread in D, then add its `lastReplyId` to the list.
    Only a `lastReplyId` not on the list is new. When Kody offers to mark a Kody
-   Issue resolved ("say the word"), add the id to the list and do not answer: no
-   Kody Issue exists while the PR is open. The closeout answers it.
+   Issue resolved ("say the word"), add the id to the list and do not answer. While
+   the PR is open, this PR's issues do not exist yet. The closeout answers it.
 
 ### C. Exit check
 
@@ -209,8 +209,9 @@ reaction does not change an issue's status.
 1. Read `closedAt` (`gh pr view "$PR" --json closedAt`). If the PR closed less than
    5 minutes ago, wait until 5 minutes have passed. Kodus creates the issues after
    the close.
-2. List every Kody thread with its closeout class (reference §7). Get the bot login
-   from §1 on the PR's head commit.
+2. Get the bot login from §1 on the PR's head commit. If §1 is empty, Kodus never
+   reviewed this head: report "nothing to close out" and stop. Then list every Kody
+   thread with its closeout class (reference §7).
 3. For each thread, by class:
 
 | Class | Meaning | Reply |
