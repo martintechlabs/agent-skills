@@ -214,11 +214,7 @@ query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){
                elif ($fixed|length) > 0 then "fixed"
                elif ($mine|length) > 0 then "declined"
                elif .isResolved then "fixed"
-               else "unanswered" end),
-       kodyAfterCloseout: (if ($closeout|length) > 0
-         then ($c | (map(.databaseId) | index($closeout[-1].databaseId)) as $i
-               | .[$i+1:] | map(select(.author.login==$bot)) | last | .body[0:1000])
-         else null end)}'
+               else "unanswered" end)}'
 ```
 
 A resolved thread with no reply from you is classed `fixed`: older loop versions
@@ -229,3 +225,33 @@ open issue matches, which is fine.
 Kody answers replies in its own threads, with or without a mention. The `@kody`
 prefix keeps the instruction explicit. Kody changes an issue only when your latest
 message tells it to, so phrase the reply as an instruction, not a question.
+
+## §8 Kody's answer to your newest reply
+
+For every Kody thread you replied in: your newest reply, how many replies you
+posted, and Kody's newest answer after it (`null` until Kody answers). Uses the same
+setup and `ME` as §7.
+
+```bash
+gh api graphql --paginate -F owner="$OWNER" -F repo="$NAME" -F pr="$PR" -f query='
+query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){
+  repository(owner:$owner,name:$repo){pullRequest(number:$pr){
+    reviewThreads(first:100,after:$endCursor){
+      pageInfo{hasNextPage endCursor}
+      nodes{id isResolved path line originalLine
+        comments(first:50){nodes{databaseId author{login} body}}}}}}}' \
+  | jq --arg bot "$KODY_SLUG" --arg me "$ME" '.data.repository.pullRequest.reviewThreads.nodes[]
+    | select(.comments.nodes[0].author.login==$bot)
+    | .comments.nodes as $c
+    | ([$c | to_entries[] | select(.value.author.login==$me) | .key]) as $mine
+    | select($mine | length > 0)
+    | ([$c[($mine[-1]+1):][] | select(.author.login==$bot)] | last) as $answer
+    | {id, isResolved, path, line: (.line // .originalLine),
+       myReplies: ($mine | length),
+       myLastReply: $c[$mine[-1]].body[0:300],
+       answerId: $answer.databaseId,
+       answer: ($answer.body // null | if . then .[0:2000] else null end)}'
+```
+
+Poll until every thread you just replied in has an `answerId` that is not on your
+handled list, or 5 minutes pass. `myReplies` counts toward the 3-reply limit.

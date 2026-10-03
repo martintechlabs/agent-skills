@@ -11,4 +11,6 @@ Spec: `docs/superpowers/specs/2026-10-03-kodus-loop-issue-closeout-design.md`
 5. references §7: closeout query. Verify read-only on merged PR #46 and on a
    synthetic fixture covering every class.
 6. Bump 0.1.1 → 0.2.0; update README row.
-7. Live closeout run on a real merged PR (posts comments; needs user OK).
+7. Talking with Kody section + reference §8; replies carry evidence; closeout
+   reply carries the issue lookup hint. Verify §8 on PR #46 and the fixture.
+8. Live closeout run on a real merged PR (posts comments; needs user OK).

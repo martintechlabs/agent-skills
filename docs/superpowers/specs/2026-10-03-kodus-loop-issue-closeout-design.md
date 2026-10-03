@@ -20,6 +20,11 @@ the Kodus Issues UI. Resolving a GitHub thread does not change any Kodus state.
 - Kody's conversation agent has `KODUS_UPDATE_KODY_ISSUE_STATUS`. It only **offers**
   the write ("say the word") and acts only when the developer's latest message
   instructs it. Kody answers replies in its own threads.
+- Kody's chat gets the issue tools and the thread's file path and PR number, but
+  not an issue id. Seen live on PR #46 (open at the time): Kody tried to update the
+  issue, passed the comment id, and the tool failed ("the comment id isn't the
+  issue id"). The closeout reply therefore tells Kody to look the issue up with
+  `KODUS_LIST_KODY_ISSUES` first.
 - No webhook code acts on 👍 reactions for issue status. Reactions feed fine-tuning
   only.
 
@@ -41,6 +46,16 @@ The user chose in-thread replies over a Kodus Team API key (no new secret).
 - **Open-PR offers.** While the PR is open, no Kody Issue exists. A Kody offer to
   mark an issue is added to the handled list and not answered.
 - Version 0.1.1 → 0.2.0 (new capability).
+
+## Talking with Kody
+
+A single reply is not enough. Kody answers each reply in its threads: it verifies,
+disputes, asks a question, or offers to act. The skill reads that answer (reference
+§8) and responds to it: evidence on a dispute, an answer to a question, an explicit
+instruction on an offer (closeout only), the lookup hint when an update fails. At
+most 3 replies per thread per run; after that the thread is reported as disputed.
+In the loop, a thread stays unresolved while Kody still disagrees, so the next pass
+picks it up.
 
 ## Rejected
 

@@ -125,12 +125,9 @@ Post at most one trigger per pass. Never post a trigger while a Kody check run o
    finding. A suggestion with no inline thread is still a finding.
 4. Look for Kody replies: the same §2 query also returns resolved Kody threads
    whose last comment is a Kody reply (`rebuttal: true`). Kody answers inside the
-   thread and does not reopen it. Read `lastReply`. Kody often confirms a fix
-   ("I verified the fix…"); add that `lastReplyId` to the handled list. When Kody
-   disagrees, reconsider the thread in D, then add its `lastReplyId` to the list.
-   Only a `lastReplyId` not on the list is new. When Kody offers to mark a Kody
-   Issue resolved ("say the word"), add the id to the list and do not answer. While
-   the PR is open, this PR's issues do not exist yet. The closeout answers it.
+   thread and does not reopen it. Read `lastReply` and handle it with
+   [Talking with Kody](#talking-with-kody-in-a-thread). Only a `lastReplyId` not on
+   the handled list is new.
 
 ### C. Exit check
 
@@ -146,10 +143,9 @@ For each finding, read the code in context and decide:
   suggested code is acceptable, use it. Kodus compares each push with the
   suggestion, and a fix in a different shape can stay "not implemented" and become
   an Open Kody Issue.
-- **False positive or won't fix:** do not change code. Reply on the thread with a
-  one-to-two sentence reason (reference §5).
+- **False positive or won't fix:** do not change code. You reply in step E.
 - **Outdated thread** (`isOutdated: true`): check if the current code still has the
-  problem. If it does not, reply "Addressed in <sha>" and resolve the thread. If it
+  problem. If it does not, treat it as fixed in the commit that removed it. If it
   does, treat it as Valid.
 - **PR-level suggestion:** fix it, or decline it in the final report. You cannot
   resolve it; add its id to the handled list either way.
@@ -164,14 +160,51 @@ broken code to get another review.
 2. Stage only the files you changed: `git add <paths>`. Do not use `git add -A`.
    Then commit: `git commit -m "fix: address Kodus review feedback (kodus-loop pass N)"`.
 3. `git push`
-4. On each Kody thread you fixed, reply `Fixed in <short sha>.` (reference §5).
-   The closeout uses this reply to tell fixed threads from declined ones.
-5. Resolve each Kody thread you fixed or answered (reference §5). Resolve a thread
-   only after its fix is pushed and its reply is posted.
+4. Reply on each Kody thread you handled (reference §5). Give Kody enough evidence
+   to check the fix itself, the way a reviewer would want it:
+   - Fixed: `Fixed in <short sha>. <what changed, with path:line>. <the test that
+     covers it, or how you checked it>.` Start with `Fixed in`; the closeout uses
+     it to tell fixed threads from declined ones.
+   - Declined: one or two sentences with the concrete reason (the code, a caller, a
+     config, or a convention that makes the finding wrong).
+5. Wait for Kody's answers and respond with
+   [Talking with Kody](#talking-with-kody-in-a-thread). Resolve a thread when Kody
+   agrees, or when it does not answer in time. Leave it unresolved when Kody still
+   disagrees; the next pass picks it up in B.
 6. Go back to A. A push does not start a review, so step A posts the next
    trigger.
 
 One review per fix batch: commit all fixes for the pass, then push once.
+
+## Talking with Kody in a thread
+
+Kody answers replies in its own review threads, with or without `@kody`. A reply
+is the start of a short exchange, not the end of the thread. Kody's answer tells you
+if it accepts the fix or the reason. Read it and answer what it actually says.
+
+1. After you post, poll every 30 s for up to 5 minutes for a Kody reply after your
+   newest reply in each thread (reference §8). Post all of a pass's replies first,
+   then poll them together.
+2. Read Kody's answer and act on it:
+
+| Kody's answer | Your response |
+| ------------- | ------------- |
+| Agrees: verified the fix, accepts the reason | Done. Resolve the thread (loop only). |
+| Offers to change a Kody Issue ("would you like me to mark it resolved?", "say the word") | Loop: Kody agrees, so treat it as agreement. Do not say yes: this PR's issues do not exist until it closes, and an attempt fails (seen live: "the comment id isn't the issue id"). Closeout: say yes as an instruction, with the lookup (below). |
+| Says the problem is still there, or only partly fixed | Check its claim in the code. If it is right, the finding is Valid again: leave the thread unresolved for the next pass (loop), or report it (closeout). If it is wrong, reply once with stronger evidence: the exact `path:line`, the test name, or the command output. |
+| Asks a question ("which line?", "what about X?") | Answer it with the concrete fact. |
+| Says no open Kody Issue matches (closeout) | Done. Kodus already counts the suggestion as implemented. |
+| Says the status update failed, or it could not find the issue (closeout) | Reply with the lookup again, and add the file, the PR number, and the first line of the finding. The usual cause is that Kody passed the comment id as the issue id. |
+| No answer in 5 minutes | Loop: resolve and note "Kody did not answer". Closeout: report it to check by hand. |
+
+3. To make Kody act, write an instruction, not a question. Kody changes a Kody Issue
+   only when your latest message tells it to. Good: `@kody Yes, mark the Kody issue
+   for this finding as resolved now.` Not good: `Could you resolve this?`
+4. Post at most 3 replies of your own per thread in one run, counting the first. If
+   Kody still has not agreed, stop the exchange and report the thread as disputed
+   with Kody's last point. Never argue in circles; a third unchanged reason will
+   not convince it.
+5. Add each Kody reply id you handled to the handled list.
 
 ## Teaching Kody
 
@@ -216,17 +249,23 @@ reaction does not change an issue's status.
 
 | Class | Meaning | Reply |
 | ----- | ------- | ----- |
-| `fixed` | Your `Fixed in` / `Addressed in` reply, or resolved with no reply from you | `@kody Yes, mark the Kody issue for this finding as resolved. It was fixed in <sha>.` |
-| `declined` | You replied with a reason | `@kody Yes, dismiss the Kody issue for this finding. <one-sentence reason>` |
+| `fixed` | Your `Fixed in` / `Addressed in` reply, or resolved with no reply from you | `@kody Yes, mark the Kody issue for this finding as resolved now. It was fixed in <sha>. <LOOKUP>` |
+| `declined` | You replied with a reason | `@kody Yes, dismiss the Kody issue for this finding now. <one-sentence reason> <LOOKUP>` |
 | `unanswered` | Unresolved, no reply from you | None. List it in the report. |
-| `done` | A closeout reply is already there | None. |
+| `done` | A closeout reply is already there (an earlier closeout run) | None. Continue the exchange from Kody's newest answer in step 4. |
 
-   Use the `<sha>` from your earlier reply when there is one; otherwise omit that
-   sentence. Post each reply with §5. Post at most one closeout reply per thread.
-4. Poll every 30 s for up to 5 minutes for a Kody reply after yours in each thread
-   (§7 `kodyAfterCloseout`). Kody may confirm, say that no open issue matches (Kodus
-   already marked the suggestion implemented), or ask a question. Do not answer a
-   second time. Report it.
+   `<LOOKUP>` tells Kody how to find the issue. The thread's comment id is not the
+   issue id, and Kody fails when it uses it. Write: `The comment id is not the issue
+   id: find the open issue with KODUS_LIST_KODY_ISSUES (repository <name>, file
+   <path>, from PR #<n>, "<finding title>") and update it with
+   KODUS_UPDATE_KODY_ISSUE_STATUS.` Use the `<sha>` from your earlier reply when
+   there is one; otherwise omit that sentence. Post each reply with §5.
+4. Wait for Kody's answers and respond with
+   [Talking with Kody](#talking-with-kody-in-a-thread) until Kody confirms that it
+   changed the issue, says no open issue matches, or the reply limit is reached. A
+   thread counts as closed out only when Kody says it changed the issue (or that
+   none is open). "I can do that" is not a confirmation: answer it with the
+   instruction.
 5. Do not resolve, unresolve, or edit any thread in the closeout.
 
 Report:
@@ -236,7 +275,7 @@ Kodus closeout complete.
   PR:            #123 (merged)
   Resolved:      4 (Kody confirmed)
   Dismissed:     1 (Kody confirmed)
-  Check by hand: 2  (no answer or not confirmed: path:line, ...)
+  Check by hand: 2  (no answer, disputed, or not confirmed: path:line, Kody's last point)
   Unanswered:    0
 ```
 
