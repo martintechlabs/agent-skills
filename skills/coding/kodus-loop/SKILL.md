@@ -14,7 +14,7 @@ description: >-
   the repository reviews with Greptile.
 metadata:
   author: stephen-martin
-  version: "0.2.1"
+  version: "0.2.2"
 ---
 
 # Kodus Loop
@@ -253,9 +253,6 @@ When the pass limit stops the loop after a push, say that the last push was neve
 reviewed. When stopped early, list every remaining finding as
 `path:line [severity] one-line summary`, and give the next step (for example: assign
 a Kodus license, add the base branch to Kody's config, split the PR).
-
-End every loop report with: `After the PR merges, run the Kodus loop on it again to
-close its Kody Issues.`
 
 ## Closeout (merged or closed PR)
 
