@@ -47,8 +47,8 @@ GitHub:
 
 ```bash
 for n in $(gh pr list --state all --limit 20 --json number -q '.[].number'); do
-  gh api "repos/{owner}/{repo}/issues/$n/comments" --jq '.[].user.login'
-  gh api "repos/{owner}/{repo}/pulls/$n/reviews" --jq '.[].user.login'
+  gh api --paginate "repos/{owner}/{repo}/issues/$n/comments" --jq '.[].user.login'
+  gh api --paginate "repos/{owner}/{repo}/pulls/$n/reviews" --jq '.[].user.login'
 done | grep -qE '^greptile-apps(-staging)?\[bot\]$'
 ```
 
@@ -102,8 +102,11 @@ These rules override greploop where they differ:
   resolve it to reach greploop's exit condition. Report it as a blocker.
 - **Accept a score below 5/5** when the only remaining items are rejected or
   pending a decision. Do not change correct code to raise the score.
-- **Stage only the files you changed.** greploop commits with `git add -A`.
-  Stage explicit paths instead, so unrelated changes stay out of the commit.
+- **Stage only your fixes.** greploop commits with `git add -A`. Stage
+  explicit paths instead. If a file you must change already has uncommitted
+  user edits, stop and ask before editing it. Before each commit, check that
+  `git diff --cached` contains only your fixes, with no files that were
+  already staged.
 
 ## Validate every review finding
 
