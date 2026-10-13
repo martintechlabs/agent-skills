@@ -33,7 +33,33 @@ or architectural decision.
   uncommitted changes.
 - Ensure the existing `/greploop` skill is available. If it is unavailable,
   stop and report the missing prerequisite.
+- Confirm that Greptile reviews this repository (below).
 - Follow repository instructions and applicable approval requirements.
+
+### Confirm Greptile is installed
+
+Without Greptile on the repository, greploop waits for a review that never
+arrives. Look for a Greptile bot comment or review on the target PR or the
+last 20 PRs. Do not rely on a Greptile check run: Greptile-reviewed PRs often
+have none.
+
+GitHub:
+
+```bash
+for n in $(gh pr list --state all --limit 20 --json number -q '.[].number'); do
+  gh api "repos/{owner}/{repo}/issues/$n/comments" --jq '.[].user.login'
+  gh api "repos/{owner}/{repo}/pulls/$n/reviews" --jq '.[].user.login'
+done | grep -qE '^greptile-apps(-staging)?\[bot\]$'
+```
+
+On GitLab or Perforce, look for notes by the Greptile bot user on recent
+MRs or reviews.
+
+- **Found:** continue.
+- **Not found:** this does not prove Greptile is absent. It may have been
+  installed after the last reviewed PR. Tell the user that Greptile could not
+  be confirmed and ask whether it is installed. On a yes, continue. On a no,
+  or when no user is available to ask, stop before the review loop.
 
 ## Establish implementation context
 
@@ -63,6 +89,21 @@ constraints.
 
 Do not optimize for a review score at the expense of correctness,
 requirements, or architecture.
+
+These rules override greploop where they differ:
+
+- **Close every thread you do not fix with a reply.** greploop resolves
+  false positives silently. Instead, reply in the thread with the reason
+  (false positive, or optional improvement out of scope), then resolve it.
+  A rejected comment must not stay open only to block greploop's
+  zero-unresolved exit.
+- **Leave decision threads open.** A finding that needs user input (see
+  "Escalate product and architectural decisions") stays unresolved. Do not
+  resolve it to reach greploop's exit condition. Report it as a blocker.
+- **Accept a score below 5/5** when the only remaining items are rejected or
+  pending a decision. Do not change correct code to raise the score.
+- **Stage only the files you changed.** greploop commits with `git add -A`.
+  Stage explicit paths instead, so unrelated changes stay out of the commit.
 
 ## Validate every review finding
 
