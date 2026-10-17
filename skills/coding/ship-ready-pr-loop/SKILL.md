@@ -1,6 +1,6 @@
 ---
 name: ship-ready-pr-loop
-description: Use when hardening a completed change or pull request through iterative review until it is ready to ship.
+description: Use when hardening a completed change or pull request through iterative review until it is ready to ship. Prefer shipit when a PR already exists and only needs its Greptile review addressed.
 metadata:
   author: stephen-martin
   version: "0.9.0"
