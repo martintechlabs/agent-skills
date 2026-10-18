@@ -37,6 +37,18 @@ Do these first. Do nothing else until a PR exists.
 - The PR must be on GitHub, because every step uses `gh`. On GitLab or
   Perforce, stop and report that shipit is GitHub-only.
 - Confirm the local repository and branch correspond to the target PR.
+- The PR must be open. Read `gh pr view <PR> --json number,state,headRefOid`.
+  If `state` is not `OPEN`, stop and report. Use the PR number, not a URL, in
+  every later command.
+- The local branch must contain the PR head:
+
+  ```bash
+  git fetch origin "pull/<PR_NUMBER>/head" &&
+  git merge-base --is-ancestor <headRefOid> HEAD
+  ```
+
+  If this fails, the local branch is behind the PR or has diverged. Stop and
+  report. Never pull, reset, or force-push over local work.
 - Inspect the working tree. Do not overwrite, discard, or include unrelated
   uncommitted changes.
 - Confirm Codex is installed and signed in (`codex login status`). If not,
@@ -76,9 +88,10 @@ codex exec review --base "origin/$BASE" -o <scratch file>
 If the base does not resolve, stop and report a blocker. Never substitute
 `main` or another default branch.
 
-- Codex reviews the branch, and `--base` takes no prompt. A finding on a
-  line outside the PR diff (`git diff "origin/$BASE...HEAD"`) is out of
-  scope. Unrelated user edits are not part of the PR.
+- `--base` takes no prompt, and Codex also reads uncommitted edits to
+  tracked files. A finding caused only by uncommitted edits is out of scope,
+  because those edits are not part of the PR. A finding about code that the
+  PR breaks elsewhere is in scope.
 - Classify each finding as Critical, Major, Minor, or lower. Validate it
   under "Validate every review finding". Fix only validated Critical and
   Major defects. List the rest in the report.
@@ -183,9 +196,11 @@ These rules override greploop where they differ:
 - **Run greploop as a skill.** Never run it as a shell command.
 - **Reuse a current review.** Greptile reviews cost money. Before every pass,
   run the check below.
-- **Request one review per fix batch.** Commit and push fixes as you make
-  them. Request the next review only after every fix for the current findings
-  is committed, pushed, and validated. Never request a review per commit.
+- **Request one review per fix batch.** Commit fixes as you make them, and
+  push once per batch. On a repository that reviews every push, each push
+  starts a paid review. Request the next review only after every fix for the
+  current findings is committed, pushed, and validated. Never request a
+  review per commit.
 - **Stop after 5 passes.** A pass that reuses a review counts.
 - **Treat a timeout with care.** greploop waits about 10 minutes for a
   Greptile check run, and many repositories have none. On a timeout, run the
@@ -224,7 +239,9 @@ fi
 A score line means a summary covers `HEAD_SHA`. A summary that names
 another commit is stale, so the check prints no score for it.
 
-1. **Local HEAD is not the PR head:** push, then run the check again.
+1. **Local HEAD is not the PR head:** the local branch is ahead (the
+   prerequisites rule out behind). Push, never force-push, then run the check
+   again.
 2. **Check run `queued` or `in_progress`:** a review is running. Do not
    request one. Let greploop wait, then run the check again.
 3. **Check run `completed` but not `success`:** that is not a review. A
