@@ -90,7 +90,10 @@ git fetch origin "$BASE"
 REVIEW_DIR=$(mktemp -d)
 git worktree add --detach "$REVIEW_DIR" HEAD
 (cd "$REVIEW_DIR" && codex exec review --base "origin/$BASE" -o <absolute scratch file>)
+CODEX_STATUS=$?
 git worktree remove --force "$REVIEW_DIR"
+echo "codex exit status: $CODEX_STATUS"
+[ "$CODEX_STATUS" -eq 0 ]   # the block fails when Codex failed, not when cleanup did
 ```
 
 If the base does not resolve, stop and report a blocker. Never substitute
@@ -234,11 +237,21 @@ else
     --jq '.check_runs[] | select(.app.slug | test("^greptile-apps(-staging)?$")) | "check run: \(.status) \(.conclusion)"'
   # Greptile writes its summary to the PR description or to its latest PR comment.
   DESCRIPTION=$(gh pr view "$PR" --json body -q .body)
+  # Anyone with write access can edit the description; trust it only if Greptile edited it last.
+  LAST_EDITOR=$(gh api graphql -F owner='{owner}' -F repo='{repo}' -F pr="$PR" -f query='
+    query($owner: String!, $repo: String!, $pr: Int!) {
+      repository(owner: $owner, name: $repo) { pullRequest(number: $pr) {
+        userContentEdits(first: 100) { nodes { editedAt editor { login } } } } } }' \
+    --jq '.data.repository.pullRequest.userContentEdits.nodes | max_by(.editedAt) | .editor.login // empty')
   COMMENT=$(gh api --paginate "repos/{owner}/{repo}/issues/$PR/comments?per_page=100" |
     jq -rs 'add | map(select((.user.login | test("^greptile-apps(-staging)?\\[bot\\]$")) and (.body | contains("greptile_confidence_score"))))
             | sort_by(.updated_at) | last | .body // empty')
   for SRC in description comment; do
     if [ "$SRC" = description ]; then
+      if ! printf '%s\n' "$LAST_EDITOR" | grep -qE '^greptile-apps(-staging)?$'; then
+        echo "description: not trusted (last edited by ${LAST_EDITOR:-unknown})"
+        continue
+      fi
       # Only Greptile's block: the rest of the description is the author's prose.
       TEXT=$(printf '%s\n' "$DESCRIPTION" |
         sed -n '/^<!-- greptile_comment -->$/,/^<!-- \/greptile_comment -->$/p')
@@ -262,22 +275,22 @@ another commit is stale, so the check prints no score for it.
 2. **Check run `queued` or `in_progress`:** a review is running. Do not
    request one. Let greploop wait, then run the check again.
 3. **Check run `completed` as `cancelled`, `timed_out`, or `skipped`:**
-   that is not a review. Greptile marks a finished review that has findings
-   as `failure`, so `failure` with a score still counts.
-4. **Score printed from a source Greptile wrote:** reuse it. Tell greploop
-   to read those results and not to post `@greptile review`. A `comment:`
-   score counts, because the comment's author is the Greptile bot. A
-   `description:` score counts only with a completed Greptile check run.
-   The PR author can edit the description, so a score there alone is not
-   proof of a review.
+   that is not a review. Greptile marks a finished review that scores below
+   the repository's threshold as `failure`, so `failure` with a score still
+   counts.
+4. **Score printed:** reuse it. Tell greploop to read those results and not
+   to post `@greptile review`. A `comment:` score counts, because the
+   comment's author is the Greptile bot. A `description:` score is printed
+   only when Greptile made the latest edit to the description. If anyone
+   edited it after Greptile, the check prints "not trusted", and the score
+   there does not count.
 5. **Otherwise:** request a new review. Right after a push, first run the
    check every 10 seconds for up to 2 minutes. A running check run or a
    score for `HEAD_SHA` means an automatic review exists, so do not request
    one.
 
 The check keys on the summary, not on the check run, because many
-Greptile-reviewed PRs have no check run. On such a PR, a score only in the
-description does not count, so the check requests a new review. Known limit: on a repository that
+Greptile-reviewed PRs have no check run. Known limit: on a repository that
 reviews every push and has no check run, nothing shows until the summary
 posts. A review that takes longer than 2 minutes then gets a second,
 paid request. Greptile's manual-only setting (`"autoReview": []`) avoids

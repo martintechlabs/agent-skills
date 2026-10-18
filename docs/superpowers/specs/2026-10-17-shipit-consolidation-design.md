@@ -179,10 +179,15 @@ bash snippet. Codex and greploop are not run live in this change.
   (Greptile finding on PR #53).
 - The reuse check trusts only sources Greptile wrote: a check run whose app is
   `greptile-apps`, and comments by `greptile-apps[bot]`. The PR author can edit
-  the description, so a description score counts only with a Greptile check
-  run. Greptile marks a finished review that has findings as `failure` (PR #53:
-  `completed failure` with a 1/5 summary), so `failure` is still a review
-  (Greptile finding on PR #53).
+  the description, so a description score counts only when the latest entry in
+  its edit history (`userContentEdits`) is by `greptile-apps`. A check run does
+  not authenticate the description text (Greptile and Codex findings on PR
+  #53). Greptile marks a review below the repository's score threshold as
+  `failure` (check title "Confidence 1/5 — below your required 3/5"), so
+  `failure` is still a review.
+- Codex's exit status must survive the worktree cleanup (Greptile and Codex
+  findings on PR #53). The live Codex run on PR #53 worked end to end in a
+  temporary worktree.
 - `gh pr view` returns merged and closed PRs (`"state":"MERGED"` for PR #52).
   shipit requires `OPEN`, and requires the local branch to contain the PR head
   (`git merge-base --is-ancestor`).
