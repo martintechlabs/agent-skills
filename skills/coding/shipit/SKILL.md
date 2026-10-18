@@ -6,11 +6,11 @@ description: >-
   intended behavior and architecture. Do not merge, deploy, or release without
   explicit approval. Use when the user says "shipit", "ship this PR", "get this PR
   ready to ship", or wants a Greptile-reviewed PR brought to a verified,
-  review-ready state. Use ship-ready-pr-loop or kodus-loop instead when the
-  repository reviews with Kodus.
+  review-ready state. Use ship-ready-pr-loop instead when the change has no PR
+  yet or needs its own code review and fix pass before Greptile.
 metadata:
   author: stephen-martin
-  version: "0.1.0"
+  version: "0.1.1"
 ---
 
 # Shipit

@@ -1,9 +1,9 @@
 ---
 name: ship-ready-pr-loop
-description: Use when hardening a completed change or pull request through iterative review until it is ready to ship.
+description: Use when hardening a completed change or pull request through iterative review until it is ready to ship. Prefer shipit when a PR already exists and only needs its Greptile review addressed.
 metadata:
   author: stephen-martin
-  version: "0.8.0"
+  version: "0.9.0"
 ---
 
 # Ship-Ready PR Loop
@@ -17,9 +17,10 @@ The goal is:
 1. Select the strongest available review mechanism.
 2. Fix all valid Critical and Major issues.
 3. Create or update the PR.
-4. Run the `kodus-loop` skill until it completes or reaches its pass limit.
+4. Run `/greploop`.
+5. Iterate until Greploop reaches 5/5 or the maximum pass count is reached.
 
-Keep the work narrow. Do not perform broad cleanup, style refactors, architecture rewrites, or low-priority fixes unless they directly resolve a Critical/Major issue or are required to complete the Kodus loop.
+Keep the work narrow. Do not perform broad cleanup, style refactors, architecture rewrites, or low-priority fixes unless they directly resolve a Critical/Major issue or are required for Greploop 5/5.
 
 ## Workflow
 
@@ -32,11 +33,6 @@ Before making changes:
 - Identify the project's validation commands: tests, typecheck, lint, and build.
 
 If commands are not obvious, inspect package files, CI config, Makefiles, README files, or project docs.
-
-Check that Kodus is installed on the repository with kodus-loop's install check (its step 0, reference §0). The check reads Kody check runs, and Kodus creates them only on pushes to a PR.
-
-- **Kody check run found** on the current branch's PR or the last 20 PRs: Kodus is installed. Continue.
-- **None found:** with no PR yet, there is no `HEAD_SHA`, so run §0 over the last 20 PRs only. Missing check runs do not prove that Kodus is absent: an app installed after the last PR push leaves no check run until the next push. Tell the user that Kodus could not be confirmed, give kodus-loop's numbered fix steps (not its "not installed" message), and ask whether Kodus is installed now. On a yes, continue: step 7 pushes before kodus-loop runs, and kodus-loop's step 0 checks again after that push and stops if Kodus is still missing. On a no, or if no user is available to ask (an unattended run), stop before any review work.
 
 ### 2. Select the review mechanism
 
@@ -181,21 +177,64 @@ The PR description must include:
 
 Use a concise PR title that describes the actual risk reduced.
 
-### 7. Run the Kodus loop
+### 7. Run Greploop
 
-Invoke the `kodus-loop` skill. Never run it as a shell command.
+Invoke `/greploop` as the Greploop skill or slash action. Never run it as a shell command.
 
-The Kodus loop is a hard acceptance gate. It passes when Kody's review of the PR head commit is complete and no Kody review thread is unresolved. Kody gives no score.
+Greploop is a hard acceptance gate.
 
-Push every local commit before you invoke it: `git rev-parse HEAD` must equal the PR's `headRefOid`. Automatic Kodus reviews are normally off, so kodus-loop triggers each review itself and reuses a completed review of the head commit when one exists. Do not post `@kody start-review` yourself.
+Target score: **5/5**
 
-Fix every valid Kody finding. Do not resolve threads to pass the gate: fix the underlying issue, or reply with the reason a finding is wrong.
+Review all Greploop findings. Fix anything required to reach 5/5. Do not game the score; fix the underlying issue.
 
-### 8. Let the Kodus loop iterate
+Greptile reviews are expensive. Before every Greploop pass, reuse a completed review of the current head commit instead of requesting another. Run this check from the top each time; if local commits are unpushed, it stops, and you push and run it again:
 
-kodus-loop runs its own review, fix, and push passes, at most 5. One review per fix batch. Do not restart it after it stops at its pass limit; report the remaining blockers instead. If it stops because Kodus did not respond, skipped the review, or failed twice, the gate cannot pass: stop and report that as a blocker. Do not fall back to another reviewer for this gate.
+```bash
+HEAD_SHA=$(gh pr view <PR_NUMBER> --json headRefOid -q .headRefOid)
+if [ "$HEAD_SHA" != "$(git rev-parse HEAD)" ]; then
+  echo "Local HEAD is not the PR head. Push, then rerun this check." >&2
+else
+  gh api --paginate "repos/{owner}/{repo}/commits/$HEAD_SHA/check-runs?per_page=100" \
+    --jq '.check_runs[] | select(.name | test("greptile"; "i")) | "\(.status) \(.conclusion)"'
+  # Greptile writes its summary to the PR description or to one of its PR comments.
+  {
+    gh pr view <PR_NUMBER> --json body -q .body
+    gh api --paginate "repos/{owner}/{repo}/issues/<PR_NUMBER>/comments" |
+      jq -rs 'add | map(select((.user.login | test("greptile"; "i")) and (.body | contains("greptile_confidence_score"))))
+              | sort_by(.updated_at) | last | .body // empty'
+  } | grep -o 'greptile_confidence_score:[0-9]\|Last reviewed commit:.*/commit/[0-9a-f]\{40\}'
+fi
+```
 
-After each Kodus fix batch, rerun relevant validation commands before the push.
+If the check run is `queued` or `in_progress`, a review of `HEAD_SHA` is already running. Do not request another; let Greploop wait for it, then run this check again. If the repository reviews on push and no Greptile check run exists yet right after a push, recheck every 10 seconds for up to 2 minutes before treating the check as absent; the automatic review may still be registering.
+
+Reuse the review only when all of these hold:
+
+- The Greptile check run on `HEAD_SHA` is `completed` with conclusion `success`. A cancelled, timed-out, skipped, or failed check is not a review.
+- A Greptile summary (in the PR description or a Greptile PR comment) shows a confidence score, and its `Last reviewed commit` link ends in `HEAD_SHA`. A score that names another commit is stale.
+
+When both hold, invoke Greploop with the instruction to read those results and not post a new `@greptile review` trigger. When no review of `HEAD_SHA` is running or reusable, request a new review.
+
+A pass that reuses a current review counts toward the pass limit.
+
+### 8. Repeat the Greploop loop
+
+Repeat the Greploop skill or slash action, then fix remaining issues.
+
+Request at most one review per fix batch. Commit and push fixes as you make them, but request the next review only after every fix for the current findings is committed, pushed, and validated. Never request a review per commit. With manual-only Greptile reviews (`"autoReview": []`), pushes start no reviews. If the repository still reviews on push, push once per pass so each push maps to one review, and let the reuse check in step 7 pick up that review instead of requesting another.
+
+Stage only your fixes. Greploop commits with `git add -A`; stage explicit paths instead. Before each commit, check that `git diff --cached` contains only your fixes.
+
+Stop when either:
+
+- Greploop reports 5/5, or
+- 5 total Greploop passes have been completed.
+
+Maximum Greploop passes: **5**
+
+If Greploop times out waiting for Greptile, the gate cannot pass: stop and report that as a blocker. Do not fall back to another reviewer for this gate.
+
+After each Greploop fix pass, rerun relevant validation commands.
 
 ## Acceptance Criteria
 
@@ -206,16 +245,16 @@ The work is complete only when:
 - No unresolved valid Major review findings remain.
 - Project validation passes.
 - A PR exists.
-- The Kodus loop completed: Kody's review of the head commit is complete and no Kody thread is unresolved.
+- Greploop score is 5/5.
 
-If the review loop reaches five passes with valid Critical/Major findings, or the Kodus loop does not complete within five passes, the PR and final report must state the exact remaining blockers, why they remain, and what is needed to finish. Do not report the work as complete.
+If the review loop reaches five passes with valid Critical/Major findings, or Greploop does not reach 5/5 within five passes, the PR and final report must state the exact remaining blockers, why they remain, and what is needed to finish. Do not report the work as complete.
 
 ## Hard Rules
 
 - Do not stop solely because a preferred review mechanism is unavailable.
 - Do not run a slash action as a shell command.
 - Do not present native self-review, or `code-review-and-quality` run in the author's context, as independent review.
-- Do not fix low-priority issues unless needed for a Critical/Major fix or to complete the Kodus loop.
+- Do not fix low-priority issues unless needed for a Critical/Major fix or Greploop 5/5.
 - Do not perform broad rewrites.
 - Do not change public APIs unless required.
 - Do not suppress warnings without explaining why.
@@ -223,7 +262,7 @@ If the review loop reaches five passes with valid Critical/Major findings, or th
 - Do not weaken validation.
 - Do not skip validation after code changes.
 - Do not create a PR that hides remaining blockers.
-- Do not claim the Kodus loop completed unless its latest run confirms it.
+- Do not claim Greploop is 5/5 unless the latest run confirms it.
 
 ## Final Response Format
 
@@ -237,8 +276,8 @@ PR: <link>
 Review mechanisms:
 - <mechanism>: <passes>
 Total review passes: <number>
-Kodus loop passes: <number>
-Kodus loop result: complete / stopped (<reason>)
+Greploop passes: <number>
+Final Greploop score: <score>
 
 Validation:
 - <command>: pass/fail
