@@ -15,6 +15,9 @@ The user no longer uses Kodus. Reverse the 2026-09-30 switch
   on its own merits, not as part of the Kodus switch.
 - The reuse check keys on the Greptile check run, as 0.6.1 did. greploop itself
   polls that check run, so a repository without one cannot pass the gate either way.
+- greploop commits with `git add -A`. Step 8 overrides it: stage explicit paths and
+  check `git diff --cached` before each commit. kodus-loop had this rule, and 0.6.1
+  did not (Greptile finding on PR #52).
 - Step 1's Kodus install check goes, with no Greptile replacement. 0.6.1 had none,
   and greploop stops after a 10-minute timeout when no review arrives. A timeout is
   a blocker, not a reason to fall back to another reviewer.

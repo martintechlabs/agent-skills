@@ -223,6 +223,8 @@ Repeat the Greploop skill or slash action, then fix remaining issues.
 
 Request at most one review per fix batch. Commit and push fixes as you make them, but request the next review only after every fix for the current findings is committed, pushed, and validated. Never request a review per commit. With manual-only Greptile reviews (`"autoReview": []`), pushes start no reviews. If the repository still reviews on push, push once per pass so each push maps to one review, and let the reuse check in step 7 pick up that review instead of requesting another.
 
+Stage only your fixes. Greploop commits with `git add -A`; stage explicit paths instead. Before each commit, check that `git diff --cached` contains only your fixes.
+
 Stop when either:
 
 - Greploop reports 5/5, or
