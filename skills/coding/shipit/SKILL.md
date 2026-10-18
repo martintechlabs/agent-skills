@@ -1,21 +1,23 @@
 ---
 name: shipit
 description: >-
-  Prepare a pull request to ship by running greploop, validating review findings,
-  applying narrowly scoped fixes, and verifying relevant tests while preserving
-  intended behavior and architecture. Do not merge, deploy, or release without
-  explicit approval. Use when the user says "shipit", "ship this PR", "get this PR
-  ready to ship", or wants a Greptile-reviewed PR brought to a verified,
-  review-ready state. Use ship-ready-pr-loop instead when the change has no PR
-  yet or needs its own code review and fix pass before Greptile.
+  Bring a GitHub pull request to a verified, review-ready state. Codex reviews
+  every PR against its base branch, and validated Critical and Major findings
+  get narrowly scoped fixes. A minor change stops there. A larger change then
+  runs greploop for a Greptile review, reusing a current review instead of
+  paying for a new one. Validates every finding, escalates product and
+  architecture decisions, and never merges, deploys, or releases without
+  explicit approval. Use when the user says "shipit", "ship this PR", "get this
+  PR ready to ship", "get this ready to ship", or "harden this change".
 metadata:
   author: stephen-martin
-  version: "0.1.1"
+  version: "0.2.0"
 ---
 
 # Shipit
 
-Bring a pull request to a verified, review-ready state using the existing
+Bring a pull request to a verified, review-ready state. Codex reviews every
+PR. A minor change ends there. A larger change then goes through the existing
 `/greploop` skill.
 
 Preserve the intended behavior and architecture. Verify each review comment
@@ -25,41 +27,25 @@ or architectural decision.
 
 ## Inputs and prerequisites
 
+Do these first. Do nothing else until a PR exists.
+
 - Accept a PR number or PR URL as input.
 - If no PR is supplied, identify the PR associated with the current branch.
+- If no PR exists, ask the user for one, or for approval to open one. Do not
+  open one unasked. When no user is available to ask, stop and report.
 - If the target is ambiguous, ask the user before proceeding.
+- The PR must be on GitHub, because every step uses `gh`. On GitLab or
+  Perforce, stop and report that shipit is GitHub-only.
 - Confirm the local repository and branch correspond to the target PR.
 - Inspect the working tree. Do not overwrite, discard, or include unrelated
   uncommitted changes.
-- Ensure the existing `/greploop` skill is available. If it is unavailable,
-  stop and report the missing prerequisite.
-- Confirm that Greptile reviews this repository (below).
+- Confirm Codex is installed and signed in (`codex login status`). If not,
+  stop and report the missing prerequisite. There is no fallback reviewer.
+  Under a ChatGPT-plan login, check `~/.codex/models_cache.json` before you
+  assume the default model works.
 - Follow repository instructions and applicable approval requirements.
 
-### Confirm Greptile is installed
-
-Without Greptile on the repository, greploop waits for a review that never
-arrives. Look for a Greptile bot comment or review on the target PR or the
-last 20 PRs. Do not rely on a Greptile check run: Greptile-reviewed PRs often
-have none.
-
-GitHub:
-
-```bash
-for n in $(gh pr list --state all --limit 20 --json number -q '.[].number'); do
-  gh api --paginate "repos/{owner}/{repo}/issues/$n/comments" --jq '.[].user.login'
-  gh api --paginate "repos/{owner}/{repo}/pulls/$n/reviews" --jq '.[].user.login'
-done | grep -qE '^greptile-apps(-staging)?\[bot\]$'
-```
-
-On GitLab or Perforce, look for notes by the Greptile bot user on recent
-MRs or reviews.
-
-- **Found:** continue.
-- **Not found:** this does not prove Greptile is absent. It may have been
-  installed after the last reviewed PR. Tell the user that Greptile could not
-  be confirmed and ask whether it is installed. On a yes, continue. On a no,
-  or when no user is available to ask, stop before the review loop.
+The Greptile prerequisites come later, only for a larger change.
 
 ## Establish implementation context
 
@@ -76,7 +62,94 @@ Before starting the review loop:
 Do not invent missing requirements. Flag ambiguity when it materially
 affects a proposed fix.
 
+## Run the Codex review
+
+Codex reviews every change against the PR's own base branch:
+
+```bash
+PR=<PR_NUMBER>
+BASE=$(gh pr view "$PR" --json baseRefName -q .baseRefName)
+git fetch origin "$BASE"
+codex exec review --base "origin/$BASE" -o <scratch file>
+```
+
+If the base does not resolve, stop and report a blocker. Never substitute
+`main` or another default branch.
+
+- Codex reviews the branch, and `--base` takes no prompt. A finding on a
+  line outside the PR diff (`git diff "origin/$BASE...HEAD"`) is out of
+  scope. Unrelated user edits are not part of the PR.
+- Classify each finding as Critical, Major, Minor, or lower. Validate it
+  under "Validate every review finding". Fix only validated Critical and
+  Major defects. List the rest in the report.
+- Commit each fix before the next pass, so the review sees it.
+- Verify after each fix pass (see "Verify changes").
+- Repeat until no valid Critical or Major finding remains, or 5 passes.
+- Do not push between passes. Push once, when the loop ends. On a
+  repository that reviews every push, each push starts a paid Greptile
+  review.
+- If 5 passes end with valid Critical or Major findings, push the validated
+  fixes, skip the size gate and greploop, and report "Blocked by review
+  findings". Do not pay for a Greptile review of known defects.
+- If Codex fails to run, stop and report a blocker.
+
+## Size gate
+
+After the Codex loop, inspect the final PR diff:
+
+```bash
+git diff --numstat "origin/$BASE...HEAD"            # added, deleted, path
+git diff --name-status -M "origin/$BASE...HEAD"     # status, path
+```
+
+The change is minor only when all of these hold:
+
+- 10 changed lines or fewer in total (added plus deleted).
+- Every file status is `M`. An added, deleted, or renamed file is not minor.
+- No binary file (`-` in the `--numstat` counts).
+- Nothing in a risky area: auth or permissions, security, secrets or config,
+  data model or migrations, public API, dependencies or lockfiles, CI or
+  build config.
+
+Anything else is a larger change. When in doubt, treat it as larger. The
+user can override either way ("run Greptile anyway", "skip Greptile").
+
+## Minor change
+
+- Push, if the Codex loop has not.
+- Do not request a Greptile review, and do not wait for one.
+- Report "Greptile skipped: minor change" with the reason.
+- If the PR already has unresolved Greptile review threads, list them as
+  remaining items. The status then cannot be "Ready to merge".
+
 ## Run greploop
+
+For a larger change only.
+
+Ensure the existing `/greploop` skill is available. If it is unavailable,
+stop and report the missing prerequisite.
+
+### Confirm Greptile is installed
+
+Without Greptile on the repository, greploop waits for a review that never
+arrives. Look for a Greptile bot comment or review on the target PR or the
+last 20 PRs. Do not rely on a Greptile check run: Greptile-reviewed PRs often
+have none.
+
+```bash
+for n in $(gh pr list --state all --limit 20 --json number -q '.[].number'); do
+  gh api --paginate "repos/{owner}/{repo}/issues/$n/comments" --jq '.[].user.login'
+  gh api --paginate "repos/{owner}/{repo}/pulls/$n/reviews" --jq '.[].user.login'
+done | grep -qE '^greptile-apps(-staging)?\[bot\]$'
+```
+
+- **Found:** continue.
+- **Not found:** this does not prove Greptile is absent. It may have been
+  installed after the last reviewed PR. Tell the user that Greptile could not
+  be confirmed and ask whether it is installed. On a yes, continue. On a no,
+  or when no user is available to ask, stop before the review loop.
+
+### Review loop
 
 Invoke the existing `/greploop` skill for the target PR.
 
@@ -172,7 +245,8 @@ this.
 
 ## Validate every review finding
 
-Before changing code for a review comment:
+This applies to Codex and Greptile findings alike. Before changing code for
+a review comment:
 
 1. Inspect the referenced code and relevant surrounding call sites.
 2. Compare the finding with requirements, intended behavior, and existing
@@ -251,14 +325,15 @@ Never claim verification succeeded without execution evidence.
 
 ## Iterate responsibly
 
-After applying and verifying fixes, continue the greploop review cycle.
+After applying and verifying fixes, continue the Codex or greploop review
+cycle.
 
 - Revalidate new comments rather than treating them as automatically correct.
 - Preserve the same scope and decision boundaries across iterations.
 - Do not repeat ineffective changes or oscillate between conflicting fixes.
 - If feedback repeats, conflicts, or cannot be resolved safely, stop and
   explain the blocker.
-- Respect any iteration limits in the underlying greploop skill.
+- Respect the pass limits: 5 Codex passes, 5 greploop passes.
 - Do not treat a high review score as a substitute for passing checks or
   satisfied requirements.
 
@@ -284,6 +359,13 @@ State one of:
 - Blocked pending a decision.
 - Blocked by review findings or failed checks.
 - Review loop complete, with verification gaps.
+
+### Review path
+
+- Minor change, with the reason Greptile was skipped, or larger change.
+- Codex passes.
+- For a larger change: greploop passes, final score, and how many passes
+  reused a review.
 
 ### Changes
 

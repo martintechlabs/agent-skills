@@ -11,7 +11,7 @@ containing a `SKILL.md` (YAML frontmatter + Markdown instructions) plus optional
 against whatever repo or account they're pointed at — `github-lockdown` mutates live
 GitHub state (branch protection, rulesets, repo settings) via `gh`, `neondb-branch`
 creates and recreates real Neon branches via the REST API, and `consult-codex`,
-`codex-review`, and `ship-ready-pr-loop` invoke the `codex` CLI. Treat those as
+`codex-review`, and `shipit` invoke the `codex` CLI. Treat those as
 live-system tooling, not sandboxed scripts.
 
 ## Operating mode
