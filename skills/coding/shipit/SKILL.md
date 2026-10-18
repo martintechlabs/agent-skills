@@ -40,6 +40,10 @@ Do these first. Do nothing else until a PR exists.
 - The PR must be open. Read `gh pr view <PR> --json number,state,headRefOid`.
   If `state` is not `OPEN`, stop and report. Use the PR number, not a URL, in
   every later command.
+- The commands below assume `origin` is the PR's base repository (the
+  repository in the PR URL). In a fork checkout it is not. Then use the
+  remote that points at the base repository in place of `origin`
+  everywhere. If no remote does, stop and report.
 - The local branch must contain the PR head:
 
   ```bash
@@ -82,16 +86,20 @@ Codex reviews every change against the PR's own base branch:
 PR=<PR_NUMBER>
 BASE=$(gh pr view "$PR" --json baseRefName -q .baseRefName)
 git fetch origin "$BASE"
-codex exec review --base "origin/$BASE" -o <scratch file>
+# Codex diffs against the working tree, so review a clean checkout of HEAD.
+REVIEW_DIR=$(mktemp -d)
+git worktree add --detach "$REVIEW_DIR" HEAD
+(cd "$REVIEW_DIR" && codex exec review --base "origin/$BASE" -o <absolute scratch file>)
+git worktree remove --force "$REVIEW_DIR"
 ```
 
 If the base does not resolve, stop and report a blocker. Never substitute
 `main` or another default branch.
 
-- `--base` takes no prompt, and Codex also reads uncommitted edits to
-  tracked files. A finding caused only by uncommitted edits is out of scope,
-  because those edits are not part of the PR. A finding about code that the
-  PR breaks elsewhere is in scope.
+- Codex reads uncommitted edits in the directory it runs in. In the main
+  checkout, a local edit could hide a committed defect. The temporary
+  worktree holds only `HEAD`, so Codex reviews exactly what the PR ships.
+  Remove the worktree after every pass, even when Codex fails.
 - Classify each finding as Critical, Major, Minor, or lower. Validate it
   under "Validate every review finding". Fix only validated Critical and
   Major defects. List the rest in the report.
@@ -204,8 +212,8 @@ These rules override greploop where they differ:
 - **Stop after 5 passes.** A pass that reuses a review counts.
 - **Treat a timeout with care.** greploop waits about 10 minutes for a
   Greptile check run, and many repositories have none. On a timeout, run the
-  reuse check. If it shows a score for `HEAD_SHA`, read that review and
-  continue. If not, stop and report a blocker. Never fall back to another
+  reuse check. If it shows a score that counts under its rule 4, read that
+  review and continue. If not, stop and report a blocker. Never fall back to another
   reviewer.
 - **Claim 5/5 only from the latest run** on `HEAD_SHA`.
 
@@ -221,16 +229,25 @@ HEAD_SHA=$(gh pr view "$PR" --json headRefOid -q .headRefOid)
 if [ "$HEAD_SHA" != "$(git rev-parse HEAD)" ]; then
   echo "Local HEAD is not the PR head. Push, then rerun this check." >&2
 else
+  # Only the Greptile app can create this check run; match the app, not the name.
   gh api --paginate "repos/{owner}/{repo}/commits/$HEAD_SHA/check-runs?per_page=100" \
-    --jq '.check_runs[] | select(.name | test("greptile"; "i")) | "check run: \(.name) \(.status) \(.conclusion)"'
+    --jq '.check_runs[] | select(.app.slug | test("^greptile-apps(-staging)?$")) | "check run: \(.status) \(.conclusion)"'
   # Greptile writes its summary to the PR description or to its latest PR comment.
-  BODY=$(gh pr view "$PR" --json body -q .body)
+  DESCRIPTION=$(gh pr view "$PR" --json body -q .body)
   COMMENT=$(gh api --paginate "repos/{owner}/{repo}/issues/$PR/comments?per_page=100" |
-    jq -rs 'add | map(select((.user.login | test("greptile"; "i")) and (.body | contains("greptile_confidence_score"))))
+    jq -rs 'add | map(select((.user.login | test("^greptile-apps(-staging)?\\[bot\\]$")) and (.body | contains("greptile_confidence_score"))))
             | sort_by(.updated_at) | last | .body // empty')
-  for TEXT in "$BODY" "$COMMENT"; do
-    if printf '%s\n' "$TEXT" | grep -q "Last reviewed commit:.*/commit/$HEAD_SHA"; then
-      printf '%s\n' "$TEXT" | grep -o 'greptile_confidence_score:[0-9]'
+  for SRC in description comment; do
+    if [ "$SRC" = description ]; then
+      # Only Greptile's block: the rest of the description is the author's prose.
+      TEXT=$(printf '%s\n' "$DESCRIPTION" |
+        sed -n '/^<!-- greptile_comment -->$/,/^<!-- \/greptile_comment -->$/p')
+    else
+      TEXT=$COMMENT
+    fi
+    # Whole-line markers only; Greptile's findings can quote these strings.
+    if printf '%s\n' "$TEXT" | grep -q "^<sub>Reviews (.*Last reviewed commit: .*/commit/$HEAD_SHA)"; then
+      printf '%s\n' "$TEXT" | grep -o '^<!-- greptile_confidence_score:[0-9] -->$' | sed "s/^/$SRC: /"
     fi
   done
 fi
@@ -244,17 +261,23 @@ another commit is stale, so the check prints no score for it.
    again.
 2. **Check run `queued` or `in_progress`:** a review is running. Do not
    request one. Let greploop wait, then run the check again.
-3. **Check run `completed` but not `success`:** that is not a review. A
-   cancelled, timed-out, skipped, or failed check does not count.
-4. **Score printed, and no check run or a `success` one:** reuse it. Tell
-   greploop to read those results and not to post `@greptile review`.
+3. **Check run `completed` as `cancelled`, `timed_out`, or `skipped`:**
+   that is not a review. Greptile marks a finished review that has findings
+   as `failure`, so `failure` with a score still counts.
+4. **Score printed from a source Greptile wrote:** reuse it. Tell greploop
+   to read those results and not to post `@greptile review`. A `comment:`
+   score counts, because the comment's author is the Greptile bot. A
+   `description:` score counts only with a completed Greptile check run.
+   The PR author can edit the description, so a score there alone is not
+   proof of a review.
 5. **Otherwise:** request a new review. Right after a push, first run the
    check every 10 seconds for up to 2 minutes. A running check run or a
    score for `HEAD_SHA` means an automatic review exists, so do not request
    one.
 
 The check keys on the summary, not on the check run, because many
-Greptile-reviewed PRs have no check run. Known limit: on a repository that
+Greptile-reviewed PRs have no check run. On such a PR, a score only in the
+description does not count, so the check requests a new review. Known limit: on a repository that
 reviews every push and has no check run, nothing shows until the summary
 posts. A review that takes longer than 2 minutes then gets a second,
 paid request. Greptile's manual-only setting (`"autoReview": []`) avoids

@@ -174,9 +174,15 @@ bash snippet. Codex and greploop are not run live in this change.
 - codex-cli 0.162.1 rejects `--base` with a prompt: "the argument '--base
   <BRANCH>' cannot be used with '[PROMPT]'". shipit passes no prompt.
 - Codex's base-branch review diffs the merge base against the working tree, so
-  it reads uncommitted edits to tracked files. shipit treats a finding caused
-  only by those edits as out of scope, and keeps findings about code the PR
-  breaks elsewhere.
+  it reads uncommitted edits to tracked files. A local edit could hide a
+  committed defect, so shipit runs Codex in a temporary worktree at `HEAD`
+  (Greptile finding on PR #53).
+- The reuse check trusts only sources Greptile wrote: a check run whose app is
+  `greptile-apps`, and comments by `greptile-apps[bot]`. The PR author can edit
+  the description, so a description score counts only with a Greptile check
+  run. Greptile marks a finished review that has findings as `failure` (PR #53:
+  `completed failure` with a 1/5 summary), so `failure` is still a review
+  (Greptile finding on PR #53).
 - `gh pr view` returns merged and closed PRs (`"state":"MERGED"` for PR #52).
   shipit requires `OPEN`, and requires the local branch to contain the PR head
   (`git merge-base --is-ancestor`).
