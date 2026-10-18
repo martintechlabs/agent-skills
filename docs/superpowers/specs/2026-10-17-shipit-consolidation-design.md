@@ -66,9 +66,8 @@ greploop phase. A minor change must not block on them.
   skip the size gate and greploop, and report "Blocked by review findings"
   (builder's call). A paid review of known defects is waste.
 - If Codex fails mid-loop, that is a blocker.
-- Tell Codex, in its prompt argument, to review only the committed branch. Whether
-  `--base` also reads uncommitted files is unverified, and unrelated user edits
-  must not become findings.
+- Unrelated user edits must not become findings. (Superseded: the prompt-argument
+  approach first written here does not work. See "Implementation notes".)
 
 ### 4. Size gate (after the Codex loop, on the final PR diff)
 
@@ -169,3 +168,20 @@ shipit has no test suite. Run `bash scripts/check-frontmatter.sh`. Spot-check th
 reuse-check `gh` queries read-only against a real Greptile-reviewed PR (this repo's
 PR #52) so the field names match what `gh` returns. Run `bash -n` on each extracted
 bash snippet. Codex and greploop are not run live in this change.
+
+## Implementation notes (verified 2026-10-17)
+
+- codex-cli 0.162.1 rejects `--base` with a prompt: "the argument '--base
+  <BRANCH>' cannot be used with '[PROMPT]'". shipit passes no prompt.
+- Codex's base-branch review diffs the merge base against the working tree, so
+  it reads uncommitted edits to tracked files. shipit treats a finding caused
+  only by those edits as out of scope, and keeps findings about code the PR
+  breaks elsewhere.
+- `gh pr view` returns merged and closed PRs (`"state":"MERGED"` for PR #52).
+  shipit requires `OPEN`, and requires the local branch to contain the PR head
+  (`git merge-base --is-ancestor`).
+- The size gate shows raw `--numstat` and `--name-status` output, not a summed
+  count. `--numstat` prints `-` for a binary file, and a sum would count it as 0.
+  A binary file is not minor.
+- The plan's Codex snippet (with a prompt) and its `awk` sum were replaced by the
+  above during the build.
