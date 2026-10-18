@@ -107,6 +107,68 @@ These rules override greploop where they differ:
   user edits, stop and ask before editing it. Before each commit, check that
   `git diff --cached` contains only your fixes, with no files that were
   already staged.
+- **Run greploop as a skill.** Never run it as a shell command.
+- **Reuse a current review.** Greptile reviews cost money. Before every pass,
+  run the check below.
+- **Request one review per fix batch.** Commit and push fixes as you make
+  them. Request the next review only after every fix for the current findings
+  is committed, pushed, and validated. Never request a review per commit.
+- **Stop after 5 passes.** A pass that reuses a review counts.
+- **Treat a timeout with care.** greploop waits about 10 minutes for a
+  Greptile check run, and many repositories have none. On a timeout, run the
+  reuse check. If it shows a score for `HEAD_SHA`, read that review and
+  continue. If not, stop and report a blocker. Never fall back to another
+  reviewer.
+- **Claim 5/5 only from the latest run** on `HEAD_SHA`.
+
+### Reuse a current review
+
+greploop posts `@greptile review` whenever no Greptile check is running. It
+does this even when a finished review already covers the head commit. Run
+this check from the top before every pass:
+
+```bash
+PR=<PR_NUMBER>
+HEAD_SHA=$(gh pr view "$PR" --json headRefOid -q .headRefOid)
+if [ "$HEAD_SHA" != "$(git rev-parse HEAD)" ]; then
+  echo "Local HEAD is not the PR head. Push, then rerun this check." >&2
+else
+  gh api --paginate "repos/{owner}/{repo}/commits/$HEAD_SHA/check-runs?per_page=100" \
+    --jq '.check_runs[] | select(.name | test("greptile"; "i")) | "check run: \(.name) \(.status) \(.conclusion)"'
+  # Greptile writes its summary to the PR description or to its latest PR comment.
+  BODY=$(gh pr view "$PR" --json body -q .body)
+  COMMENT=$(gh api --paginate "repos/{owner}/{repo}/issues/$PR/comments?per_page=100" |
+    jq -rs 'add | map(select((.user.login | test("greptile"; "i")) and (.body | contains("greptile_confidence_score"))))
+            | sort_by(.updated_at) | last | .body // empty')
+  for TEXT in "$BODY" "$COMMENT"; do
+    if printf '%s\n' "$TEXT" | grep -q "Last reviewed commit:.*/commit/$HEAD_SHA"; then
+      printf '%s\n' "$TEXT" | grep -o 'greptile_confidence_score:[0-9]'
+    fi
+  done
+fi
+```
+
+A score line means a summary covers `HEAD_SHA`. A summary that names
+another commit is stale, so the check prints no score for it.
+
+1. **Local HEAD is not the PR head:** push, then run the check again.
+2. **Check run `queued` or `in_progress`:** a review is running. Do not
+   request one. Let greploop wait, then run the check again.
+3. **Check run `completed` but not `success`:** that is not a review. A
+   cancelled, timed-out, skipped, or failed check does not count.
+4. **Score printed, and no check run or a `success` one:** reuse it. Tell
+   greploop to read those results and not to post `@greptile review`.
+5. **Otherwise:** request a new review. Right after a push, first run the
+   check every 10 seconds for up to 2 minutes. A running check run or a
+   score for `HEAD_SHA` means an automatic review exists, so do not request
+   one.
+
+The check keys on the summary, not on the check run, because many
+Greptile-reviewed PRs have no check run. Known limit: on a repository that
+reviews every push and has no check run, nothing shows until the summary
+posts. A review that takes longer than 2 minutes then gets a second,
+paid request. Greptile's manual-only setting (`"autoReview": []`) avoids
+this.
 
 ## Validate every review finding
 
