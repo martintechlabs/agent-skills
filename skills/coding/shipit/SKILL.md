@@ -11,7 +11,7 @@ description: >-
   PR ready to ship", "get this ready to ship", or "harden this change".
 metadata:
   author: stephen-martin
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # Shipit
@@ -126,14 +126,27 @@ git diff --numstat "origin/$BASE...HEAD"            # added, deleted, path
 git diff --name-status -M "origin/$BASE...HEAD"     # status, path
 ```
 
+Sort each changed file into one of two kinds:
+
+- **Content:** images, icons, fonts, media, prose docs (README, `docs/`,
+  changelogs), and translation or locale files. A file whose diff changes
+  only comments, whitespace, or user-visible copy is also content.
+- **Code:** everything else. Markdown that instructs an agent (`SKILL.md`,
+  `AGENTS.md`, `CLAUDE.md`, prompt files) is code.
+
 The change is minor only when all of these hold:
 
-- 10 changed lines or fewer in total (added plus deleted).
-- Every file status is `M`. An added, deleted, or renamed file is not minor.
-- No binary file (`-` in the `--numstat` counts).
+- Content files do not count, whatever their size or status. They can be
+  added, deleted, renamed, or binary.
+- Every code file status is `M`. An added, deleted, or renamed code file is
+  not minor.
+- 10 changed lines or fewer in code files, in total (added plus deleted).
+- Every binary file (`-` in the `--numstat` counts) is a static asset. Any
+  other binary is not minor.
 - Nothing in a risky area: auth or permissions, security, secrets or config,
   data model or migrations, public API, dependencies or lockfiles, CI or
-  build config.
+  build config. JSON, YAML, and TOML files other than locale files are
+  config.
 
 Anything else is a larger change. When in doubt, treat it as larger. The
 user can override either way ("run Greptile anyway", "skip Greptile").
