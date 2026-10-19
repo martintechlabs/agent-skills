@@ -130,7 +130,10 @@ Sort each changed file into one of two kinds:
 
 - **Content:** images, icons, fonts, media, prose docs (README, `docs/`,
   changelogs), and translation or locale files. A file whose diff changes
-  only comments, whitespace, or user-visible copy is also content.
+  only user-visible copy, or comments and whitespace that do not change
+  behavior, is also content. Significant indentation (Python, YAML,
+  Makefiles) and directive comments (lint or type suppressions, build tags)
+  change behavior.
 - **Code:** everything else. Markdown that instructs an agent (`SKILL.md`,
   `AGENTS.md`, `CLAUDE.md`, prompt files) is code.
 
