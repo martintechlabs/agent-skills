@@ -218,7 +218,7 @@ verify() {
   if [ "$AUTO_DELETE" = true ]; then
     local dbom
     dbom="$(gh api "repos/$REPO" | jq -r '.delete_branch_on_merge')" || { echo "Could not read $REPO settings back." >&2; exit 1; }
-    [ "$dbom" = true ] || { echo "Verification failed: delete_branch_on_merge is not true on $REPO." >&2; exit 1; }
+    [ "$dbom" = true ] || { echo "Verification failed: delete_branch_on_merge on $REPO sent true, GitHub returned $dbom." >&2; exit 1; }
   fi
   echo "Locked down $REPO ($target), read back from GitHub: ruleset $NAME (id $RULESET_ID) active, required PR, $APPROVALS approver(s), force-push + deletion blocked."
   [ "$AUTO_DELETE" = true ] && echo "  Auto-delete merged branches: on."

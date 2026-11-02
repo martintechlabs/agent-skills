@@ -277,7 +277,7 @@ test_verify_auto_delete_off() {
   local d; d="$(mktemp -d)"
   run_lockdown "$d/bin" FAKE_GH_VIEWER_PERMISSION=ADMIN FAKE_GH_REPO_JSON='{"delete_branch_on_merge":false}' -- --repo octo/repo
   assert_eq "$RC" "1" "verify fails when delete_branch_on_merge reads back false"
-  assert_contains "$ERR" "delete_branch_on_merge" "auto-delete failure names the setting"
+  assert_contains "$ERR" "delete_branch_on_merge on octo/repo sent true, GitHub returned false" "auto-delete failure shows sent and returned values"
   rm -rf "$d"
 }
 
