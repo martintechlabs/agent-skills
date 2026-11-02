@@ -39,3 +39,11 @@ gets cleanly comparable inputs. The trend skill degrades gracefully without them
 Done — all seven skills are grouped under "CTO toolkit". Listed here only as a marker
 that the grouping decision was made deliberately; revisit if the suite grows enough to
 warrant sub-groups.
+
+## 5. `github-lockdown`: ignore org-level rulesets when finding its own
+
+`find_ruleset_id` lists `repos/<repo>/rulesets`, which includes parent (org) rulesets by
+default. If an org has a ruleset that is also named `github-lockdown`, the script matches it
+by name and tries to `PUT repos/<repo>/rulesets/<org-id>`. **Do:** pass
+`includes_parents=false` or filter on `source_type == "Repository"`. Found while fixing the
+read-back verify step.

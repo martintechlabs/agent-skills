@@ -36,6 +36,7 @@ bad()  { FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$1"; [ -n "${2:-}" ] && printf 
 
 assert_eq()       { [ "$1" = "$2" ] && ok "$3" || bad "$3" "expected [$2] got [$1]"; }
 assert_contains() { case "$1" in *"$2"*) ok "$3";; *) bad "$3" "[$1] did not contain [$2]";; esac; }
+assert_line()     { grep -qxF -- "$2" "$1" && ok "$3" || bad "$3" "no line [$2] in $1"; }
 
 # ---- Task 1 test ----
 test_help() {
@@ -174,7 +175,11 @@ test_real_apply_records_calls() {
   local logtext; logtext="$(cat "$log")"
   assert_contains "$logtext" "api -X POST repos/octo/repo/rulesets" "issues POST to create ruleset"
   assert_contains "$logtext" "api -X PATCH repos/octo/repo" "issues PATCH for auto-delete"
+  assert_line "$log" "api repos/octo/repo/rulesets/1001" "reads the created ruleset back by the id GitHub returned"
+  assert_line "$log" "api repos/octo/repo" "reads delete_branch_on_merge back from the repo"
+  # The fake GET adds the extra fields real GitHub returns; verify must tolerate them.
   assert_contains "$OUT" "Locked down" "prints a verification summary"
+  assert_contains "$OUT" "read back from GitHub" "summary says it was read back"
   rm -rf "$d"
 }
 
@@ -229,10 +234,64 @@ test_real_apply_update_puts() {
     -- --repo octo/repo --no-auto-delete
   assert_eq "$RC" "0" "real update exits 0"
   assert_contains "$(cat "$log")" "api -X PUT repos/octo/repo/rulesets/99 --input -" "updates existing ruleset via PUT by id"
+  assert_line "$log" "api repos/octo/repo/rulesets/99" "reads the updated ruleset back by id"
+  grep -qxF "api repos/octo/repo" "$log" && bad "no-auto-delete skips the auto-delete read-back" || ok "no-auto-delete skips the auto-delete read-back"
   rm -rf "$d"
 }
 
 test_real_apply_update_puts
+
+test_admin_bypass_verifies() {
+  local d; d="$(mktemp -d)"
+  run_lockdown "$d/bin" FAKE_GH_VIEWER_PERMISSION=ADMIN -- --repo octo/repo --admin-bypass --status-checks "ci, build"
+  assert_eq "$RC" "0" "admin bypass + status checks verify when GitHub matches"
+  rm -rf "$d"
+}
+
+test_admin_bypass_verifies
+
+# expect_drift <label> <jq filter GitHub's GET applies> [extra lockdown args...]
+expect_drift() {
+  local label="$1" filter="$2"; shift 2
+  local d; d="$(mktemp -d)"
+  run_lockdown "$d/bin" FAKE_GH_VIEWER_PERMISSION=ADMIN FAKE_GH_RULESET_JQ="$filter" -- --repo octo/repo "$@"
+  assert_eq "$RC" "1" "verify fails: $label"
+  assert_contains "$ERR" "Verification failed" "verify reports: $label"
+  case "$OUT" in *"Locked down"*) bad "no success summary: $label";; *) ok "no success summary: $label";; esac
+  rm -rf "$d"
+}
+
+expect_drift "enforcement not active" '.enforcement = "evaluate"'
+expect_drift "approvals differ" '(.rules[] | select(.type=="pull_request") | .parameters.required_approving_review_count) = 1'
+expect_drift "deletion rule missing" '.rules |= map(select(.type != "deletion"))'
+expect_drift "unwanted bypass actor" '.bypass_actors = [{actor_id:5, actor_type:"RepositoryRole", bypass_mode:"always"}]'
+expect_drift "wrong branch targeted" '.conditions.ref_name.include = ["refs/heads/other"]'
+expect_drift "target branch excluded" '.conditions.ref_name.exclude = ["~DEFAULT_BRANCH"]'
+expect_drift "extra bypass actor beside admin" \
+  '.bypass_actors += [{actor_id:1, actor_type:"Integration", bypass_mode:"always"}]' --admin-bypass
+expect_drift "status check name is only a prefix match" \
+  '(.rules[] | select(.type=="required_status_checks") | .parameters.required_status_checks) = [{context:"ci-build"}]' \
+  --status-checks ci
+
+test_verify_auto_delete_off() {
+  local d; d="$(mktemp -d)"
+  run_lockdown "$d/bin" FAKE_GH_VIEWER_PERMISSION=ADMIN FAKE_GH_REPO_JSON='{"delete_branch_on_merge":false}' -- --repo octo/repo
+  assert_eq "$RC" "1" "verify fails when delete_branch_on_merge reads back false"
+  assert_contains "$ERR" "delete_branch_on_merge on octo/repo sent true, GitHub returned false" "auto-delete failure shows sent and returned values"
+  rm -rf "$d"
+}
+
+test_verify_auto_delete_off
+
+test_verify_read_failure() {
+  local d; d="$(mktemp -d)"
+  run_lockdown "$d/bin" FAKE_GH_VIEWER_PERMISSION=ADMIN FAKE_GH_RULESET_JQ='error("HTTP 502")' -- --repo octo/repo
+  assert_eq "$RC" "1" "verify fails when the ruleset cannot be read back"
+  assert_contains "$ERR" "Could not read ruleset 1001" "read-back failure is reported as such"
+  rm -rf "$d"
+}
+
+test_verify_read_failure
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
