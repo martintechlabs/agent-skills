@@ -195,16 +195,15 @@ apply_auto_delete() {
   gh api -X PATCH "repos/$REPO" -F delete_branch_on_merge=true >/dev/null
 }
 
-# True when the GitHub ruleset (input) holds every key and value of $want, with exact
-# scalar matches. A subset, not equality: GitHub adds fields of its own (required_reviewers,
-# allowed_merge_methods, ...). bypass_actors is compared by count too, because an empty
-# list is a subset of anything and "no bypass" is the point.
+# True when the GitHub ruleset (input) holds every key of $want with exact scalar values.
+# Objects may carry extra keys (GitHub adds required_reviewers, allowed_merge_methods, ...).
+# Arrays must have the same length, so a sent [] (no bypass actors, no excludes) stays [].
 VERIFY_JQ='
 def covers($w):
   if ($w|type) == "object" then type == "object" and (. as $g | all($w|keys[]; . as $k | $g[$k] | covers($w[$k])))
-  elif ($w|type) == "array" then type == "array" and (. as $g | all($w[]; . as $x | any($g[]; covers($x))))
+  elif ($w|type) == "array" then type == "array" and length == ($w|length) and (. as $g | all($w[]; . as $x | any($g[]; covers($x))))
   else . == $w end;
-covers($want) and ((.bypass_actors // []) | length) == ($want.bypass_actors | length)'
+covers($want)'
 
 # Read the ruleset and repo settings back from GitHub; exit 1 if they differ from what was sent.
 verify() {
@@ -216,9 +215,10 @@ verify() {
     printf 'Sent:\n%s\nGitHub returned:\n%s\n' "$want" "$got" >&2
     exit 1
   fi
-  if [ "$AUTO_DELETE" = true ] && [ "$(gh api "repos/$REPO" | jq -r '.delete_branch_on_merge')" != true ]; then
-    echo "Verification failed: delete_branch_on_merge is not true on $REPO." >&2
-    exit 1
+  if [ "$AUTO_DELETE" = true ]; then
+    local dbom
+    dbom="$(gh api "repos/$REPO" | jq -r '.delete_branch_on_merge')" || { echo "Could not read $REPO settings back." >&2; exit 1; }
+    [ "$dbom" = true ] || { echo "Verification failed: delete_branch_on_merge is not true on $REPO." >&2; exit 1; }
   fi
   echo "Locked down $REPO ($target), read back from GitHub: ruleset $NAME (id $RULESET_ID) active, required PR, $APPROVALS approver(s), force-push + deletion blocked."
   [ "$AUTO_DELETE" = true ] && echo "  Auto-delete merged branches: on."

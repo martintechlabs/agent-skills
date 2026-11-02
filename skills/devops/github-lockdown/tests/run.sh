@@ -266,6 +266,9 @@ expect_drift "approvals differ" '(.rules[] | select(.type=="pull_request") | .pa
 expect_drift "deletion rule missing" '.rules |= map(select(.type != "deletion"))'
 expect_drift "unwanted bypass actor" '.bypass_actors = [{actor_id:5, actor_type:"RepositoryRole", bypass_mode:"always"}]'
 expect_drift "wrong branch targeted" '.conditions.ref_name.include = ["refs/heads/other"]'
+expect_drift "target branch excluded" '.conditions.ref_name.exclude = ["~DEFAULT_BRANCH"]'
+expect_drift "extra bypass actor beside admin" \
+  '.bypass_actors += [{actor_id:1, actor_type:"Integration", bypass_mode:"always"}]' --admin-bypass
 expect_drift "status check name is only a prefix match" \
   '(.rules[] | select(.type=="required_status_checks") | .parameters.required_status_checks) = [{context:"ci-build"}]' \
   --status-checks ci
@@ -279,6 +282,16 @@ test_verify_auto_delete_off() {
 }
 
 test_verify_auto_delete_off
+
+test_verify_read_failure() {
+  local d; d="$(mktemp -d)"
+  run_lockdown "$d/bin" FAKE_GH_VIEWER_PERMISSION=ADMIN FAKE_GH_RULESET_JQ='error("HTTP 502")' -- --repo octo/repo
+  assert_eq "$RC" "1" "verify fails when the ruleset cannot be read back"
+  assert_contains "$ERR" "Could not read ruleset 1001" "read-back failure is reported as such"
+  rm -rf "$d"
+}
+
+test_verify_read_failure
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
