@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # Fake `gh` for tests. Records calls to $FAKE_GH_LOG and emits canned JSON.
+# Writes (POST/PUT ruleset, PATCH repo) are stored next to this file, and later GETs read
+# them back, so the script's read-back verification sees what it wrote.
 # Behavior is tuned per-test via env vars:
 #   FAKE_GH_VIEWER_PERMISSION  (default ADMIN)
 #   FAKE_GH_NAME_WITH_OWNER    (default octo/repo)
-#   FAKE_GH_RULESETS_JSON      (default [])   -> response for GET .../rulesets
+#   FAKE_GH_RULESETS_JSON      (default [])   -> response for GET .../rulesets (the list)
+#   FAKE_GH_RULESET_JQ         (default .)    -> jq filter applied to GET .../rulesets/<id>, to simulate drift
+#   FAKE_GH_REPO_JSON          (optional)     -> response for GET repos/<owner>/<repo>
 set -uo pipefail
 [ -n "${FAKE_GH_LOG:-}" ] && printf '%s\n' "$*" >>"$FAKE_GH_LOG"
+STATE="$(dirname "$0")"
 
 case "$1" in
   auth)
@@ -20,10 +25,35 @@ case "$1" in
       *)                  printf '\n' ;;
     esac ;;
   api)
-    # `gh api <path> [ -X METHOD ] [ --input FILE | -f k=v ]`
-    case "$*" in
-      *rulesets*) printf '%s\n' "${FAKE_GH_RULESETS_JSON:-[]}" ;;
-      *)          printf '{}\n' ;;
+    # `gh api [-X METHOD] <path> [--input - | -F k=v] [--paginate]`
+    shift
+    method=GET; path=""; field=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -X) method="$2"; shift 2 ;;
+        -F|-f) field="$2"; shift 2 ;;
+        --input) shift 2 ;;
+        --paginate) shift ;;
+        *) path="$1"; shift ;;
+      esac
+    done
+    case "$method $path" in
+      "GET "*/rulesets) printf '%s\n' "${FAKE_GH_RULESETS_JSON:-[]}" ;;
+      "POST "*/rulesets) jq '. + {id: 1001}' | tee "$STATE/ruleset.json" ;;
+      "PUT "*/rulesets/*) jq --argjson id "${path##*/}" '. + {id: $id}' | tee "$STATE/ruleset.json" ;;
+      "GET "*/rulesets/*)
+        # Real GitHub adds fields of its own to the stored ruleset (seen live on a GET).
+        jq '. + {source_type: "Repository", current_user_can_bypass: "never", node_id: "RRS_fake"}
+            | .rules |= map(if .type == "pull_request" then .parameters += {
+                required_reviewers: [], require_extra_approval_for_unattributed_changes: true,
+                allowed_merge_methods: ["merge", "squash", "rebase"]} else . end)' \
+          "$STATE/ruleset.json" | jq "${FAKE_GH_RULESET_JQ:-.}" ;;
+      "PATCH "*) printf '%s\n' "${field#*=}" >"$STATE/delete_branch_on_merge"; printf '{}\n' ;;
+      "GET "*)
+        if [ -n "${FAKE_GH_REPO_JSON:-}" ]; then printf '%s\n' "$FAKE_GH_REPO_JSON"
+        else jq -n --argjson v "$(cat "$STATE/delete_branch_on_merge" 2>/dev/null || echo false)" '{delete_branch_on_merge: $v}'
+        fi ;;
+      *) printf '{}\n' ;;
     esac ;;
   *)
     exit 0 ;;

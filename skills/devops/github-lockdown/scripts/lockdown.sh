@@ -9,6 +9,7 @@ THREAD_RES=false; LINEAR=false; SIGNED=false; CODE_OWNER=false; DISMISS_STALE=fa
 STATUS_CHECKS=""; AUTO_DELETE=true; NAME="github-lockdown"; DRY_RUN=false
 PRINT_CONFIG=false
 PREFLIGHT_ONLY=false
+RULESET_ID=""
 
 usage() {
   cat <<'EOF'
@@ -46,7 +47,7 @@ main() {
   if [ "$DRY_RUN" = true ]; then printf '%s\n' "$body"; fi
   apply_ruleset "$body" "$id"
   apply_auto_delete
-  if [ "$DRY_RUN" != true ]; then verify; fi
+  if [ "$DRY_RUN" != true ]; then verify "$body"; fi
 }
 
 parse_args() {
@@ -167,7 +168,7 @@ find_ruleset_id() {
 }
 
 apply_ruleset() {
-  local body="$1" id="$2"
+  local body="$1" id="$2" resp
   if [ "$DRY_RUN" = true ]; then
     if [ -n "$id" ]; then
       echo "PLAN UPDATE ruleset id=$id via PUT repos/$REPO/rulesets/$id" >&2
@@ -177,10 +178,12 @@ apply_ruleset() {
     return 0
   fi
   if [ -n "$id" ]; then
-    printf '%s' "$body" | gh api -X PUT "repos/$REPO/rulesets/$id" --input - >/dev/null
+    resp="$(printf '%s' "$body" | gh api -X PUT "repos/$REPO/rulesets/$id" --input -)"
   else
-    printf '%s' "$body" | gh api -X POST "repos/$REPO/rulesets" --input - >/dev/null
+    resp="$(printf '%s' "$body" | gh api -X POST "repos/$REPO/rulesets" --input -)"
   fi
+  RULESET_ID="$(jq -r '.id // empty' <<<"$resp")"
+  [ -n "$RULESET_ID" ] || { echo "GitHub did not return a ruleset id for $NAME on $REPO." >&2; exit 1; }
 }
 
 apply_auto_delete() {
@@ -192,10 +195,32 @@ apply_auto_delete() {
   gh api -X PATCH "repos/$REPO" -F delete_branch_on_merge=true >/dev/null
 }
 
+# True when the GitHub ruleset (input) holds every key and value of $want, with exact
+# scalar matches. A subset, not equality: GitHub adds fields of its own (required_reviewers,
+# allowed_merge_methods, ...). bypass_actors is compared by count too, because an empty
+# list is a subset of anything and "no bypass" is the point.
+VERIFY_JQ='
+def covers($w):
+  if ($w|type) == "object" then type == "object" and (. as $g | all($w|keys[]; . as $k | $g[$k] | covers($w[$k])))
+  elif ($w|type) == "array" then type == "array" and (. as $g | all($w[]; . as $x | any($g[]; covers($x))))
+  else . == $w end;
+covers($want) and ((.bypass_actors // []) | length) == ($want.bypass_actors | length)'
+
+# Read the ruleset and repo settings back from GitHub; exit 1 if they differ from what was sent.
 verify() {
-  local approvals="$APPROVALS" target="default branch"
+  local want="$1" got target="default branch"
   [ -n "$BRANCH" ] && target="$BRANCH"
-  echo "Locked down $REPO ($target): required PR, $approvals approver(s), force-push + deletion blocked."
+  got="$(gh api "repos/$REPO/rulesets/$RULESET_ID")" || { echo "Could not read ruleset $RULESET_ID back from $REPO." >&2; exit 1; }
+  if ! jq -e --argjson want "$want" "$VERIFY_JQ" <<<"$got" >/dev/null; then
+    echo "Verification failed: ruleset $RULESET_ID on $REPO does not match what was sent." >&2
+    printf 'Sent:\n%s\nGitHub returned:\n%s\n' "$want" "$got" >&2
+    exit 1
+  fi
+  if [ "$AUTO_DELETE" = true ] && [ "$(gh api "repos/$REPO" | jq -r '.delete_branch_on_merge')" != true ]; then
+    echo "Verification failed: delete_branch_on_merge is not true on $REPO." >&2
+    exit 1
+  fi
+  echo "Locked down $REPO ($target), read back from GitHub: ruleset $NAME (id $RULESET_ID) active, required PR, $APPROVALS approver(s), force-push + deletion blocked."
   [ "$AUTO_DELETE" = true ] && echo "  Auto-delete merged branches: on."
   [ "$ADMIN_BYPASS" = true ] && echo "  Admin bypass: enabled."
   return 0

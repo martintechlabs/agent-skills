@@ -9,7 +9,7 @@ description: >-
 disable-model-invocation: true
 metadata:
   author: martintechlabs
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # Lock down a GitHub repository
@@ -57,13 +57,20 @@ The standard lockdown, applied with no flags:
    `owner/repo`.
 
 4. **Dry-run and confirm.** Run the script with `--dry-run` and the chosen flags, show the
-   user the planned changes, and get explicit confirmation before applying:
+   user the planned changes, and get explicit confirmation before applying. The script is
+   `scripts/lockdown.sh` inside this skill's directory (the directory that holds this
+   SKILL.md, e.g. `~/.agents/skills/github-lockdown/` after `npx skills add`), not inside
+   the target repo:
 
    ```bash
-   skills/devops/github-lockdown/scripts/lockdown.sh --dry-run --repo <owner/repo> [flags]
+   <skill-dir>/scripts/lockdown.sh --dry-run --repo <owner/repo> [flags]
    ```
 
-5. **Apply.** Re-run without `--dry-run`. Report the verification summary the script prints.
+5. **Apply.** Re-run without `--dry-run`. The script then reads the ruleset and the repo's
+   `delete_branch_on_merge` setting back from GitHub and compares them with what it sent.
+   Report the summary it prints. If it exits 1 with `Verification failed`, the write went
+   through but GitHub does not show the expected state: show the user the sent and returned
+   JSON it printed, and do not report the repo as locked down.
 
 ## Flags
 
