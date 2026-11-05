@@ -2,7 +2,13 @@
 
 **Date:** 2026-07-28
 **Category:** `devops`
-**Status:** Approved (amended 2026-08-01 — dual Orca + Conductor seamless support)
+**Status:** Approved (amended 2026-08-01 — dual Orca + Conductor seamless support; amended
+2026-11-05 — Conductor support removed, Orca only)
+
+> **Amendment 2026-11-05:** Conductor is being discontinued, so 0.3.0 drops it. The
+> `.conductor/settings.toml` template is gone and `CONDUCTOR_WORKSPACE_NAME` is no longer read;
+> identity is now `ORCA_WORKSPACE_NAME` → `WORKSPACE_NAME` → secondary-worktree basename → git
+> branch. Conductor references below are historical.
 
 ## Purpose
 

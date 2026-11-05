@@ -9,22 +9,21 @@ description: >-
   an assumption. Lifecycle lives in .neondb/state.json (branchId + projectId + status), so a git
   branch change or workspace rename never switches database ownership. Works with Prisma or Drizzle.
   No orchestration tool required — plain package.json scripts drive provision/sync/teardown, with
-  workspace identity resolved from Conductor, Orca, a general WORKSPACE_NAME, or the current git
-  branch. Ships ready-to-use Conductor and Orca config templates. provision() fully rebuilds the
+  workspace identity resolved from Orca, a general WORKSPACE_NAME, or the current git branch. Ships
+  a ready-to-use Orca config template. provision() fully rebuilds the
   branch on every run. Manual-only — run in a Neon + Prisma or Neon + Drizzle project to add the
   setup.
 disable-model-invocation: true
 metadata:
   author: martintechlabs
-  version: "0.2.1"
+  version: "0.3.0"
 ---
 
 # Per-workspace isolated Neon databases (Prisma or Drizzle, any git repo)
 
 ## What this sets up
 
-Every workspace — a Conductor workspace, an Orca worktree, or a plain git checkout on its own
-branch — gets its **own** database, so parallel agents never read or write the same rows.
+Every workspace — an Orca worktree or a plain git checkout on its own branch — gets its **own** database, so parallel agents never read or write the same rows.
 `provision()` is a **full, deterministic rebuild — every run, not just the first**: it deletes the
 branch currently recorded for the workspace and creates a fresh one. Data written into the workspace
 branch through normal app usage is discarded on every re-run; the branch is disposable by design.
@@ -117,11 +116,10 @@ Identity decides what a **new** branch is called. It never decides which branch 
 
 | Order | Source | When it applies |
 |---|---|---|
-| 1 | `CONDUCTOR_WORKSPACE_NAME` | Conductor injects this automatically |
-| 2 | `ORCA_WORKSPACE_NAME` | Set by Orca or the project, when present |
-| 3 | `WORKSPACE_NAME` | General ambient override for custom tools or CI |
-| 4 | Checkout directory basename | A secondary git worktree with none of the above set |
-| 5 | Current git branch | A plain single-clone checkout with none of the above set |
+| 1 | `ORCA_WORKSPACE_NAME` | Set by Orca or the project, when present |
+| 2 | `WORKSPACE_NAME` | General ambient override for custom tools or CI |
+| 3 | Checkout directory basename | A secondary git worktree with none of the above set (Orca today) |
+| 4 | Current git branch | A plain single-clone checkout with none of the above set |
 
 `WORKSPACE_NAME` is **never** read from `.env.neondb` — that file can be copied across workspaces.
 Set it in your shell, CI config, or orchestrator env instead.
@@ -240,26 +238,9 @@ await prisma.$transaction(async (tx) => { /* … */ }, { maxWait: 30_000, timeou
 
 The script exports `PRISMA_TX_MAXWAIT_MS` (30s) so the value has one home.
 
-### 5. Orchestrator config (optional — both shipped, use what applies)
+### 5. Orca config (optional)
 
-**Conductor** — copy `references/conductor-settings.toml.example` to `.conductor/settings.toml`:
-
-```toml
-"$schema" = "https://conductor.build/schemas/settings.repo.schema.json"
-
-[scripts]
-setup = "corepack enable pnpm && pnpm worktree:setup"
-archive = "pnpm worktree:archive"
-run = "pnpm worktree:sync && pnpm dev --port $CONDUCTOR_PORT"
-run_mode = "concurrent"
-```
-
-`run_mode = "concurrent"` is safe because each workspace has its own branch and `$CONDUCTOR_PORT`.
-**Never put `DATABASE_URL` in Conductor's Environment tabs** — `load-env.cjs` overrides it anyway,
-but a stray value there is a trap for every other tool. Put `NEON_API_KEY`/`NEON_PROJECT_ID`/
-`NEON_PARENT_BRANCH` in **both** Local and Cloud tabs (or in `.env.neondb` directly).
-
-**Orca** — copy `references/orca.yaml.example` to `orca.yaml`:
+Copy `references/orca.yaml.example` to `orca.yaml`:
 
 ```yaml
 scripts:
@@ -270,9 +251,11 @@ scripts:
 ```
 
 Orca has no `run` hook — the gate lives in the `dev` script's `sync &&` prefix and in
-`load-env.cjs`, which is why both are universal rather than orchestrator-specific.
+`load-env.cjs`, which is why both are universal rather than orchestrator-specific. Never put
+`DATABASE_URL` in your orchestrator's environment config — `load-env.cjs` overrides it anyway, but a
+stray value there is a trap for every other tool.
 
-Track `.conductor/settings.toml` in git; gitignore `.neondb/` and `.env.neondb` (verify with
+Track `orca.yaml` in git; gitignore `.neondb/` and `.env.neondb` (verify with
 `git check-ignore .neondb .env.neondb`).
 
 ### 6. Wire up seeding

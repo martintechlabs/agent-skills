@@ -494,7 +494,7 @@ function requireEnv(name: string): string {
   if (!value) {
     throw new FatalError(
       `${name} is required for the per-workspace Neon branch. Set it in ${ENV_FILE}, your shell ` +
-        `environment, or your orchestrator's environment config (e.g. Conductor's Environment tabs).`,
+        `environment, or your orchestrator's environment config.`,
     )
   }
   return value
@@ -535,8 +535,8 @@ export interface GitContext {
 
 /**
  * Workspace identity, before slugify. First match wins:
- *   1. CONDUCTOR_WORKSPACE_NAME  2. ORCA_WORKSPACE_NAME  3. WORKSPACE_NAME
- *   4. basename(cwd) for a secondary git worktree  5. the current git branch
+ *   1. ORCA_WORKSPACE_NAME  2. WORKSPACE_NAME
+ *   3. basename(cwd) for a secondary git worktree  4. the current git branch
  * WORKSPACE_NAME is only ever read from process env, NEVER from .env.neondb — that file can be
  * copied across workspaces.
  *
@@ -544,15 +544,14 @@ export interface GitContext {
  * that comes from .neondb/state.json's branchId alone.
  */
 export function resolveWorkspaceName(env: NodeJS.ProcessEnv, cwd: string, git: GitContext): string {
-  const fromEnv = env.CONDUCTOR_WORKSPACE_NAME || env.ORCA_WORKSPACE_NAME || env.WORKSPACE_NAME
+  const fromEnv = env.ORCA_WORKSPACE_NAME || env.WORKSPACE_NAME
   if (fromEnv) return fromEnv
   if (git.isSecondaryWorktree) return basename(cwd)
   if (git.branch) return git.branch
   throw new FatalError(
-    'Could not determine workspace identity: no CONDUCTOR_WORKSPACE_NAME / ORCA_WORKSPACE_NAME / ' +
-      'WORKSPACE_NAME is set, this checkout is not a secondary git worktree, and there is no usable ' +
-      'git branch (detached HEAD, or not a git repository). Check out a named branch, or set ' +
-      'WORKSPACE_NAME explicitly.',
+    'Could not determine workspace identity: no ORCA_WORKSPACE_NAME / WORKSPACE_NAME is set, this ' +
+      'checkout is not a secondary git worktree, and there is no usable git branch (detached HEAD, ' +
+      'or not a git repository). Check out a named branch, or set WORKSPACE_NAME explicitly.',
   )
 }
 
