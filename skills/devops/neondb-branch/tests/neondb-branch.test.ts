@@ -1030,8 +1030,10 @@ describe('workspace identity (unchanged naming convention)', () => {
   const worktree: GitContext = { isSecondaryWorktree: true, branch: 'martintechlabs/feature-x' }
   const singleClone: GitContext = { isSecondaryWorktree: false, branch: 'martintechlabs/feature-x' }
 
-  it('prefers CONDUCTOR_WORKSPACE_NAME over every other source', () => {
-    expect(resolveWorkspaceName({ CONDUCTOR_WORKSPACE_NAME: 'conductor-ws', ORCA_WORKSPACE_NAME: 'orca-ws', WORKSPACE_NAME: 'generic' }, '/tmp/dir', worktree)).toBe('conductor-ws')
+  it('prefers ORCA_WORKSPACE_NAME, then WORKSPACE_NAME, and ignores CONDUCTOR_WORKSPACE_NAME', () => {
+    expect(resolveWorkspaceName({ CONDUCTOR_WORKSPACE_NAME: 'conductor-ws', ORCA_WORKSPACE_NAME: 'orca-ws', WORKSPACE_NAME: 'generic' }, '/tmp/dir', worktree)).toBe('orca-ws')
+    expect(resolveWorkspaceName({ CONDUCTOR_WORKSPACE_NAME: 'conductor-ws', WORKSPACE_NAME: 'generic' }, '/tmp/dir', worktree)).toBe('generic')
+    expect(resolveWorkspaceName({ CONDUCTOR_WORKSPACE_NAME: 'conductor-ws' }, '/tmp/my-worktree', worktree)).toBe('my-worktree')
   })
 
   it('falls back to the checkout basename for a secondary worktree, then the git branch', () => {

@@ -137,7 +137,7 @@ External CLI auth a live run needs, verified before you rely on it working:
 No `.env` files in this repo — it doesn't run a service, and nothing here reads an
 environment variable of its own. The variables skills care about belong to the *target*
 repo: `neondb-branch` reads `NEON_API_KEY`/`NEON_PROJECT_ID`/`NEON_PARENT_BRANCH` and
-resolves workspace identity from Conductor, Orca, `WORKSPACE_NAME`, or the current git
+resolves workspace identity from Orca, `WORKSPACE_NAME`, or the current git
 branch. That precedence chain lives in its `SKILL.md`, not here.
 
 ## Implementation guidelines
